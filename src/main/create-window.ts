@@ -13,7 +13,7 @@ export interface WindowRuntime {
 
 const trustedDevelopmentHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
 const trustedDevelopmentProtocols = new Set(['http:', 'https:'])
-const trustedDevelopmentPorts = new Set(['', '5173'])
+const trustedDevelopmentPorts = new Set(['5173'])
 
 function getTrustedDevelopmentUrl(rendererUrl: string | undefined): string | undefined {
   if (!rendererUrl) {
@@ -68,10 +68,17 @@ export async function createAppWindow(
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', (event) => event.preventDefault())
 
-  if (developmentUrl) {
-    await window.loadURL(developmentUrl)
-  } else {
-    await window.loadFile(join(__dirname, '../renderer/index.html'))
+  try {
+    if (developmentUrl) {
+      await window.loadURL(developmentUrl)
+    } else {
+      await window.loadFile(join(__dirname, '../renderer/index.html'))
+    }
+  } catch (error) {
+    if (!window.isDestroyed()) {
+      window.destroy()
+    }
+    throw error
   }
 
   return window

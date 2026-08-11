@@ -3,23 +3,55 @@ import { describe, expect, it, vi } from 'vitest'
 import { createAppWindow, createWindowOptions } from '../../../src/main/create-window'
 
 function createWindowHarness() {
+  const destroy = vi.fn()
+  const isDestroyed = vi.fn(() => false)
   const loadFile = vi.fn().mockResolvedValue(undefined)
   const loadURL = vi.fn().mockResolvedValue(undefined)
+  const show = vi.fn()
+  let readyToShow: (() => void) | undefined
+  let willNavigate:
+    | ((event: { preventDefault: () => void }, targetUrl: string) => void)
+    | undefined
+  let windowOpenHandler: (() => { action: string }) | undefined
   const fakeWindow = {
+    destroy,
+    isDestroyed,
     loadFile,
     loadURL,
-    once: () => undefined,
-    show: () => undefined,
+    once: (event: string, callback: () => void) => {
+      if (event === 'ready-to-show') {
+        readyToShow = callback
+      }
+    },
+    show,
     webContents: {
-      on: () => undefined,
-      setWindowOpenHandler: () => undefined
+      on: (
+        event: string,
+        callback: (event: { preventDefault: () => void }, targetUrl: string) => void
+      ) => {
+        if (event === 'will-navigate') {
+          willNavigate = callback
+        }
+      },
+      setWindowOpenHandler: (handler: () => { action: string }) => {
+        windowOpenHandler = handler
+      }
     }
   }
   const FakeBrowserWindow = function () {
     return fakeWindow
   }
 
-  return { FakeBrowserWindow, loadFile, loadURL }
+  return {
+    FakeBrowserWindow,
+    destroy,
+    getReadyToShow: () => readyToShow,
+    getWillNavigate: () => willNavigate,
+    getWindowOpenHandler: () => windowOpenHandler,
+    loadFile,
+    loadURL,
+    show
+  }
 }
 
 describe('secure application windows', () => {
@@ -29,7 +61,8 @@ describe('secure application windows', () => {
     expect(options.webPreferences).toMatchObject({
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      webSecurity: true
     })
   })
 
@@ -59,6 +92,35 @@ describe('secure application windows', () => {
     expect(receivedOptions?.webPreferences?.preload).toBe('/absolute/path/to/preload.js')
   })
 
+  it('shows the hidden window only after ready-to-show', async () => {
+    const { FakeBrowserWindow, getReadyToShow, show } = createWindowHarness()
+
+    await createAppWindow('/absolute/path/to/preload.js', FakeBrowserWindow as never)
+    expect(show).not.toHaveBeenCalled()
+
+    getReadyToShow()?.()
+
+    expect(show).toHaveBeenCalledOnce()
+  })
+
+  it('denies renderer requests to open a new window', async () => {
+    const { FakeBrowserWindow, getWindowOpenHandler } = createWindowHarness()
+
+    await createAppWindow('/absolute/path/to/preload.js', FakeBrowserWindow as never)
+
+    expect(getWindowOpenHandler()?.()).toEqual({ action: 'deny' })
+  })
+
+  it('prevents renderer navigation to another address', async () => {
+    const { FakeBrowserWindow, getWillNavigate } = createWindowHarness()
+    const preventDefault = vi.fn()
+
+    await createAppWindow('/absolute/path/to/preload.js', FakeBrowserWindow as never)
+    getWillNavigate()?.({ preventDefault }, 'https://attacker.example')
+
+    expect(preventDefault).toHaveBeenCalledOnce()
+  })
+
   it('ignores ELECTRON_RENDERER_URL outside development mode', async () => {
     const { FakeBrowserWindow, loadFile, loadURL } = createWindowHarness()
     vi.stubEnv('ELECTRON_RENDERER_URL', 'https://attacker.example/app')
@@ -86,6 +148,8 @@ describe('secure application windows', () => {
     ['embedded credentials', 'http://user:password@localhost:5173'],
     ['a non-HTTP protocol', 'ws://localhost:5173'],
     ['a non-loopback address', 'http://127.0.0.2:5173'],
+    ['the default HTTP port', 'http://localhost'],
+    ['the default HTTPS port', 'https://localhost'],
     ['an unapproved port', 'http://localhost:5174'],
     ['a malformed URL', 'not a URL']
   ])('rejects %s as a development renderer URL', async (_case, rendererUrl) => {
@@ -104,9 +168,7 @@ describe('secure application windows', () => {
     'http://localhost:5173',
     'https://localhost:5173',
     'http://127.0.0.1:5173',
-    'https://[::1]:5173',
-    'http://localhost',
-    'https://localhost'
+    'https://[::1]:5173'
   ])('allows the trusted development renderer URL %s', async (rendererUrl) => {
     const { FakeBrowserWindow, loadFile, loadURL } = createWindowHarness()
 
@@ -118,5 +180,27 @@ describe('secure application windows', () => {
     expect(loadURL).toHaveBeenCalledOnce()
     expect(loadURL).toHaveBeenCalledWith(rendererUrl)
     expect(loadFile).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['local renderer file', { isDevelopment: false }, 'loadFile' as const],
+    [
+      'development renderer URL',
+      { isDevelopment: true, rendererUrl: 'http://localhost:5173' },
+      'loadURL' as const
+    ]
+  ])('destroys the hidden window when loading the %s fails', async (_case, runtime, loadMethod) => {
+    const harness = createWindowHarness()
+    const error = new Error('renderer failed to load')
+    harness[loadMethod].mockRejectedValueOnce(error)
+
+    await expect(
+      createAppWindow(
+        '/absolute/path/to/preload.js',
+        harness.FakeBrowserWindow as never,
+        runtime
+      )
+    ).rejects.toBe(error)
+    expect(harness.destroy).toHaveBeenCalledOnce()
   })
 })
