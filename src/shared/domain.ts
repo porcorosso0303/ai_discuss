@@ -39,7 +39,7 @@ export interface KimiRoleConfig extends RoleConfigBase {
   provider: 'kimi'
   baseUrl: string
   model: string
-  thinkingEnabled: boolean
+  thinking: boolean
   thinkingKeep: boolean
   maxCompletionTokens: number
   sampling?: SamplingConfig
@@ -49,7 +49,7 @@ export interface DeepSeekRoleConfig extends RoleConfigBase {
   provider: 'deepseek'
   baseUrl: string
   model: string
-  thinkingEnabled: boolean
+  thinking: boolean
   effort?: 'low' | 'high' | 'max'
   maxTokens: number
   sampling?: SamplingConfig

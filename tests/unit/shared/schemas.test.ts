@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   debateReplySchema,
   debateSetupSchema,
+  kimiRoleConfigSchema,
   providerCapabilitiesSchema,
   providerSchema,
   roleConfigSchema,
@@ -30,7 +31,7 @@ const kimiRole = {
   provider: 'kimi',
   baseUrl: 'https://api.moonshot.cn/v1',
   model: 'kimi-k2.5',
-  thinkingEnabled: true,
+  thinking: true,
   thinkingKeep: false,
   maxCompletionTokens: 4096,
   sampling: {
@@ -64,12 +65,37 @@ describe('role and provider schemas', () => {
         provider: 'deepseek',
         baseUrl: 'https://api.deepseek.com',
         model: 'deepseek-v4-flash',
-        thinkingEnabled: true,
+        thinking: true,
         effort: 'max',
         maxTokens: 8192,
         sampling: { temperature: 1, topP: 0.95 }
       })
     ).toMatchObject({ provider: 'deepseek', effort: 'max' })
+  })
+
+  it('uses thinking as the only thinking toggle for Kimi and DeepSeek', () => {
+    const deepSeekRole = {
+      roleId: 'role-b',
+      name: '审慎方',
+      personaOrStance: '',
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      model: 'deepseek-v4-flash',
+      thinking: true,
+      effort: 'high',
+      maxTokens: 8192
+    } as const
+
+    expect(roleConfigSchema.parse(kimiRole)).toMatchObject({
+      provider: 'kimi',
+      thinking: true
+    })
+    expect(roleConfigSchema.parse(deepSeekRole)).toEqual(deepSeekRole)
+    expect(() => roleConfigSchema.parse({ ...kimiRole, thinkingEnabled: true })).toThrow()
+    const { thinking: _thinking, ...deepSeekWithoutThinking } = deepSeekRole
+    expect(() =>
+      roleConfigSchema.parse({ ...deepSeekWithoutThinking, thinkingEnabled: true })
+    ).toThrow()
   })
 
   it('rejects apiKey instead of silently stripping it', () => {
@@ -99,6 +125,19 @@ describe('role and provider schemas', () => {
 
   it('accepts only HTTP(S) API base URLs', () => {
     expect(() => roleConfigSchema.parse({ ...kimiRole, baseUrl: 'file:///tmp/models' })).toThrow()
+  })
+
+  it('returns validation failures without throwing for every invalid base URL', () => {
+    const baseUrlSchema = kimiRoleConfigSchema.shape.baseUrl
+
+    for (const invalidUrl of ['', 'not a url', 'file:///tmp/models']) {
+      let result: ReturnType<typeof baseUrlSchema.safeParse> | undefined
+
+      expect(() => {
+        result = baseUrlSchema.safeParse(invalidUrl)
+      }).not.toThrow()
+      expect(result?.success).toBe(false)
+    }
   })
 })
 

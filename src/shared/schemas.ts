@@ -33,8 +33,12 @@ const nonNegativeIntegerSchema = z.number().int().nonnegative()
 const positiveIntegerSchema = z.number().int().positive()
 const httpUrlSchema = z.string().url().refine(
   (value) => {
-    const protocol = new URL(value).protocol
-    return protocol === 'http:' || protocol === 'https:'
+    try {
+      const protocol = new URL(value).protocol
+      return protocol === 'http:' || protocol === 'https:'
+    } catch {
+      return false
+    }
   },
   { message: 'baseUrl must use HTTP or HTTPS' }
 )
@@ -73,7 +77,7 @@ export const kimiRoleConfigSchema = z.strictObject({
   ...commonRoleShape,
   provider: z.literal('kimi'),
   baseUrl: httpUrlSchema,
-  thinkingEnabled: z.boolean(),
+  thinking: z.boolean(),
   thinkingKeep: z.boolean(),
   maxCompletionTokens: positiveIntegerSchema,
   sampling: kimiSamplingConfigSchema.optional()
@@ -83,7 +87,7 @@ export const deepSeekRoleConfigSchema = z.strictObject({
   ...commonRoleShape,
   provider: z.literal('deepseek'),
   baseUrl: httpUrlSchema,
-  thinkingEnabled: z.boolean(),
+  thinking: z.boolean(),
   effort: z.enum(['low', 'high', 'max']).optional(),
   maxTokens: positiveIntegerSchema,
   sampling: deepSeekSamplingConfigSchema.optional()
