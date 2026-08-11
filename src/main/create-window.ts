@@ -6,6 +6,35 @@ type BrowserWindowConstructor = new (
   options: BrowserWindowConstructorOptions
 ) => BrowserWindow
 
+export interface WindowRuntime {
+  isDevelopment: boolean
+  rendererUrl?: string
+}
+
+const trustedDevelopmentHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
+const trustedDevelopmentProtocols = new Set(['http:', 'https:'])
+const trustedDevelopmentPorts = new Set(['', '5173'])
+
+function getTrustedDevelopmentUrl(rendererUrl: string | undefined): string | undefined {
+  if (!rendererUrl) {
+    return undefined
+  }
+
+  try {
+    const url = new URL(rendererUrl)
+    const isTrusted =
+      trustedDevelopmentProtocols.has(url.protocol) &&
+      trustedDevelopmentHosts.has(url.hostname) &&
+      trustedDevelopmentPorts.has(url.port) &&
+      url.username === '' &&
+      url.password === ''
+
+    return isTrusted ? rendererUrl : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function createWindowOptions(preloadPath: string): BrowserWindowConstructorOptions {
   return {
     width: 1200,
@@ -27,16 +56,20 @@ export function createWindowOptions(preloadPath: string): BrowserWindowConstruct
 
 export async function createAppWindow(
   preloadPath: string,
-  BrowserWindowClass: BrowserWindowConstructor
+  BrowserWindowClass: BrowserWindowConstructor,
+  runtime: WindowRuntime = { isDevelopment: false }
 ): Promise<BrowserWindow> {
   const window = new BrowserWindowClass(createWindowOptions(preloadPath))
+  const developmentUrl = runtime.isDevelopment
+    ? getTrustedDevelopmentUrl(runtime.rendererUrl)
+    : undefined
 
   window.once('ready-to-show', () => window.show())
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', (event) => event.preventDefault())
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    await window.loadURL(process.env.ELECTRON_RENDERER_URL)
+  if (developmentUrl) {
+    await window.loadURL(developmentUrl)
   } else {
     await window.loadFile(join(__dirname, '../renderer/index.html'))
   }
