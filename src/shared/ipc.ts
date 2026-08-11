@@ -2,10 +2,12 @@ import { z } from 'zod'
 
 import {
   credentialScopeSchema,
+  deepSeekCredentialScopeSchema,
   debateEventSchema,
   debateSessionSchema,
   debateSessionStateSchema,
   debateSetupSchema,
+  kimiCredentialScopeSchema,
   providerCapabilitiesSchema,
   roleConfigSchema,
   roleIdSchema
@@ -42,6 +44,12 @@ const acknowledgementSchema = z.strictObject({ accepted: z.boolean() })
 const sessionRequestSchema = z.strictObject({
   sessionId: z.string().trim().min(1).max(200)
 })
+
+export const providerTestConnectionRequestSchema = z.discriminatedUnion('provider', [
+  z.strictObject({ roleId: roleIdSchema, provider: z.literal('openai') }),
+  kimiCredentialScopeSchema,
+  deepSeekCredentialScopeSchema
+])
 
 export const openAIAuthStatusSchema = z.strictObject({
   status: z.enum(['signed-out', 'signing-in', 'signed-in']),
@@ -102,7 +110,7 @@ const ipcSchemas = {
     response: providerCapabilitiesSchema
   },
   providerTestConnection: {
-    request: z.strictObject({ scope: credentialScopeSchema }),
+    request: providerTestConnectionRequestSchema,
     response: z.strictObject({
       ok: z.boolean(),
       message: z.string().max(4000).optional(),

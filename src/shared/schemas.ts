@@ -54,13 +54,25 @@ export const baseUrlSchema = z
     }
   })
 
-const credentialProviderSchema = z.enum(['kimi', 'deepseek'])
-
-export const credentialScopeSchema = z.strictObject({
+const credentialScopeShape = {
   roleId: roleIdSchema,
-  provider: credentialProviderSchema,
   origin: baseUrlSchema.transform((value) => new URL(value).origin)
+}
+
+export const kimiCredentialScopeSchema = z.strictObject({
+  ...credentialScopeShape,
+  provider: z.literal('kimi')
 })
+
+export const deepSeekCredentialScopeSchema = z.strictObject({
+  ...credentialScopeShape,
+  provider: z.literal('deepseek')
+})
+
+export const credentialScopeSchema = z.discriminatedUnion('provider', [
+  kimiCredentialScopeSchema,
+  deepSeekCredentialScopeSchema
+])
 
 const commonSamplingShape = {
   temperature: z.number().min(0).optional(),

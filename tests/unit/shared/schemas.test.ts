@@ -485,9 +485,49 @@ describe('IPC contracts', () => {
       setContract.request.parse({ scope: compatibleScope, secret: 'second' }).scope
     )
     expect(deleteContract.request.parse({ scope: moonshotScope })).toEqual({ scope: moonshotScope })
-    expect(connectionContract.request.parse({ scope: compatibleScope })).toEqual({
-      scope: compatibleScope
+    expect(connectionContract.request.parse(compatibleScope)).toEqual(compatibleScope)
+  })
+
+  it('uses strict provider-specific connection test requests', () => {
+    const contract = ipcInvokeContracts[IPC_CHANNELS.providerTestConnection]
+
+    expect(contract.request.parse({ roleId: 'role-a', provider: 'openai' })).toEqual({
+      roleId: 'role-a',
+      provider: 'openai'
     })
+    expect(
+      contract.request.safeParse({
+        roleId: 'role-a',
+        provider: 'openai',
+        origin: 'https://api.openai.com'
+      }).success
+    ).toBe(false)
+    expect(
+      contract.request.safeParse({
+        roleId: 'role-a',
+        provider: 'openai',
+        secret: 'must-not-cross-this-boundary'
+      }).success
+    ).toBe(false)
+
+    expect(
+      contract.request.parse({
+        roleId: 'role-b',
+        provider: 'kimi',
+        origin: 'https://api.moonshot.cn:443/v1'
+      })
+    ).toEqual({ roleId: 'role-b', provider: 'kimi', origin: 'https://api.moonshot.cn' })
+    expect(
+      contract.request.parse({
+        roleId: 'role-b',
+        provider: 'deepseek',
+        origin: 'https://api.deepseek.com'
+      })
+    ).toEqual({ roleId: 'role-b', provider: 'deepseek', origin: 'https://api.deepseek.com' })
+    expect(contract.request.safeParse({ roleId: 'role-b', provider: 'kimi' }).success).toBe(false)
+    expect(contract.request.safeParse({ roleId: 'role-b', provider: 'deepseek' }).success).toBe(
+      false
+    )
   })
 
   it('uses strict request objects for renderer input', () => {
