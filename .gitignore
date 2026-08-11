@@ -1,0 +1,12 @@
+.worktrees/
+node_modules/
+out/
+dist/
+coverage/
+playwright-report/
+test-results/
+.env
+.env.*
+!.env.example
+resources/bin/*.exe
+*.log
