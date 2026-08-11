@@ -8,40 +8,59 @@ import {
   REASONING_EFFORTS,
   ROLE_IDS,
   SAMPLING_PARAMETERS,
-  STRUCTURED_OUTPUT_MODES,
-  type DebateEvent,
-  type DebateMessage,
-  type DebateReply,
-  type DebateSession,
-  type DebateSetup,
-  type DeepSeekRoleConfig,
-  type KimiRoleConfig,
-  type ModelCapabilities,
-  type OpenAIRoleConfig,
-  type ProviderCapabilities,
-  type RoleConfig,
-  type SamplingConfig,
-  type Usage
+  STRUCTURED_OUTPUT_MODES
 } from './domain'
 
 export const roleIdSchema = z.enum(ROLE_IDS)
 export const providerSchema = z.enum(PROVIDERS)
 export const reasoningEffortSchema = z.enum(REASONING_EFFORTS)
 
-const nonEmptyTextSchema = z.string().trim().min(1)
+const boundedTextSchema = (maxLength: number) => z.string().trim().min(1).max(maxLength)
+const idSchema = boundedTextSchema(200)
+const modelIdSchema = boundedTextSchema(200)
 const nonNegativeIntegerSchema = z.number().int().nonnegative()
 const positiveIntegerSchema = z.number().int().positive()
-const httpUrlSchema = z.string().url().refine(
-  (value) => {
+const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
+const exactLoopbackHttpPattern = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i
+
+export const baseUrlSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(2048)
+  .transform((value, context) => {
     try {
-      const protocol = new URL(value).protocol
-      return protocol === 'http:' || protocol === 'https:'
+      const url = new URL(value)
+      const hasCredentials = url.username !== '' || url.password !== ''
+      const hasUnscopedSuffix = value.includes('?') || value.includes('#')
+      const isSecureRemote = url.protocol === 'https:'
+      const isLoopbackHttp =
+        url.protocol === 'http:' &&
+        loopbackHosts.has(url.hostname) &&
+        exactLoopbackHttpPattern.test(value)
+
+      if (hasCredentials || hasUnscopedSuffix || (!isSecureRemote && !isLoopbackHttp)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'baseUrl must be HTTPS, or HTTP on an exact loopback host, without credentials, query, or fragment'
+        })
+        return z.NEVER
+      }
+
+      return url.toString()
     } catch {
-      return false
+      context.addIssue({ code: 'custom', message: 'baseUrl must be a valid URL' })
+      return z.NEVER
     }
-  },
-  { message: 'baseUrl must use HTTP or HTTPS' }
-)
+  })
+
+const credentialProviderSchema = z.enum(['kimi', 'deepseek'])
+
+export const credentialScopeSchema = z.strictObject({
+  roleId: roleIdSchema,
+  provider: credentialProviderSchema,
+  origin: baseUrlSchema.transform((value) => new URL(value).origin)
+})
 
 const commonSamplingShape = {
   temperature: z.number().min(0).optional(),
@@ -53,55 +72,83 @@ const commonSamplingShape = {
 export const kimiSamplingConfigSchema = z.strictObject({
   ...commonSamplingShape,
   temperature: z.number().min(0).max(1).optional()
-}) satisfies z.ZodType<SamplingConfig>
+})
 
 export const deepSeekSamplingConfigSchema = z.strictObject({
   ...commonSamplingShape,
   temperature: z.number().min(0).max(2).optional()
-}) satisfies z.ZodType<SamplingConfig>
+})
 
 const commonRoleShape = {
   roleId: roleIdSchema,
-  name: nonEmptyTextSchema,
-  personaOrStance: z.string(),
-  model: nonEmptyTextSchema
+  name: boundedTextSchema(100),
+  personaOrStance: z.string().max(4000),
+  model: modelIdSchema
 }
 
 export const openAIRoleConfigSchema = z.strictObject({
   ...commonRoleShape,
   provider: z.literal('openai'),
   effort: reasoningEffortSchema
-}) satisfies z.ZodType<OpenAIRoleConfig>
+})
 
-export const kimiRoleConfigSchema = z.strictObject({
-  ...commonRoleShape,
-  provider: z.literal('kimi'),
-  baseUrl: httpUrlSchema,
-  thinking: z.boolean(),
-  thinkingKeep: z.boolean(),
-  maxCompletionTokens: positiveIntegerSchema,
-  sampling: kimiSamplingConfigSchema.optional()
-}) satisfies z.ZodType<KimiRoleConfig>
+export const kimiRoleConfigSchema = z
+  .strictObject({
+    ...commonRoleShape,
+    provider: z.literal('kimi'),
+    baseUrl: baseUrlSchema,
+    thinking: z.boolean(),
+    thinkingKeep: z.enum(['none', 'all']).optional(),
+    maxCompletionTokens: positiveIntegerSchema,
+    sampling: kimiSamplingConfigSchema.optional()
+  })
+  .superRefine(({ thinking, thinkingKeep }, context) => {
+    if (!thinking && thinkingKeep === 'all') {
+      context.addIssue({
+        code: 'custom',
+        path: ['thinkingKeep'],
+        message: 'thinkingKeep all requires thinking to be enabled'
+      })
+    }
+  })
 
-export const deepSeekRoleConfigSchema = z.strictObject({
-  ...commonRoleShape,
-  provider: z.literal('deepseek'),
-  baseUrl: httpUrlSchema,
-  thinking: z.boolean(),
-  effort: z.enum(['low', 'high', 'max']).optional(),
-  maxTokens: positiveIntegerSchema,
-  sampling: deepSeekSamplingConfigSchema.optional()
-}) satisfies z.ZodType<DeepSeekRoleConfig>
+export const deepSeekRoleConfigSchema = z
+  .strictObject({
+    ...commonRoleShape,
+    provider: z.literal('deepseek'),
+    baseUrl: baseUrlSchema,
+    thinking: z.boolean(),
+    effort: z.enum(['low', 'high', 'max']).optional(),
+    maxTokens: positiveIntegerSchema,
+    sampling: deepSeekSamplingConfigSchema.optional()
+  })
+  .superRefine(({ thinking, effort, sampling }, context) => {
+    if (thinking && sampling !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sampling'],
+        message: 'sampling parameters are unavailable while thinking is enabled'
+      })
+    }
+
+    if (!thinking && effort !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['effort'],
+        message: 'effort is unavailable while thinking is disabled'
+      })
+    }
+  })
 
 export const roleConfigSchema = z.discriminatedUnion('provider', [
   openAIRoleConfigSchema,
   kimiRoleConfigSchema,
   deepSeekRoleConfigSchema
-]) satisfies z.ZodType<RoleConfig>
+])
 
 export const debateSetupSchema = z
   .strictObject({
-    topic: nonEmptyTextSchema,
+    topic: boundedTextSchema(10_000),
     roles: z.tuple([roleConfigSchema, roleConfigSchema]),
     firstSpeaker: roleIdSchema,
     maxTurns: z.number().int().min(1).max(100).default(100)
@@ -125,13 +172,13 @@ export const debateSetupSchema = z
         message: 'firstSpeaker must identify a configured role'
       })
     }
-  }) satisfies z.ZodType<DebateSetup>
+  })
 
 export const debateReplyStatusSchema = z.enum(DEBATE_REPLY_STATUSES)
 export const debateReplySchema = z.strictObject({
-  speech: nonEmptyTextSchema,
+  speech: boundedTextSchema(200_000),
   status: debateReplyStatusSchema
-}) satisfies z.ZodType<DebateReply>
+})
 
 export const usageSchema = z.strictObject({
   inputTokens: nonNegativeIntegerSchema,
@@ -139,26 +186,26 @@ export const usageSchema = z.strictObject({
   totalTokens: nonNegativeIntegerSchema,
   reasoningTokens: nonNegativeIntegerSchema.optional(),
   cacheReadTokens: nonNegativeIntegerSchema.optional()
-}) satisfies z.ZodType<Usage>
+})
 
 export const debateMessageSchema = z.strictObject({
-  id: nonEmptyTextSchema,
+  id: idSchema,
   turn: positiveIntegerSchema,
   roleId: roleIdSchema,
   provider: providerSchema,
-  model: nonEmptyTextSchema,
-  speech: nonEmptyTextSchema,
+  model: modelIdSchema,
+  speech: boundedTextSchema(200_000),
   status: debateReplyStatusSchema,
   createdAt: z.string().datetime({ offset: true }),
   usage: usageSchema.optional()
-}) satisfies z.ZodType<DebateMessage>
+})
 
 export const debateSessionStateSchema = z.enum(DEBATE_SESSION_STATES)
 export const debateTerminationReasonSchema = z.enum(DEBATE_TERMINATION_REASONS)
 
 const eventBaseShape = {
-  id: nonEmptyTextSchema,
-  sessionId: nonEmptyTextSchema,
+  id: idSchema,
+  sessionId: idSchema,
   createdAt: z.string().datetime({ offset: true })
 }
 
@@ -179,7 +226,7 @@ export const debateEventSchema = z.discriminatedUnion('type', [
     type: z.literal('speech-delta'),
     roleId: roleIdSchema,
     turn: positiveIntegerSchema,
-    delta: z.string()
+    delta: z.string().max(200_000)
   }),
   z.strictObject({
     ...eventBaseShape,
@@ -195,8 +242,8 @@ export const debateEventSchema = z.discriminatedUnion('type', [
   z.strictObject({
     ...eventBaseShape,
     type: z.literal('warning'),
-    code: nonEmptyTextSchema,
-    message: nonEmptyTextSchema,
+    code: boundedTextSchema(100),
+    message: boundedTextSchema(4000),
     roleId: roleIdSchema.optional()
   }),
   z.strictObject({
@@ -205,59 +252,118 @@ export const debateEventSchema = z.discriminatedUnion('type', [
     roleId: roleIdSchema,
     usage: usageSchema
   })
-]) satisfies z.ZodType<DebateEvent>
+])
 
 export const debateSessionSchema = z.strictObject({
-  id: nonEmptyTextSchema,
+  id: idSchema,
   setup: debateSetupSchema,
   state: debateSessionStateSchema,
-  messages: z.array(debateMessageSchema),
-  events: z.array(debateEventSchema),
+  messages: z.array(debateMessageSchema).max(100),
+  events: z.array(debateEventSchema).max(10_000),
   currentTurn: nonNegativeIntegerSchema,
   createdAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true }),
   winnerRoleId: roleIdSchema.optional(),
   terminationReason: debateTerminationReasonSchema.optional(),
   contextCompressed: z.boolean()
-}) satisfies z.ZodType<DebateSession>
+})
 
 export const samplingParameterSchema = z.enum(SAMPLING_PARAMETERS)
 export const structuredOutputModeSchema = z.enum(STRUCTURED_OUTPUT_MODES)
 
-export const modelCapabilitiesSchema = z
+const uniqueValues = <Value>(values: Value[]): boolean => new Set(values).size === values.length
+
+export const samplingParameterCapabilitySchema = z
   .strictObject({
-    id: nonEmptyTextSchema,
-    displayName: nonEmptyTextSchema.optional(),
-    reasoningEfforts: z.array(reasoningEffortSchema),
-    defaultReasoningEffort: reasoningEffortSchema.optional(),
-    contextLength: positiveIntegerSchema.optional(),
-    thinking: z.strictObject({
-      supported: z.boolean(),
-      supportsKeep: z.boolean()
-    }),
-    sampling: z.strictObject({
-      supported: z.boolean(),
-      parameters: z.array(samplingParameterSchema)
-    }),
-    structuredOutput: z.strictObject({
-      supported: z.boolean(),
-      modes: z.array(structuredOutputModeSchema)
-    })
+    name: samplingParameterSchema,
+    min: z.number(),
+    max: z.number(),
+    default: z.number().optional()
   })
-  .superRefine(({ reasoningEfforts, defaultReasoningEffort }, context) => {
-    if (
-      defaultReasoningEffort !== undefined &&
-      !reasoningEfforts.includes(defaultReasoningEffort)
-    ) {
+  .superRefine(({ min, max, default: defaultValue }, context) => {
+    if (min > max) {
+      context.addIssue({ code: 'custom', path: ['min'], message: 'min must not exceed max' })
+    }
+
+    if (defaultValue !== undefined && (defaultValue < min || defaultValue > max)) {
       context.addIssue({
         code: 'custom',
-        path: ['defaultReasoningEffort'],
-        message: 'defaultReasoningEffort must be included in reasoningEfforts'
+        path: ['default'],
+        message: 'default must be within the declared range'
       })
     }
-  }) satisfies z.ZodType<ModelCapabilities>
+  })
 
-export const providerCapabilitiesSchema = z.strictObject({
-  provider: providerSchema,
-  models: z.array(modelCapabilitiesSchema)
-}) satisfies z.ZodType<ProviderCapabilities>
+export const modelCapabilitySchema = z.strictObject({
+  id: z.string().trim().min(1).max(200),
+  displayName: z.string().trim().min(1).max(200).optional(),
+  reasoningEfforts: z
+    .array(reasoningEffortSchema)
+    .max(REASONING_EFFORTS.length)
+    .refine(uniqueValues, { message: 'reasoningEfforts must be unique' }),
+  contextLength: positiveIntegerSchema.max(10_000_000).optional(),
+  maxOutputTokens: positiveIntegerSchema.max(10_000_000).optional(),
+  thinking: z
+    .strictObject({
+      default: z.boolean(),
+      keepSupported: z.boolean()
+    })
+    .nullable(),
+  samplingParameters: z
+    .array(samplingParameterCapabilitySchema)
+    .max(SAMPLING_PARAMETERS.length)
+    .refine((parameters) => uniqueValues(parameters.map(({ name }) => name)), {
+      message: 'sampling parameter names must be unique'
+    }),
+  structuredOutputModes: z
+    .array(structuredOutputModeSchema)
+    .max(STRUCTURED_OUTPUT_MODES.length)
+    .refine(uniqueValues, { message: 'structured output modes must be unique' })
+})
+
+export const providerCapabilitiesSchema = z
+  .strictObject({
+    provider: providerSchema,
+    models: z
+      .array(modelCapabilitySchema)
+      .max(200)
+      .refine((models) => uniqueValues(models.map(({ id }) => id)), {
+        message: 'model ids must be unique'
+      }),
+    defaultModel: z.string().trim().min(1).max(200).optional()
+  })
+  .superRefine(({ models, defaultModel }, context) => {
+    if (defaultModel !== undefined && !models.some(({ id }) => id === defaultModel)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['defaultModel'],
+        message: 'defaultModel must identify a discovered model'
+      })
+    }
+  })
+
+export type RoleId = z.output<typeof roleIdSchema>
+export type Provider = z.output<typeof providerSchema>
+export type ReasoningEffort = z.output<typeof reasoningEffortSchema>
+export type BaseUrl = z.output<typeof baseUrlSchema>
+export type CredentialScope = z.output<typeof credentialScopeSchema>
+export type KimiSamplingConfig = z.output<typeof kimiSamplingConfigSchema>
+export type DeepSeekSamplingConfig = z.output<typeof deepSeekSamplingConfigSchema>
+export type OpenAIRoleConfig = z.output<typeof openAIRoleConfigSchema>
+export type KimiRoleConfig = z.output<typeof kimiRoleConfigSchema>
+export type DeepSeekRoleConfig = z.output<typeof deepSeekRoleConfigSchema>
+export type RoleConfig = z.output<typeof roleConfigSchema>
+export type DebateSetup = z.output<typeof debateSetupSchema>
+export type DebateReplyStatus = z.output<typeof debateReplyStatusSchema>
+export type DebateReply = z.output<typeof debateReplySchema>
+export type Usage = z.output<typeof usageSchema>
+export type DebateMessage = z.output<typeof debateMessageSchema>
+export type DebateSessionState = z.output<typeof debateSessionStateSchema>
+export type DebateTerminationReason = z.output<typeof debateTerminationReasonSchema>
+export type DebateEvent = z.output<typeof debateEventSchema>
+export type DebateSession = z.output<typeof debateSessionSchema>
+export type SamplingParameter = z.output<typeof samplingParameterSchema>
+export type StructuredOutputMode = z.output<typeof structuredOutputModeSchema>
+export type SamplingParameterCapability = z.output<typeof samplingParameterCapabilitySchema>
+export type ModelCapability = z.output<typeof modelCapabilitySchema>
+export type ProviderCapabilities = z.output<typeof providerCapabilitiesSchema>

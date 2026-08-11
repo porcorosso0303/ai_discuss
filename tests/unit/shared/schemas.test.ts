@@ -1,7 +1,12 @@
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
+import { z } from 'zod'
 
 import {
+  debateEventSchema,
   debateReplySchema,
+  debateSessionSchema,
   debateSetupSchema,
   kimiRoleConfigSchema,
   providerCapabilitiesSchema,
@@ -10,8 +15,10 @@ import {
   roleIdSchema
 } from '../../../src/shared/schemas'
 import {
+  IPC_EVENT_CHANNELS,
   IPC_CHANNELS,
   IPC_INVOKE_CHANNELS,
+  ipcEventContracts,
   ipcInvokeContracts
 } from '../../../src/shared/ipc'
 
@@ -32,7 +39,7 @@ const kimiRole = {
   baseUrl: 'https://api.moonshot.cn/v1',
   model: 'kimi-k2.5',
   thinking: true,
-  thinkingKeep: false,
+  thinkingKeep: 'none',
   maxCompletionTokens: 4096,
   sampling: {
     temperature: 0.3,
@@ -41,6 +48,18 @@ const kimiRole = {
     presencePenalty: 0
   }
 } as const
+
+describe('schema type ownership', () => {
+  it('keeps domain.ts free of handwritten object-shape types', () => {
+    const domainSource = readFileSync(
+      new URL('../../../src/shared/domain.ts', import.meta.url),
+      'utf8'
+    )
+
+    expect(domainSource).not.toMatch(/\binterface\b/)
+    expect(domainSource).toMatch(/export type \{[\s\S]*RoleConfig[\s\S]*\} from '\.\/schemas'/)
+  })
+})
 
 describe('role and provider schemas', () => {
   it('accepts only the two supported role ids', () => {
@@ -67,8 +86,7 @@ describe('role and provider schemas', () => {
         model: 'deepseek-v4-flash',
         thinking: true,
         effort: 'max',
-        maxTokens: 8192,
-        sampling: { temperature: 1, topP: 0.95 }
+        maxTokens: 8192
       })
     ).toMatchObject({ provider: 'deepseek', effort: 'max' })
   })
@@ -90,12 +108,65 @@ describe('role and provider schemas', () => {
       provider: 'kimi',
       thinking: true
     })
-    expect(roleConfigSchema.parse(deepSeekRole)).toEqual(deepSeekRole)
+    expect(roleConfigSchema.parse(deepSeekRole)).toMatchObject({
+      ...deepSeekRole,
+      baseUrl: 'https://api.deepseek.com/'
+    })
     expect(() => roleConfigSchema.parse({ ...kimiRole, thinkingEnabled: true })).toThrow()
     const { thinking: _thinking, ...deepSeekWithoutThinking } = deepSeekRole
     expect(() =>
       roleConfigSchema.parse({ ...deepSeekWithoutThinking, thinkingEnabled: true })
     ).toThrow()
+  })
+
+  it('allows Kimi thinkingKeep all only while thinking is enabled', () => {
+    expect(
+      roleConfigSchema.safeParse({ ...kimiRole, thinking: true, thinkingKeep: 'all' }).success
+    ).toBe(true)
+    expect(
+      roleConfigSchema.safeParse({ ...kimiRole, thinking: false, thinkingKeep: 'none' }).success
+    ).toBe(true)
+    const { thinkingKeep: _thinkingKeep, ...withoutThinkingKeep } = kimiRole
+    expect(roleConfigSchema.safeParse({ ...withoutThinkingKeep, thinking: false }).success).toBe(
+      true
+    )
+    expect(
+      roleConfigSchema.safeParse({ ...kimiRole, thinking: false, thinkingKeep: 'all' }).success
+    ).toBe(false)
+  })
+
+  it('keeps DeepSeek effort and sampling mutually exclusive by thinking mode', () => {
+    const baseDeepSeekRole = {
+      roleId: 'role-b',
+      name: '乙方',
+      personaOrStance: '',
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      model: 'deepseek-v4-flash',
+      maxTokens: 8192
+    } as const
+
+    expect(
+      roleConfigSchema.safeParse({ ...baseDeepSeekRole, thinking: true, effort: 'high' }).success
+    ).toBe(true)
+    expect(
+      roleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        thinking: false,
+        sampling: { temperature: 1 }
+      }).success
+    ).toBe(true)
+    expect(
+      roleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        thinking: true,
+        effort: 'high',
+        sampling: { temperature: 1 }
+      }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({ ...baseDeepSeekRole, thinking: false, effort: 'high' }).success
+    ).toBe(false)
   })
 
   it('rejects apiKey instead of silently stripping it', () => {
@@ -137,6 +208,33 @@ describe('role and provider schemas', () => {
         result = baseUrlSchema.safeParse(invalidUrl)
       }).not.toThrow()
       expect(result?.success).toBe(false)
+    }
+  })
+
+  it('allows secure remote URLs and exact loopback HTTP URLs only', () => {
+    const baseUrlSchema = kimiRoleConfigSchema.shape.baseUrl
+
+    expect(baseUrlSchema.parse('https://api.example.com/v1')).toBe(
+      'https://api.example.com/v1'
+    )
+    expect(baseUrlSchema.parse('http://localhost:8080/v1')).toBe(
+      'http://localhost:8080/v1'
+    )
+    expect(baseUrlSchema.parse('http://127.0.0.1/v1')).toBe('http://127.0.0.1/v1')
+    expect(baseUrlSchema.parse('http://[::1]:8080/v1')).toBe('http://[::1]:8080/v1')
+
+    for (const rejectedUrl of [
+      'http://api.example.com/v1',
+      'http://localhost.example.com/v1',
+      'http://127.1/v1',
+      'http://2130706433/v1',
+      'https://user:password@api.example.com/v1',
+      'https://api.example.com/v1?token=secret',
+      'https://api.example.com/v1#credentials',
+      'https://api.example.com/v1?',
+      'https://api.example.com/v1#'
+    ]) {
+      expect(baseUrlSchema.safeParse(rejectedUrl).success).toBe(false)
     }
   })
 })
@@ -198,22 +296,54 @@ describe('debate contracts', () => {
     expect(() => debateReplySchema.parse({ speech: '', status: 'continue' })).toThrow()
     expect(() => debateReplySchema.parse({ speech: '结束', status: 'win' })).toThrow()
   })
+
+  it('round-trips a persisted session and its renderer event', () => {
+    const createdAt = '2026-08-11T10:00:00.000Z'
+    const event = {
+      id: 'event-1',
+      sessionId: 'session-1',
+      createdAt,
+      type: 'state-changed',
+      state: 'running'
+    } as const
+    const session = {
+      id: 'session-1',
+      setup: {
+        topic: '测试持久化往返',
+        roles: [openAiRole, kimiRole],
+        firstSpeaker: 'role-a',
+        maxTurns: 100
+      },
+      state: 'running',
+      messages: [],
+      events: [event],
+      currentTurn: 0,
+      createdAt,
+      updatedAt: createdAt,
+      contextCompressed: false
+    } as const
+
+    expect(debateEventSchema.parse(event)).toEqual(event)
+    expect(debateSessionSchema.parse(session)).toEqual(session)
+    expect(ipcEventContracts[IPC_CHANNELS.debateEvent].parse(event)).toEqual(event)
+  })
 })
 
 describe('provider capability schema', () => {
   it('expresses dynamic per-model reasoning, context, and output capabilities', () => {
     const capabilities = {
       provider: 'openai',
+      defaultModel: 'gpt-5',
       models: [
         {
           id: 'gpt-5',
           displayName: 'GPT-5',
           reasoningEfforts: ['low', 'medium', 'high'],
-          defaultReasoningEffort: 'medium',
           contextLength: 200_000,
-          thinking: { supported: true, supportsKeep: false },
-          sampling: { supported: false, parameters: [] },
-          structuredOutput: { supported: true, modes: ['json-schema'] }
+          maxOutputTokens: 32_000,
+          thinking: { default: true, keepSupported: false },
+          samplingParameters: [],
+          structuredOutputModes: ['json-schema']
         }
       ]
     }
@@ -230,9 +360,83 @@ describe('provider capability schema', () => {
       })
     ).toThrow()
   })
+
+  it('rejects invalid ranges, duplicate capabilities, and unknown default models', () => {
+    const model = {
+      id: 'model-a',
+      reasoningEfforts: ['high'],
+      thinking: null,
+      samplingParameters: [{ name: 'temperature', min: 0, max: 2, default: 1 }],
+      structuredOutputModes: ['json-object']
+    } as const
+
+    expect(() =>
+      providerCapabilitiesSchema.parse({
+        provider: 'deepseek',
+        defaultModel: 'missing-model',
+        models: [model]
+      })
+    ).toThrow()
+    expect(() =>
+      providerCapabilitiesSchema.parse({
+        provider: 'deepseek',
+        models: [model, model]
+      })
+    ).toThrow()
+    const invalidModels = [
+      { ...model, reasoningEfforts: ['high', 'high'] },
+      { ...model, samplingParameters: [{ name: 'temperature', min: 2, max: 1 }] },
+      {
+        ...model,
+        samplingParameters: [{ name: 'temperature', min: 0, max: 2, default: 3 }]
+      },
+      {
+        ...model,
+        samplingParameters: [
+          { name: 'temperature', min: 0, max: 2 },
+          { name: 'temperature', min: 0, max: 2 }
+        ]
+      },
+      { ...model, structuredOutputModes: ['json-object', 'json-object'] }
+    ]
+
+    for (const invalidModel of invalidModels) {
+      expect(
+        providerCapabilitiesSchema.safeParse({ provider: 'deepseek', models: [invalidModel] })
+          .success
+      ).toBe(false)
+    }
+  })
+
+  it('limits provider model discovery results to 200 unique models', () => {
+    const models = Array.from({ length: 201 }, (_, index) => ({
+      id: `model-${index}`,
+      reasoningEfforts: [],
+      thinking: null,
+      samplingParameters: [],
+      structuredOutputModes: []
+    }))
+
+    expect(providerCapabilitiesSchema.safeParse({ provider: 'kimi', models }).success).toBe(false)
+  })
 })
 
 describe('IPC contracts', () => {
+  it('derives frozen invoke and event channel lists from their contract maps', () => {
+    expect(Object.isFrozen(IPC_INVOKE_CHANNELS)).toBe(true)
+    expect(Object.isFrozen(IPC_EVENT_CHANNELS)).toBe(true)
+    expect(new Set(IPC_INVOKE_CHANNELS)).toEqual(new Set(Object.keys(ipcInvokeContracts)))
+    expect(new Set(IPC_EVENT_CHANNELS)).toEqual(new Set(Object.keys(ipcEventContracts)))
+  })
+
+  it('never declares a secret field in any IPC response schema', () => {
+    for (const contract of Object.values(ipcInvokeContracts)) {
+      expect(JSON.stringify(z.toJSONSchema(contract.response, { io: 'input' }))).not.toMatch(
+        /"secret"/i
+      )
+    }
+  })
+
   it('exposes a finite whitelist without generic URL, path, command, or secret getters', () => {
     expect(new Set(IPC_INVOKE_CHANNELS).size).toBe(IPC_INVOKE_CHANNELS.length)
     expect(IPC_INVOKE_CHANNELS).toContain(IPC_CHANNELS.credentialsSetProviderSecret)
@@ -246,15 +450,44 @@ describe('IPC contracts', () => {
   it('accepts a provider secret only on the dedicated write-only command', () => {
     const contract = ipcInvokeContracts[IPC_CHANNELS.credentialsSetProviderSecret]
 
+    const scope = {
+      roleId: 'role-b',
+      provider: 'kimi',
+      origin: 'https://api.moonshot.cn'
+    } as const
+
     expect(
       contract.request.parse({
-        roleId: 'role-b',
-        provider: 'kimi',
+        scope,
         secret: 'sk-secret'
       })
-    ).toMatchObject({ provider: 'kimi' })
+    ).toEqual({ scope, secret: 'sk-secret' })
     expect(contract.response.parse({ stored: true })).toEqual({ stored: true })
     expect(() => contract.response.parse({ stored: true, secret: 'sk-secret' })).toThrow()
+  })
+
+  it('scopes credential set, delete, and connection checks to role, provider, and origin', () => {
+    const moonshotScope = {
+      roleId: 'role-b',
+      provider: 'kimi',
+      origin: 'https://api.moonshot.cn'
+    } as const
+    const compatibleScope = {
+      ...moonshotScope,
+      origin: 'https://compatible.example.com'
+    } as const
+
+    const setContract = ipcInvokeContracts[IPC_CHANNELS.credentialsSetProviderSecret]
+    const deleteContract = ipcInvokeContracts[IPC_CHANNELS.credentialsDeleteProviderSecret]
+    const connectionContract = ipcInvokeContracts[IPC_CHANNELS.providerTestConnection]
+
+    expect(setContract.request.parse({ scope: moonshotScope, secret: 'first' }).scope).not.toEqual(
+      setContract.request.parse({ scope: compatibleScope, secret: 'second' }).scope
+    )
+    expect(deleteContract.request.parse({ scope: moonshotScope })).toEqual({ scope: moonshotScope })
+    expect(connectionContract.request.parse({ scope: compatibleScope })).toEqual({
+      scope: compatibleScope
+    })
   })
 
   it('uses strict request objects for renderer input', () => {
@@ -266,5 +499,41 @@ describe('IPC contracts', () => {
     }
 
     expect(() => contract.request.parse({ setup, command: 'whoami' })).toThrow()
+  })
+
+  it('limits renderer-controlled strings', () => {
+    const scope = {
+      roleId: 'role-b',
+      provider: 'kimi',
+      origin: 'https://api.moonshot.cn'
+    } as const
+
+    expect(roleConfigSchema.safeParse({ ...openAiRole, name: '甲'.repeat(101) }).success).toBe(
+      false
+    )
+    expect(
+      roleConfigSchema.safeParse({ ...openAiRole, personaOrStance: '甲'.repeat(4001) }).success
+    ).toBe(false)
+    expect(roleConfigSchema.safeParse({ ...openAiRole, model: 'm'.repeat(201) }).success).toBe(
+      false
+    )
+    expect(
+      debateSetupSchema.safeParse({
+        topic: '题'.repeat(10_001),
+        roles: [openAiRole, kimiRole],
+        firstSpeaker: 'role-a'
+      }).success
+    ).toBe(false)
+    expect(
+      ipcInvokeContracts[IPC_CHANNELS.credentialsSetProviderSecret].request.safeParse({
+        scope,
+        secret: 's'.repeat(10_001)
+      }).success
+    ).toBe(false)
+    expect(
+      ipcInvokeContracts[IPC_CHANNELS.historyList].request.safeParse({
+        search: 's'.repeat(501)
+      }).success
+    ).toBe(false)
   })
 })

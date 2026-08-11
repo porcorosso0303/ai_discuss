@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import {
+  credentialScopeSchema,
   debateEventSchema,
   debateSessionSchema,
   debateSessionStateSchema,
@@ -36,48 +37,20 @@ export const IPC_CHANNELS = {
   openAIAuthChanged: 'openai:auth-changed'
 } as const
 
-export const IPC_INVOKE_CHANNELS = [
-  IPC_CHANNELS.appGetVersion,
-  IPC_CHANNELS.configListRoles,
-  IPC_CHANNELS.configSaveRole,
-  IPC_CHANNELS.configDeleteRole,
-  IPC_CHANNELS.credentialsSetProviderSecret,
-  IPC_CHANNELS.credentialsDeleteProviderSecret,
-  IPC_CHANNELS.openAIGetAuthStatus,
-  IPC_CHANNELS.openAIStartLogin,
-  IPC_CHANNELS.openAILogout,
-  IPC_CHANNELS.providerDiscoverCapabilities,
-  IPC_CHANNELS.providerTestConnection,
-  IPC_CHANNELS.debateStart,
-  IPC_CHANNELS.debatePause,
-  IPC_CHANNELS.debateResume,
-  IPC_CHANNELS.debateStop,
-  IPC_CHANNELS.debateRetryCurrentTurn,
-  IPC_CHANNELS.historyList,
-  IPC_CHANNELS.historyGet,
-  IPC_CHANNELS.historyDelete,
-  IPC_CHANNELS.historyClear,
-  IPC_CHANNELS.exportMarkdown
-] as const
-
-export const IPC_EVENT_CHANNELS = [
-  IPC_CHANNELS.debateEvent,
-  IPC_CHANNELS.openAIAuthChanged
-] as const
-
 const emptyRequestSchema = z.strictObject({})
 const acknowledgementSchema = z.strictObject({ accepted: z.boolean() })
-const sessionRequestSchema = z.strictObject({ sessionId: z.string().trim().min(1) })
-const providerWithSecretSchema = z.enum(['kimi', 'deepseek'])
+const sessionRequestSchema = z.strictObject({
+  sessionId: z.string().trim().min(1).max(200)
+})
 
 export const openAIAuthStatusSchema = z.strictObject({
   status: z.enum(['signed-out', 'signing-in', 'signed-in']),
-  accountLabel: z.string().trim().min(1).optional()
+  accountLabel: z.string().trim().min(1).max(200).optional()
 })
 
 export const debateSessionSummarySchema = z.strictObject({
-  id: z.string().trim().min(1),
-  topic: z.string().trim().min(1),
+  id: z.string().trim().min(1).max(200),
+  topic: z.string().trim().min(1).max(10_000),
   state: debateSessionStateSchema,
   currentTurn: z.number().int().nonnegative(),
   createdAt: z.string().datetime({ offset: true }),
@@ -87,11 +60,11 @@ export const debateSessionSummarySchema = z.strictObject({
 const ipcSchemas = {
   appGetVersion: {
     request: emptyRequestSchema,
-    response: z.string().trim().min(1)
+    response: z.string().trim().min(1).max(100)
   },
   configListRoles: {
     request: emptyRequestSchema,
-    response: z.strictObject({ roles: z.array(roleConfigSchema) })
+    response: z.strictObject({ roles: z.array(roleConfigSchema).max(2) })
   },
   configSaveRole: {
     request: z.strictObject({ role: roleConfigSchema }),
@@ -103,17 +76,13 @@ const ipcSchemas = {
   },
   credentialsSetProviderSecret: {
     request: z.strictObject({
-      roleId: roleIdSchema,
-      provider: providerWithSecretSchema,
-      secret: z.string().min(1)
+      scope: credentialScopeSchema,
+      secret: z.string().min(1).max(10_000)
     }),
     response: z.strictObject({ stored: z.boolean() })
   },
   credentialsDeleteProviderSecret: {
-    request: z.strictObject({
-      roleId: roleIdSchema,
-      provider: providerWithSecretSchema
-    }),
+    request: z.strictObject({ scope: credentialScopeSchema }),
     response: z.strictObject({ deleted: z.boolean() })
   },
   openAIGetAuthStatus: {
@@ -133,10 +102,10 @@ const ipcSchemas = {
     response: providerCapabilitiesSchema
   },
   providerTestConnection: {
-    request: z.strictObject({ roleId: roleIdSchema }),
+    request: z.strictObject({ scope: credentialScopeSchema }),
     response: z.strictObject({
       ok: z.boolean(),
-      message: z.string().optional(),
+      message: z.string().max(4000).optional(),
       capabilities: providerCapabilitiesSchema.optional()
     })
   },
@@ -162,10 +131,10 @@ const ipcSchemas = {
   },
   historyList: {
     request: z.strictObject({
-      search: z.string().optional(),
+      search: z.string().max(500).optional(),
       limit: z.number().int().min(1).max(200).default(50)
     }),
-    response: z.strictObject({ sessions: z.array(debateSessionSummarySchema) })
+    response: z.strictObject({ sessions: z.array(debateSessionSummarySchema).max(200) })
   },
   historyGet: {
     request: sessionRequestSchema,
@@ -183,7 +152,7 @@ const ipcSchemas = {
     request: sessionRequestSchema,
     response: z.strictObject({
       cancelled: z.boolean(),
-      fileName: z.string().trim().min(1).optional()
+      fileName: z.string().trim().min(1).max(255).optional()
     })
   }
 } as const
@@ -219,6 +188,14 @@ export const ipcEventContracts = {
 
 export type IpcInvokeChannel = keyof typeof ipcInvokeContracts
 export type IpcEventChannel = keyof typeof ipcEventContracts
+
+export const IPC_INVOKE_CHANNELS: readonly IpcInvokeChannel[] = Object.freeze(
+  Object.keys(ipcInvokeContracts) as IpcInvokeChannel[]
+)
+
+export const IPC_EVENT_CHANNELS: readonly IpcEventChannel[] = Object.freeze(
+  Object.keys(ipcEventContracts) as IpcEventChannel[]
+)
 
 export type IpcRequestMap = {
   [Channel in IpcInvokeChannel]: z.input<(typeof ipcInvokeContracts)[Channel]['request']>
