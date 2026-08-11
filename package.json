@@ -1,0 +1,35 @@
+{
+  "name": "ai-debates",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A secure desktop arena for AI model debates",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^4.0.17"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "@testing-library/jest-dom": "^6.6.4",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^22.17.1",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^43.3.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^4.0.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.2",
+    "vite": "^6.1.0",
+    "vitest": "^3.2.4"
+  }
+}
