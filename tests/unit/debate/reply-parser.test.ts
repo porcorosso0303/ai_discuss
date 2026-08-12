@@ -184,6 +184,19 @@ describe('parseReply', () => {
     expect(parsed.warning).toBeDefined()
   })
 
+  it.each([
+    '正文仍然可见。<debate-status>agree</debate-status',
+    '正文仍然可见。<debate-status>agree</debate-sta',
+    '正文仍然可见。<debate-status>agree</debate-'
+  ])('removes the complete opening marker and every truncated closing suffix: %s', (raw) => {
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
   it('removes a closing status-tag fragment at the end', () => {
     const parsed = parseReply('正文仍然可见。</debate-status>')
 
@@ -207,6 +220,25 @@ describe('parseReply', () => {
 
   it('removes a suffix clearly attributable to a debate-status closing tag', () => {
     const parsed = parseReply('正文仍然可见。</debate-sta')
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('keeps a standalone closing fragment shorter than the explicit debate prefix', () => {
+    const raw = '普通正文</debate'
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(raw)
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('removes the minimum explicit standalone debate closing prefix', () => {
+    const parsed = parseReply('正文仍然可见。</debate-')
 
     expect(parsed.speech).toBe('正文仍然可见。')
     expect(parsed.status).toBe('continue')

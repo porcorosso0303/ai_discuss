@@ -18,6 +18,7 @@ const trailingStatusPattern =
 const trailingInvalidStatusPattern =
   /\s*<debate-status>[^<>]*<\/debate-status>\s*$/i
 const trailingUnclosedStatusPattern = /\s*<debate-status>[^<>]*$/i
+const openingStatusTag = '<debate-status>'
 const closingStatusTag = '</debate-status>'
 
 const appendWarning = (warning: string | undefined, addition: string): string =>
@@ -180,6 +181,21 @@ const stripTrailingMachineMarker = (input: string): string | undefined => {
 
   if (unclosedStatusMatch !== null) {
     return input.slice(0, unclosedStatusMatch.index)
+  }
+
+  const normalizedInput = input.toLowerCase()
+  const openingTagIndex = normalizedInput.lastIndexOf(openingStatusTag)
+
+  if (openingTagIndex !== -1) {
+    const markerSuffix = normalizedInput.slice(openingTagIndex)
+    const closingTagIndex = markerSuffix.indexOf(closingStatusTag, openingStatusTag.length)
+
+    if (
+      closingTagIndex === -1 ||
+      markerSuffix.slice(closingTagIndex + closingStatusTag.length).trim().length === 0
+    ) {
+      return input.slice(0, openingTagIndex)
+    }
   }
 
   const lastTagStart = input.lastIndexOf('<')
