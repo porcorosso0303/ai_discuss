@@ -3,6 +3,7 @@ import { debateReplySchema } from '../../shared/schemas'
 
 export const EMPTY_SPEECH_PLACEHOLDER = '（模型未返回可显示的发言）'
 export const INVALID_REPLY_PLACEHOLDER = '（模型返回了无法解析的回复）'
+export const MAX_RAW_REPLY_CHARS = 200_000
 
 export type ReplyParseSource = 'json' | 'tag' | 'fallback'
 
@@ -12,14 +13,12 @@ export interface ParsedDebateReply extends DebateReply {
 }
 
 const MAX_SPEECH_LENGTH = 200_000
-const outerJsonFencePattern = /^\s*```(?:json)?[ \t]*\r?\n?([\s\S]*?)\r?\n?```\s*$/i
-const trailingStatusPattern =
-  /\s*<debate-status>(continue|concede|agree)<\/debate-status>\s*$/
-const trailingInvalidStatusPattern =
-  /\s*<debate-status>[^<>]*<\/debate-status>\s*$/i
-const trailingUnclosedStatusPattern = /\s*<debate-status>[^<>]*$/i
+const outerJsonFencePattern =
+  /^\s*```(?:(?:json|text))?[ \t]*\r?\n?([\s\S]*?)\r?\n?```\s*$/i
 const openingStatusTag = '<debate-status>'
 const closingStatusTag = '</debate-status>'
+const structuredReplyPrefixes = ['模型回复如下：', '回复如下：', '以下是回复：', 'Here is the reply:']
+const debateStatuses = new Set<DebateReplyStatus>(['continue', 'concede', 'agree'])
 
 const appendWarning = (warning: string | undefined, addition: string): string =>
   warning === undefined ? addition : `${warning} ${addition}`
@@ -170,45 +169,63 @@ const recoverTopLevelJsonSpeech = (input: string, parsed: unknown): string | und
 const recoverVisibleStructuredSpeech = (input: string, parsed: unknown): string =>
   recoverTopLevelJsonSpeech(input, parsed) ?? INVALID_REPLY_PLACEHOLDER
 
-const stripTrailingMachineMarker = (input: string): string | undefined => {
-  const invalidStatusMatch = trailingInvalidStatusPattern.exec(input)
+interface TrailingStatusTag {
+  body: string
+  status: DebateReplyStatus
+  valid: boolean
+}
 
-  if (invalidStatusMatch !== null) {
-    return input.slice(0, invalidStatusMatch.index)
-  }
+const parseTrailingStatusTag = (input: string): TrailingStatusTag | undefined => {
+  if (input.endsWith(closingStatusTag)) {
+    const closingTagIndex = input.length - closingStatusTag.length
+    const openingTagIndex = input.lastIndexOf(openingStatusTag, closingTagIndex)
 
-  const unclosedStatusMatch = trailingUnclosedStatusPattern.exec(input)
+    if (openingTagIndex === -1) {
+      return {
+        body: input.slice(0, closingTagIndex),
+        status: 'continue',
+        valid: false
+      }
+    }
 
-  if (unclosedStatusMatch !== null) {
-    return input.slice(0, unclosedStatusMatch.index)
-  }
+    const statusText = input.slice(openingTagIndex + openingStatusTag.length, closingTagIndex)
+    const valid = debateStatuses.has(statusText as DebateReplyStatus)
 
-  const normalizedInput = input.toLowerCase()
-  const openingTagIndex = normalizedInput.lastIndexOf(openingStatusTag)
-
-  if (openingTagIndex !== -1) {
-    const markerSuffix = normalizedInput.slice(openingTagIndex)
-    const closingTagIndex = markerSuffix.indexOf(closingStatusTag, openingStatusTag.length)
-
-    if (
-      closingTagIndex === -1 ||
-      markerSuffix.slice(closingTagIndex + closingStatusTag.length).trim().length === 0
-    ) {
-      return input.slice(0, openingTagIndex)
+    return {
+      body: input.slice(0, openingTagIndex),
+      status: valid ? (statusText as DebateReplyStatus) : 'continue',
+      valid
     }
   }
 
-  const lastTagStart = input.lastIndexOf('<')
+  const openingTagIndex = input.lastIndexOf(openingStatusTag)
 
-  if (lastTagStart === -1) {
+  if (
+    openingTagIndex !== -1 &&
+    input.indexOf(closingStatusTag, openingTagIndex + openingStatusTag.length) === -1
+  ) {
+    return {
+      body: input.slice(0, openingTagIndex),
+      status: 'continue',
+      valid: false
+    }
+  }
+
+  const possibleClosingFragmentIndex = input.lastIndexOf('<')
+
+  if (possibleClosingFragmentIndex === -1) {
     return undefined
   }
 
-  const possibleClosingFragment = input.slice(lastTagStart).trim().toLowerCase()
+  const possibleClosingFragment = input.slice(possibleClosingFragmentIndex)
 
   return possibleClosingFragment.startsWith('</debate-') &&
     closingStatusTag.startsWith(possibleClosingFragment)
-    ? input.slice(0, lastTagStart)
+    ? {
+        body: input.slice(0, possibleClosingFragmentIndex),
+        status: 'continue',
+        valid: false
+      }
     : undefined
 }
 
@@ -217,10 +234,25 @@ const fallbackVisibleSpeech = (input: string, parsed: unknown): string =>
     ? recoverVisibleStructuredSpeech(input, parsed)
     : input
 
+const stripAllowedReplyPrefix = (input: string): string => {
+  for (const prefix of structuredReplyPrefixes) {
+    if (input.startsWith(prefix)) {
+      return input.slice(prefix.length).trimStart()
+    }
+  }
+
+  return input
+}
+
 export const parseReply = (raw: string): ParsedDebateReply => {
-  const trimmedRaw = raw.trim()
+  const rawWasTruncated = raw.length > MAX_RAW_REPLY_CHARS
+  const limitedRaw = rawWasTruncated ? raw.slice(0, MAX_RAW_REPLY_CHARS) : raw
+  const rawLengthWarning = rawWasTruncated ? '原始回复超过长度限制，已在解析前截断。' : undefined
+  const withRawLengthWarning = (warning?: string): string | undefined =>
+    rawLengthWarning === undefined ? warning : appendWarning(warning, rawLengthWarning)
+  const trimmedRaw = limitedRaw.trim()
   const fencedMatch = outerJsonFencePattern.exec(trimmedRaw)
-  const candidate = (fencedMatch?.[1] ?? trimmedRaw).trim()
+  const candidate = stripAllowedReplyPrefix((fencedMatch?.[1] ?? trimmedRaw).trim())
   let parsedJson: unknown
 
   try {
@@ -228,41 +260,41 @@ export const parseReply = (raw: string): ParsedDebateReply => {
     const validated = debateReplySchema.safeParse(parsedJson)
 
     if (validated.success) {
-      return finalizeReply({ ...validated.data, source: 'json' })
+      return finalizeReply({
+        ...validated.data,
+        source: 'json',
+        warning: withRawLengthWarning()
+      })
     }
   } catch {
     parsedJson = undefined
   }
 
-  const statusMatch = trailingStatusPattern.exec(trimmedRaw)
+  const trailingStatusTag = parseTrailingStatusTag(candidate)
 
-  if (statusMatch !== null) {
-    return finalizeReply({
-      speech: trimmedRaw.slice(0, statusMatch.index),
-      status: statusMatch[1] as DebateReplyStatus,
-      source: 'tag'
-    })
-  }
-
-  const speechWithoutMachineMarker = stripTrailingMachineMarker(trimmedRaw)
-
-  if (speechWithoutMachineMarker !== undefined) {
-    const cleanedRaw = speechWithoutMachineMarker.trim()
-    const cleanedFenceMatch = outerJsonFencePattern.exec(cleanedRaw)
-    const cleanedCandidate = (cleanedFenceMatch?.[1] ?? cleanedRaw).trim()
-    let cleanedJson: unknown
+  if (trailingStatusTag !== undefined) {
+    const body = trailingStatusTag.body.trim()
+    let parsedBody: unknown
 
     try {
-      cleanedJson = JSON.parse(cleanedCandidate)
+      parsedBody = JSON.parse(body)
     } catch {
-      cleanedJson = undefined
+      parsedBody = undefined
     }
 
+    const structuredBody = body.startsWith('{') || body.startsWith('[')
+
     return finalizeReply({
-      speech: fallbackVisibleSpeech(cleanedCandidate, cleanedJson),
-      status: 'continue',
-      source: 'fallback',
-      warning: '已移除无效或不完整的末尾辩论状态标记，状态按 continue 处理。'
+      speech: structuredBody ? fallbackVisibleSpeech(body, parsedBody) : body,
+      status: trailingStatusTag.status,
+      source: trailingStatusTag.valid ? 'tag' : 'fallback',
+      warning: withRawLengthWarning(
+        trailingStatusTag.valid
+          ? structuredBody
+            ? '尾部状态标记前的结构化回复不符合严格 contract，已仅提取可见正文。'
+            : undefined
+          : '已移除无效或不完整的末尾辩论状态标记，状态按 continue 处理。'
+      )
     })
   }
 
@@ -270,6 +302,6 @@ export const parseReply = (raw: string): ParsedDebateReply => {
     speech: fallbackVisibleSpeech(candidate, parsedJson),
     status: 'continue',
     source: 'fallback',
-    warning: '模型输出不符合回复 contract，状态已按 continue 处理。'
+    warning: withRawLengthWarning('模型输出不符合回复 contract，状态已按 continue 处理。')
   })
 }

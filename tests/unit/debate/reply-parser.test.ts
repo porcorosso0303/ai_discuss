@@ -1,8 +1,11 @@
+import { performance } from 'node:perf_hooks'
+
 import { describe, expect, it } from 'vitest'
 
 import {
   EMPTY_SPEECH_PLACEHOLDER,
   INVALID_REPLY_PLACEHOLDER,
+  MAX_RAW_REPLY_CHARS,
   parseReply
 } from '../../../src/main/debate/reply-parser'
 
@@ -25,12 +28,36 @@ describe('parseReply', () => {
     })
   })
 
+  it.each([
+    '```\n围绕话题的正文。<debate-status>concede</debate-status>\n```',
+    '```text\n围绕话题的正文。<debate-status>concede</debate-status>\n```'
+  ])('unwraps an outer text fence before parsing a trailing status tag: %s', (raw) => {
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe('围绕话题的正文。')
+    expect(parsed.status).toBe('concede')
+    expect(parsed.source).toBe('tag')
+    expect(parsed.speech).not.toContain('debate-status')
+  })
+
   it('recognizes and removes a valid status tag only at the end of the body', () => {
     expect(parseReply('我们已经找到共同结论。\n<debate-status>agree</debate-status>')).toEqual({
       speech: '我们已经找到共同结论。',
       status: 'agree',
       source: 'tag'
     })
+  })
+
+  it('safely extracts structured speech before a valid trailing status tag', () => {
+    const parsed = parseReply(
+      '{"speech":"safe","reasoning_content":"SECRET"}<debate-status>continue</debate-status>'
+    )
+
+    expect(parsed.speech).toBe('safe')
+    expect(parsed.speech).not.toContain('SECRET')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('tag')
+    expect(parsed.warning).toBeDefined()
   })
 
   it('does not treat a status-like tag inside visible prose as machine status', () => {
@@ -47,6 +74,33 @@ describe('parseReply', () => {
     const parsed = parseReply('{"speech":"我仍然坚持这个论点。","status":"victory"}')
 
     expect(parsed.speech).toBe('我仍然坚持这个论点。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it.each([
+    '模型回复如下：',
+    '回复如下：',
+    '以下是回复：',
+    'Here is the reply: '
+  ])('safely extracts JSON after an allowed short explanation prefix: %s', (prefix) => {
+    const parsed = parseReply(
+      `${prefix}{"speech":"正文","status":"bad","reasoning_content":"秘密思考"}`
+    )
+
+    expect(parsed.speech).toBe('正文')
+    expect(parsed.speech).not.toContain('秘密思考')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('does not reinterpret arbitrary prose containing braces as prefixed JSON', () => {
+    const raw = '我的例子 {"speech":"仍是普通引用","status":"concede"} 不构成机器回复。'
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(raw)
     expect(parsed.status).toBe('continue')
     expect(parsed.source).toBe('fallback')
     expect(parsed.warning).toBeDefined()
@@ -256,6 +310,16 @@ describe('parseReply', () => {
     expect(parsed.warning).toBeDefined()
   })
 
+  it('keeps non-canonical uppercase status tags verbatim without lowercased-index slicing', () => {
+    const raw = 'İ正文<DEBATE-STATUS>agree</DEBATE-STATUS>'
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(raw)
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
   it('returns a safe non-empty placeholder and warning for empty output', () => {
     expect(parseReply('   ')).toEqual({
       speech: EMPTY_SPEECH_PLACEHOLDER,
@@ -283,5 +347,42 @@ describe('parseReply', () => {
       source: 'fallback',
       warning: expect.any(String)
     })
+  })
+
+  it('limits oversized raw replies before parsing and reports the truncation', () => {
+    const parsed = parseReply(`正文${' '.repeat(MAX_RAW_REPLY_CHARS + 100)}`)
+
+    expect(parsed.speech).toBe('正文')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.warning).toContain('原始回复超过长度限制')
+  })
+
+  it('handles a 100k whitespace-only reply within a generous synchronous budget', () => {
+    const startedAt = performance.now()
+    const parsed = parseReply(' '.repeat(100_000))
+    const durationMs = performance.now() - startedAt
+
+    expect(parsed.speech).toBe(EMPTY_SPEECH_PLACEHOLDER)
+    expect(durationMs).toBeLessThan(250)
+  })
+
+  it('avoids superlinear growth while scanning long trailing status values', () => {
+    const measureBestOfThree = (size: number): number => {
+      let best = Number.POSITIVE_INFINITY
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const startedAt = performance.now()
+        parseReply(`正文<debate-status>${'x'.repeat(size)}`)
+        best = Math.min(best, performance.now() - startedAt)
+      }
+
+      return best
+    }
+
+    measureBestOfThree(2_000)
+    const shortDurationMs = measureBestOfThree(20_000)
+    const longDurationMs = measureBestOfThree(80_000)
+
+    expect(longDurationMs).toBeLessThan(shortDurationMs * 8 + 25)
   })
 })
