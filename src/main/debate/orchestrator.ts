@@ -1,12 +1,12 @@
 import type {
+  DebateEvent,
   DebateMessage,
   DebateSession,
   DebateSetup,
-  OrchestratorEvent,
   RoleConfig,
   Usage
 } from '../../shared/domain'
-import { debateSetupSchema, orchestratorEventSchema } from '../../shared/schemas'
+import { debateEventSchema, debateSetupSchema } from '../../shared/schemas'
 import {
   ProviderRefusalError,
   isRetryableProviderError,
@@ -36,14 +36,23 @@ export interface OrchestratorDependencies {
   clock?: () => Date
   idFactory?: () => string
   retryPolicy?: RetryPolicy
-  onEvent?: (event: OrchestratorEvent) => void
+  onEvent?: (event: DebateEvent) => void
 }
+
+type DebateEventInput = DebateEvent extends infer Event
+  ? Event extends DebateEvent
+    ? Omit<Event, 'id' | 'sessionId' | 'createdAt'>
+    : never
+  : never
 
 export class DebateOrchestrator {
   private machine?: DebateMachineState
   private createdAt?: string
   private abortController?: AbortController
+  private drivePromise?: Promise<void>
+  private saveQueue: Promise<void> = Promise.resolve()
   private generation = 0
+  private durableEvents: DebateEvent[] = []
   private readonly clock: () => Date
   private readonly idFactory: () => string
   private readonly retryPolicy: RetryPolicy
@@ -73,7 +82,7 @@ export class DebateOrchestrator {
     }
 
     this.transition({ type: 'validationSucceeded' })
-    await this.drive()
+    await this.ensureDrive()
     return this.session()
   }
 
@@ -81,16 +90,18 @@ export class DebateOrchestrator {
     return this.session()
   }
 
-  pause(): DebateSession {
+  async pause(): Promise<DebateSession> {
     this.transition({ type: 'pauseRequested' })
-    return this.session()
+    const paused = this.session()
+    await this.enqueueSave(paused)
+    return paused
   }
 
   async resume(): Promise<DebateSession> {
     if (!this.transition({ type: 'resume' })) {
       return this.session()
     }
-    await this.drive()
+    await this.ensureDrive()
     return this.session()
   }
 
@@ -104,7 +115,7 @@ export class DebateOrchestrator {
     this.generation += 1
     this.abortController?.abort()
     await provider?.cancelActive?.()
-    await this.dependencies.repository.saveSession(this.session())
+    await this.enqueueSave()
     return this.session()
   }
 
@@ -113,13 +124,13 @@ export class DebateOrchestrator {
       return this.session()
     }
     this.generation += 1
-    await this.drive()
+    await this.ensureDrive()
     return this.session()
   }
 
   async finishFailed(): Promise<DebateSession> {
     this.transition({ type: 'finishFailed' })
-    await this.dependencies.repository.saveSession(this.session())
+    await this.enqueueSave()
     return this.session()
   }
 
@@ -129,12 +140,34 @@ export class DebateOrchestrator {
     }
   }
 
+  private ensureDrive(): Promise<void> {
+    if (this.drivePromise !== undefined) {
+      return this.drivePromise
+    }
+
+    const running = this.drive()
+    this.drivePromise = running
+    running.then(
+      () => {
+        if (this.drivePromise === running) {
+          this.drivePromise = undefined
+        }
+      },
+      () => {
+        if (this.drivePromise === running) {
+          this.drivePromise = undefined
+        }
+      }
+    )
+    return running
+  }
+
   private async runCurrentTurn(): Promise<void> {
     const before = this.requireMachine()
     const role = this.role(before.currentSpeaker)
     const turn = before.turnCount + 1
     this.transition({ type: 'turnStarted', roleId: role.roleId })
-    this.emit({ type: 'turnStarted', roleId: role.roleId, turn })
+    this.emit({ type: 'turn-started', roleId: role.roleId, turn })
 
     const generation = this.generation
     let completedRaw: string | undefined
@@ -163,9 +196,13 @@ export class DebateOrchestrator {
 
           if (chunk.type === 'content') {
             raw += chunk.content
-            this.emit({ type: 'chunk', roleId: role.roleId, turn, content: chunk.content })
+            this.emit(
+              { type: 'speech-delta', roleId: role.roleId, turn, delta: chunk.content },
+              false
+            )
           } else if (chunk.type === 'usage') {
             usage = chunk.usage
+            this.emit({ type: 'usage-updated', roleId: role.roleId, usage: chunk.usage })
           } else if (chunk.finishReason === 'refusal') {
             refused = true
           }
@@ -178,7 +215,7 @@ export class DebateOrchestrator {
         if (refused) {
           this.emitProviderError(role, turn, attempt, false, '模型明确拒绝继续发言')
           this.transition({ type: 'turnRefused' })
-          await this.dependencies.repository.saveSession(this.session())
+          await this.enqueueSave()
           return
         }
 
@@ -199,13 +236,13 @@ export class DebateOrchestrator {
 
         if (refusedByError) {
           this.transition({ type: 'turnRefused' })
-          await this.dependencies.repository.saveSession(this.session())
+          await this.enqueueSave()
           return
         }
 
         if (!retryable || attempt === this.retryPolicy.maxAttempts) {
           this.transition({ type: 'turnFailed' })
-          await this.dependencies.repository.saveSession(this.session())
+          await this.enqueueSave()
           return
         }
       } finally {
@@ -232,9 +269,9 @@ export class DebateOrchestrator {
       ...(completedUsage === undefined ? {} : { usage: completedUsage })
     }
     this.transition({ type: 'turnCompleted', message }, false)
-    this.emit({ type: 'turnCompleted', message })
-    await this.dependencies.repository.saveSession(this.session())
+    this.emit({ type: 'message-completed', message })
     this.emitStateIfTerminal()
+    await this.enqueueSave()
   }
 
   private role(roleId: RoleConfig['roleId']): RoleConfig {
@@ -250,7 +287,7 @@ export class DebateOrchestrator {
     const result = reduceDebateState(this.requireMachine(), action)
     this.machine = result.state
     if (emitState && previous !== result.state.phase) {
-      this.emit({ type: 'stateChanged', state: result.state.phase })
+      this.emit({ type: 'state-changed', state: result.state.phase })
     }
     return result.warning === undefined
   }
@@ -258,12 +295,21 @@ export class DebateOrchestrator {
   private emitStateIfTerminal(): void {
     const state = this.requireMachine().phase
     if (state !== 'running') {
-      this.emit({ type: 'stateChanged', state })
+      this.emit({ type: 'state-changed', state })
     }
   }
 
-  private emit(event: OrchestratorEvent): void {
-    this.dependencies.onEvent?.(orchestratorEventSchema.parse(event))
+  private emit(input: DebateEventInput, durable = true): void {
+    const event = debateEventSchema.parse({
+      ...input,
+      id: this.idFactory(),
+      sessionId: this.requireMachine().sessionId,
+      createdAt: this.clock().toISOString()
+    })
+    if (durable) {
+      this.durableEvents = [...this.durableEvents, event]
+    }
+    this.dependencies.onEvent?.(event)
   }
 
   private emitProviderError(
@@ -274,7 +320,8 @@ export class DebateOrchestrator {
     message: string
   ): void {
     this.emit({
-      type: 'error',
+      type: 'warning',
+      code: 'provider-error',
       roleId: role.roleId,
       turn,
       message,
@@ -287,6 +334,13 @@ export class DebateOrchestrator {
     return error instanceof Error && error.message.trim() !== ''
       ? error.message.slice(0, 4000)
       : 'Provider call failed'
+  }
+
+  private enqueueSave(session = this.session()): Promise<void> {
+    const snapshot = structuredClone(session)
+    const queued = this.saveQueue.then(() => this.dependencies.repository.saveSession(snapshot))
+    this.saveQueue = queued.catch(() => undefined)
+    return queued
   }
 
   private requireMachine(): DebateMachineState {
@@ -304,7 +358,7 @@ export class DebateOrchestrator {
       setup: machine.setup,
       state: machine.phase,
       messages: machine.messages,
-      events: [],
+      events: this.durableEvents,
       currentTurn: machine.turnCount,
       createdAt: this.createdAt ?? now,
       updatedAt: now,

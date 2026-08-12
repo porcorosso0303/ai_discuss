@@ -66,7 +66,6 @@ export type {
   KimiSamplingConfig,
   ModelCapability,
   OpenAIRoleConfig,
-  OrchestratorEvent,
   Provider,
   ProviderCapabilities,
   ReasoningEffort,

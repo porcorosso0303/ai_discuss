@@ -131,6 +131,105 @@ export class FakeDebateRepository implements DebateRepository {
   }
 }
 
+export class DeferredDebateRepository implements DebateRepository {
+  readonly started: DebateSession[] = []
+  readonly saved: DebateSession[] = []
+  activeSaves = 0
+  maxConcurrentSaves = 0
+  private readonly saveWaiters: Array<() => void> = []
+  private readonly releaseWaiters: Array<(() => void) | undefined> = []
+
+  async saveSession(session: DebateSession): Promise<void> {
+    const snapshot = structuredClone(session)
+    this.started.push(snapshot)
+    this.activeSaves += 1
+    this.maxConcurrentSaves = Math.max(this.maxConcurrentSaves, this.activeSaves)
+    this.saveWaiters.splice(0).forEach((resolve) => resolve())
+
+    await new Promise<void>((resolve) => this.releaseWaiters.push(resolve))
+
+    this.saved.push(snapshot)
+    this.activeSaves -= 1
+  }
+
+  async waitForStarted(count: number): Promise<void> {
+    while (this.started.length < count) {
+      await new Promise<void>((resolve) => this.saveWaiters.push(resolve))
+    }
+  }
+
+  releaseNext(): void {
+    const index = this.releaseWaiters.findIndex((resolve) => resolve !== undefined)
+    if (index !== -1) {
+      this.release(index)
+    }
+  }
+
+  release(index: number): void {
+    const resolve = this.releaseWaiters[index]
+    this.releaseWaiters[index] = undefined
+    resolve?.()
+  }
+}
+
+export class FirstSaveDeferredRepository implements DebateRepository {
+  readonly started: DebateSession[] = []
+  readonly saved: DebateSession[] = []
+  activeSaves = 0
+  maxConcurrentSaves = 0
+  private releaseFirstSave = (): void => undefined
+  private firstSaveStarted = Promise.resolve()
+
+  constructor() {
+    this.firstSaveStarted = new Promise<void>((resolveStarted) => {
+      this.releaseFirstSave = (): void => undefined
+      this.resolveFirstStarted = resolveStarted
+    })
+  }
+
+  private resolveFirstStarted = (): void => undefined
+
+  async saveSession(session: DebateSession): Promise<void> {
+    const snapshot = structuredClone(session)
+    const index = this.started.length
+    this.started.push(snapshot)
+    this.activeSaves += 1
+    this.maxConcurrentSaves = Math.max(this.maxConcurrentSaves, this.activeSaves)
+
+    if (index === 0) {
+      const blocked = new Promise<void>((resolve) => {
+        this.releaseFirstSave = resolve
+      })
+      this.resolveFirstStarted()
+      await blocked
+    }
+
+    this.saved.push(snapshot)
+    this.activeSaves -= 1
+  }
+
+  async waitForFirstSave(): Promise<void> {
+    await this.firstSaveStarted
+  }
+
+  releaseFirst(): void {
+    this.releaseFirstSave()
+  }
+}
+
+export class FirstSaveRejectingRepository implements DebateRepository {
+  readonly saved: DebateSession[] = []
+  calls = 0
+
+  async saveSession(session: DebateSession): Promise<void> {
+    this.calls += 1
+    if (this.calls === 1) {
+      throw new Error('simulated repository failure')
+    }
+    this.saved.push(structuredClone(session))
+  }
+}
+
 export const deterministicDependencies = (): Pick<
   OrchestratorDependencies,
   'clock' | 'idFactory'

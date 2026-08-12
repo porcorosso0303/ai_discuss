@@ -256,43 +256,16 @@ export const debateEventSchema = z.discriminatedUnion('type', [
     type: z.literal('warning'),
     code: boundedTextSchema(100),
     message: boundedTextSchema(4000),
-    roleId: roleIdSchema.optional()
+    roleId: roleIdSchema.optional(),
+    turn: positiveIntegerSchema.optional(),
+    attempt: positiveIntegerSchema.optional(),
+    retryable: z.boolean().optional()
   }),
   z.strictObject({
     ...eventBaseShape,
     type: z.literal('usage-updated'),
     roleId: roleIdSchema,
     usage: usageSchema
-  })
-])
-
-export const orchestratorEventSchema = z.discriminatedUnion('type', [
-  z.strictObject({
-    type: z.literal('stateChanged'),
-    state: debateSessionStateSchema
-  }),
-  z.strictObject({
-    type: z.literal('turnStarted'),
-    roleId: roleIdSchema,
-    turn: positiveIntegerSchema
-  }),
-  z.strictObject({
-    type: z.literal('chunk'),
-    roleId: roleIdSchema,
-    turn: positiveIntegerSchema,
-    content: z.string().max(200_000)
-  }),
-  z.strictObject({
-    type: z.literal('turnCompleted'),
-    message: debateMessageSchema
-  }),
-  z.strictObject({
-    type: z.literal('error'),
-    roleId: roleIdSchema,
-    turn: positiveIntegerSchema,
-    message: boundedTextSchema(4000),
-    retryable: z.boolean(),
-    attempt: positiveIntegerSchema
   })
 ])
 
@@ -403,7 +376,6 @@ export type DebateMessage = z.output<typeof debateMessageSchema>
 export type DebateSessionState = z.output<typeof debateSessionStateSchema>
 export type DebateTerminationReason = z.output<typeof debateTerminationReasonSchema>
 export type DebateEvent = z.output<typeof debateEventSchema>
-export type OrchestratorEvent = z.output<typeof orchestratorEventSchema>
 export type DebateSession = z.output<typeof debateSessionSchema>
 export type SamplingParameter = z.output<typeof samplingParameterSchema>
 export type StructuredOutputMode = z.output<typeof structuredOutputModeSchema>
