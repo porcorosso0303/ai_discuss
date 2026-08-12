@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { EMPTY_SPEECH_PLACEHOLDER, parseReply } from '../../../src/main/debate/reply-parser'
+import {
+  EMPTY_SPEECH_PLACEHOLDER,
+  INVALID_REPLY_PLACEHOLDER,
+  parseReply
+} from '../../../src/main/debate/reply-parser'
 
 describe('parseReply', () => {
   it('strictly parses a valid JSON reply', () => {
@@ -66,6 +70,16 @@ describe('parseReply', () => {
     expect(parsed.warning).toBeDefined()
   })
 
+  it('does not recover an incomplete top-level speech string', () => {
+    const parsed = parseReply('{"speech":"尚未闭合的正文')
+
+    expect(parsed.speech).toBe(INVALID_REPLY_PLACEHOLDER)
+    expect(parsed.speech).not.toContain('尚未闭合的正文')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
   it('does not expose reasoning content from an otherwise invalid JSON object', () => {
     const parsed = parseReply(
       '{"speech":"只显示回答。","status":"agree","reasoning_content":"秘密思考"}'
@@ -73,6 +87,67 @@ describe('parseReply', () => {
 
     expect(parsed.speech).toBe('只显示回答。')
     expect(parsed.speech).not.toContain('秘密思考')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('never recovers a nested speech field from reasoning content', () => {
+    const parsed = parseReply(
+      '{"reasoning_content":{"speech":"秘密思考不得显示"},"status":"continue"}'
+    )
+
+    expect(parsed.speech).toBe(INVALID_REPLY_PLACEHOLDER)
+    expect(parsed.speech).not.toContain('秘密思考不得显示')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('never recovers a nested speech field from a raw provider payload', () => {
+    const parsed = parseReply(
+      '{"rawPayload":{"speech":"secret provider payload"},"status":"continue"}'
+    )
+
+    expect(parsed.speech).toBe(INVALID_REPLY_PLACEHOLDER)
+    expect(parsed.speech).not.toContain('secret provider payload')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('removes an invalid status marker at the end without accepting its status', () => {
+    const parsed = parseReply('正文仍然可见。<debate-status>victory</debate-status>')
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('removes an unclosed status marker at the end', () => {
+    const parsed = parseReply('正文仍然可见。<debate-status>concede')
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('removes a closing status-tag fragment at the end', () => {
+    const parsed = parseReply('正文仍然可见。</debate-status>')
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('keeps a complete status tag in the middle as ordinary visible debate text', () => {
+    const raw = '正文中的 <debate-status>agree</debate-status> 是引用，后面还有论述。'
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(raw)
     expect(parsed.status).toBe('continue')
     expect(parsed.source).toBe('fallback')
     expect(parsed.warning).toBeDefined()

@@ -2,6 +2,7 @@ import type { DebateReply, DebateReplyStatus } from '../../shared/domain'
 import { debateReplySchema } from '../../shared/schemas'
 
 export const EMPTY_SPEECH_PLACEHOLDER = '（模型未返回可显示的发言）'
+export const INVALID_REPLY_PLACEHOLDER = '（模型返回了无法解析的回复）'
 
 export type ReplyParseSource = 'json' | 'tag' | 'fallback'
 
@@ -14,6 +15,10 @@ const MAX_SPEECH_LENGTH = 200_000
 const outerJsonFencePattern = /^\s*```(?:json)?[ \t]*\r?\n?([\s\S]*?)\r?\n?```\s*$/i
 const trailingStatusPattern =
   /\s*<debate-status>(continue|concede|agree)<\/debate-status>\s*$/
+const trailingInvalidStatusPattern =
+  /\s*<debate-status>[^<>]*<\/debate-status>\s*$/i
+const trailingUnclosedStatusPattern = /\s*<debate-status>[^<>]*$/i
+const closingStatusTag = '</debate-status>'
 
 const appendWarning = (warning: string | undefined, addition: string): string =>
   warning === undefined ? addition : `${warning} ${addition}`
@@ -47,57 +52,136 @@ const finalizeReply = ({
     : { speech: visibleSpeech, status, source, warning: finalWarning }
 }
 
-const decodeJsonStringContent = (content: string): string => {
-  try {
-    return JSON.parse(`"${content}"`) as string
-  } catch {
-    return content
-      .replaceAll('\\n', '\n')
-      .replaceAll('\\r', '\r')
-      .replaceAll('\\t', '\t')
-      .replaceAll('\\"', '"')
-      .replaceAll('\\\\', '\\')
-  }
+interface ParsedJsonString {
+  value: string
+  end: number
 }
 
-const recoverJsonSpeech = (input: string, parsed: unknown): string | undefined => {
-  if (
-    typeof parsed === 'object' &&
-    parsed !== null &&
-    'speech' in parsed &&
-    typeof parsed.speech === 'string'
-  ) {
-    return parsed.speech
-  }
-
-  const speechStart = /"speech"\s*:\s*"/.exec(input)
-
-  if (speechStart === null) {
+const parseJsonStringAt = (input: string, start: number): ParsedJsonString | undefined => {
+  if (input[start] !== '"') {
     return undefined
   }
 
-  const valueStart = speechStart.index + speechStart[0].length
   let escaped = false
-  let encodedSpeech = ''
 
-  for (let index = valueStart; index < input.length; index += 1) {
+  for (let index = start + 1; index < input.length; index += 1) {
     const character = input[index]
 
     if (character === '"' && !escaped) {
-      return decodeJsonStringContent(encodedSpeech)
+      try {
+        const value = JSON.parse(input.slice(start, index + 1)) as unknown
+        return typeof value === 'string' ? { value, end: index + 1 } : undefined
+      } catch {
+        return undefined
+      }
     }
 
-    encodedSpeech += character
+    escaped = character === '\\' && !escaped
+  }
 
-    if (character === '\\' && !escaped) {
-      escaped = true
-    } else {
-      escaped = false
+  return undefined
+}
+
+const skipWhitespace = (input: string, start: number): number => {
+  let index = start
+
+  while (/\s/.test(input[index] ?? '')) {
+    index += 1
+  }
+
+  return index
+}
+
+const recoverTopLevelJsonSpeech = (input: string, parsed: unknown): string | undefined => {
+  if (
+    typeof parsed === 'object' &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    Object.prototype.hasOwnProperty.call(parsed, 'speech') &&
+    typeof (parsed as { speech?: unknown }).speech === 'string'
+  ) {
+    return (parsed as { speech: string }).speech
+  }
+
+  const rootStart = skipWhitespace(input, 0)
+
+  if (input[rootStart] !== '{') {
+    return undefined
+  }
+
+  let depth = 0
+
+  for (let index = rootStart; index < input.length; index += 1) {
+    const character = input[index]
+
+    if (character === '"') {
+      const jsonString = parseJsonStringAt(input, index)
+
+      if (jsonString === undefined) {
+        return undefined
+      }
+
+      if (depth === 1) {
+        const colonIndex = skipWhitespace(input, jsonString.end)
+
+        if (input[colonIndex] === ':' && jsonString.value === 'speech') {
+          const speechStart = skipWhitespace(input, colonIndex + 1)
+          return parseJsonStringAt(input, speechStart)?.value
+        }
+      }
+
+      index = jsonString.end - 1
+      continue
+    }
+
+    if (character === '{' || character === '[') {
+      depth += 1
+    } else if (character === '}' || character === ']') {
+      depth -= 1
     }
   }
 
-  return decodeJsonStringContent(encodedSpeech)
+  return undefined
 }
+
+/*
+ * Invalid structured output must never be rendered wholesale because it can
+ * contain provider-only reasoning or raw payload fields. Recovery is limited
+ * to one complete top-level JSON string named `speech`.
+ */
+const recoverVisibleStructuredSpeech = (input: string, parsed: unknown): string =>
+  recoverTopLevelJsonSpeech(input, parsed) ?? INVALID_REPLY_PLACEHOLDER
+
+const stripTrailingMachineMarker = (input: string): string | undefined => {
+  const invalidStatusMatch = trailingInvalidStatusPattern.exec(input)
+
+  if (invalidStatusMatch !== null) {
+    return input.slice(0, invalidStatusMatch.index)
+  }
+
+  const unclosedStatusMatch = trailingUnclosedStatusPattern.exec(input)
+
+  if (unclosedStatusMatch !== null) {
+    return input.slice(0, unclosedStatusMatch.index)
+  }
+
+  const lastTagStart = input.lastIndexOf('<')
+
+  if (lastTagStart === -1) {
+    return undefined
+  }
+
+  const possibleClosingFragment = input.slice(lastTagStart).trim().toLowerCase()
+
+  return closingStatusTag.startsWith(possibleClosingFragment)
+    ? input.slice(0, lastTagStart)
+    : undefined
+}
+
+const fallbackVisibleSpeech = (input: string, parsed: unknown): string =>
+  input.startsWith('{') || input.startsWith('[')
+    ? recoverVisibleStructuredSpeech(input, parsed)
+    : input
 
 export const parseReply = (raw: string): ParsedDebateReply => {
   const trimmedRaw = raw.trim()
@@ -126,12 +210,30 @@ export const parseReply = (raw: string): ParsedDebateReply => {
     })
   }
 
-  const recoveredSpeech = recoverJsonSpeech(candidate, parsedJson)
-  const looksLikeStructuredOutput = candidate.startsWith('{') || candidate.startsWith('[')
-  const fallbackSpeech = recoveredSpeech ?? (looksLikeStructuredOutput ? '' : candidate)
+  const speechWithoutMachineMarker = stripTrailingMachineMarker(trimmedRaw)
+
+  if (speechWithoutMachineMarker !== undefined) {
+    const cleanedRaw = speechWithoutMachineMarker.trim()
+    const cleanedFenceMatch = outerJsonFencePattern.exec(cleanedRaw)
+    const cleanedCandidate = (cleanedFenceMatch?.[1] ?? cleanedRaw).trim()
+    let cleanedJson: unknown
+
+    try {
+      cleanedJson = JSON.parse(cleanedCandidate)
+    } catch {
+      cleanedJson = undefined
+    }
+
+    return finalizeReply({
+      speech: fallbackVisibleSpeech(cleanedCandidate, cleanedJson),
+      status: 'continue',
+      source: 'fallback',
+      warning: '已移除无效或不完整的末尾辩论状态标记，状态按 continue 处理。'
+    })
+  }
 
   return finalizeReply({
-    speech: fallbackSpeech,
+    speech: fallbackVisibleSpeech(candidate, parsedJson),
     status: 'continue',
     source: 'fallback',
     warning: '模型输出不符合回复 contract，状态已按 continue 处理。'
