@@ -109,7 +109,8 @@ const recoverTopLevelJsonSpeech = (input: string, parsed: unknown): string | und
     return undefined
   }
 
-  let depth = 0
+  const containerStack: Array<'{' | '['> = []
+  let recoveredSpeech: string | undefined
 
   for (let index = rootStart; index < input.length; index += 1) {
     const character = input[index]
@@ -118,15 +119,23 @@ const recoverTopLevelJsonSpeech = (input: string, parsed: unknown): string | und
       const jsonString = parseJsonStringAt(input, index)
 
       if (jsonString === undefined) {
-        return undefined
+        return recoveredSpeech
       }
 
-      if (depth === 1) {
+      if (containerStack.length === 1 && containerStack[0] === '{') {
         const colonIndex = skipWhitespace(input, jsonString.end)
 
         if (input[colonIndex] === ':' && jsonString.value === 'speech') {
           const speechStart = skipWhitespace(input, colonIndex + 1)
-          return parseJsonStringAt(input, speechStart)?.value
+          const speech = parseJsonStringAt(input, speechStart)
+
+          if (speech === undefined) {
+            return undefined
+          }
+
+          recoveredSpeech = speech.value
+          index = speech.end - 1
+          continue
         }
       }
 
@@ -135,13 +144,21 @@ const recoverTopLevelJsonSpeech = (input: string, parsed: unknown): string | und
     }
 
     if (character === '{' || character === '[') {
-      depth += 1
+      containerStack.push(character)
     } else if (character === '}' || character === ']') {
-      depth -= 1
+      const expectedOpener = character === '}' ? '{' : '['
+
+      if (containerStack.pop() !== expectedOpener) {
+        return undefined
+      }
+
+      if (containerStack.length === 0) {
+        return input.slice(index + 1).trim().length === 0 ? recoveredSpeech : undefined
+      }
     }
   }
 
-  return undefined
+  return recoveredSpeech
 }
 
 /*
@@ -173,7 +190,8 @@ const stripTrailingMachineMarker = (input: string): string | undefined => {
 
   const possibleClosingFragment = input.slice(lastTagStart).trim().toLowerCase()
 
-  return closingStatusTag.startsWith(possibleClosingFragment)
+  return possibleClosingFragment.startsWith('</debate-') &&
+    closingStatusTag.startsWith(possibleClosingFragment)
     ? input.slice(0, lastTagStart)
     : undefined
 }

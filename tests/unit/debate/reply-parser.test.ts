@@ -116,6 +116,56 @@ describe('parseReply', () => {
     expect(parsed.warning).toBeDefined()
   })
 
+  it.each([
+    '{"metadata":[},"speech":"方括号与花括号不匹配后的泄漏"',
+    '{"metadata":{],"speech":"花括号与方括号不匹配后的泄漏"'
+  ])('abandons speech recovery after a mismatched JSON closer: %s', (raw) => {
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(INVALID_REPLY_PLACEHOLDER)
+    expect(parsed.speech).not.toContain('泄漏')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it.each([
+    '{"speech":"不得在后续结构错配时显示","metadata":[}}',
+    '{"speech":"不得在根闭合后有残余时显示"} trailing-data',
+    '{"speech":"不得在根闭合后发生栈下溢时显示"}}'
+  ])('abandons an early recovered speech when later JSON structure is invalid: %s', (raw) => {
+    const parsed = parseReply(raw)
+
+    expect(parsed.speech).toBe(INVALID_REPLY_PLACEHOLDER)
+    expect(parsed.speech).not.toContain('不得')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('recovers a top-level speech after valid nested objects and arrays', () => {
+    const parsed = parseReply(
+      '{"metadata":{"items":[{"speech":"嵌套内容"}]},"speech":"安全的顶层正文","status":"bro'
+    )
+
+    expect(parsed.speech).toBe('安全的顶层正文')
+    expect(parsed.speech).not.toContain('嵌套内容')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it('recovers a complete top-level speech when later JSON is truncated but structurally valid so far', () => {
+    const parsed = parseReply(
+      '{"metadata":[1,{"safe":true}],"speech":"截断前安全正文","status":"con'
+    )
+
+    expect(parsed.speech).toBe('截断前安全正文')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
   it('removes an invalid status marker at the end without accepting its status', () => {
     const parsed = parseReply('正文仍然可见。<debate-status>victory</debate-status>')
 
@@ -136,6 +186,27 @@ describe('parseReply', () => {
 
   it('removes a closing status-tag fragment at the end', () => {
     const parsed = parseReply('正文仍然可见。</debate-status>')
+
+    expect(parsed.speech).toBe('正文仍然可见。')
+    expect(parsed.status).toBe('continue')
+    expect(parsed.source).toBe('fallback')
+    expect(parsed.warning).toBeDefined()
+  })
+
+  it.each(['普通正文<', '普通正文</', '普通正文</d', '数学比较：1 <'])(
+    'keeps an ordinary short closing-tag-like suffix visible: %s',
+    (raw) => {
+      const parsed = parseReply(raw)
+
+      expect(parsed.speech).toBe(raw)
+      expect(parsed.status).toBe('continue')
+      expect(parsed.source).toBe('fallback')
+      expect(parsed.warning).toBeDefined()
+    }
+  )
+
+  it('removes a suffix clearly attributable to a debate-status closing tag', () => {
+    const parsed = parseReply('正文仍然可见。</debate-sta')
 
     expect(parsed.speech).toBe('正文仍然可见。')
     expect(parsed.status).toBe('continue')
