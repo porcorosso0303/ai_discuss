@@ -117,6 +117,47 @@ describe('parseSse', () => {
     expect(stream.locked).toBe(false)
   })
 
+  it('honors an early DONE marker before limiting trailing bytes in the same chunk', async () => {
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encode(`data: first\n\ndata: [DONE]\n\n${'x'.repeat(1024)}`))
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+
+    await expect(
+      collect(
+        parseSse(stream, {
+          maxLineLength: 32,
+          maxEventLength: 64,
+          maxBufferLength: 64
+        })
+      )
+    ).resolves.toEqual([{ data: 'first' }])
+    expect(cancelled).toBe(true)
+  })
+
+  it('accepts one large transport chunk containing many bounded events', async () => {
+    const payload = Array.from({ length: 100 }, (_, index) => `data: ${index}\n\n`).join(
+      ''
+    )
+
+    const events = await collect(
+      parseSse(streamFromChunks([encode(payload)]), {
+        maxLineLength: 32,
+        maxEventLength: 64,
+        maxBufferLength: 64
+      })
+    )
+
+    expect(events).toHaveLength(100)
+    expect(events.at(0)).toEqual({ data: '0' })
+    expect(events.at(-1)).toEqual({ data: '99' })
+  })
+
   it('checks an already-aborted signal before acquiring a reader', async () => {
     const reason = new DOMException('cancelled first', 'AbortError')
     const controller = new AbortController()

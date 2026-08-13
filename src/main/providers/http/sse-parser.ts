@@ -54,6 +54,7 @@ export async function* parseSse(
   const maxLineLength = positiveInteger(options.maxLineLength, DEFAULT_MAX_LINE_LENGTH)
   const maxEventLength = positiveInteger(options.maxEventLength, DEFAULT_MAX_EVENT_LENGTH)
   const maxBufferLength = positiveInteger(options.maxBufferLength, DEFAULT_MAX_BUFFER_LENGTH)
+  const decodeSliceLength = Math.max(1, maxBufferLength)
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -190,19 +191,23 @@ export async function* parseSse(
         return
       }
 
-      let text = decoder.decode(value, { stream: true })
-      if (atStart && text !== '') {
-        atStart = false
-        if (text.startsWith('\uFEFF')) text = text.slice(1)
+      for (let offset = 0; offset < value.byteLength && !terminated; ) {
+        const end = Math.min(value.byteLength, offset + decodeSliceLength)
+        let text = decoder.decode(value.subarray(offset, end), { stream: true })
+        offset = end
+        if (atStart && text !== '') {
+          atStart = false
+          if (text.startsWith('\uFEFF')) text = text.slice(1)
+        }
+        buffer += text
+        drain(false)
+        if (buffer.length > maxBufferLength) {
+          throw new SseLimitError(
+            `SSE buffer limit exceeded (${maxBufferLength} characters)`
+          )
+        }
+        while (pending.length > 0) yield pending.shift() as SseEvent
       }
-      buffer += text
-      if (buffer.length > maxBufferLength) {
-        throw new SseLimitError(
-          `SSE buffer limit exceeded (${maxBufferLength} characters)`
-        )
-      }
-      drain(false)
-      while (pending.length > 0) yield pending.shift() as SseEvent
     }
     if (terminated) await reader.cancel().catch(() => undefined)
     completed = true
