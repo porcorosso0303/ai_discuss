@@ -1,7 +1,9 @@
 import { z } from 'zod'
 
-const summaryItemSchema = z.string().trim().min(1).max(4000)
-const MAX_SUMMARY_CONTENT_LENGTH = 32_000
+export const ARGUMENT_SUMMARY_ITEM_MAX_LENGTH = 4000
+export const ARGUMENT_SUMMARY_CONTENT_MAX_LENGTH = 32_000
+
+const summaryItemSchema = z.string().trim().min(1).max(ARGUMENT_SUMMARY_ITEM_MAX_LENGTH)
 
 export const argumentSummarySchema = z
   .strictObject({
@@ -20,7 +22,7 @@ export const argumentSummarySchema = z
       [...claims, ...evidence, ...concessions, ...disputes].reduce(
         (total, item) => total + item.length,
         0
-      ) <= MAX_SUMMARY_CONTENT_LENGTH,
+      ) <= ARGUMENT_SUMMARY_CONTENT_MAX_LENGTH,
     { message: 'argument summary exceeds the aggregate content limit' }
   )
 
