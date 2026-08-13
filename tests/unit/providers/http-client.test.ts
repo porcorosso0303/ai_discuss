@@ -54,6 +54,125 @@ describe('fetchJson', () => {
       .toBeUndefined()
   })
 
+  it('rejects an oversized successful JSON body and cancels/releases its reader', async () => {
+    let cancelled = false
+    const secret = 'oversized-body-secret'
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encode(`{"secret":"${secret}"}`))
+      },
+      cancel() {
+        cancelled = true
+      }
+    })
+    const fetchImpl = vi.fn(async () => new Response(body, { status: 200 }))
+
+    const error = await fetchJson('https://api.example.test/models', {}, {
+      fetch: fetchImpl,
+      maxJsonBodyBytes: 8
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(HttpResponseError)
+    expect((error as Error).message).toMatch(/too large/i)
+    expect((error as Error).message.length).toBeLessThan(200)
+    expect(JSON.stringify(error)).not.toContain(secret)
+    expect(cancelled).toBe(true)
+    expect(body.locked).toBe(false)
+  })
+
+  it('accepts the exact JSON byte limit and rejects one byte beyond it', async () => {
+    const json = '{"ok":true}'
+    const byteLength = encode(json).byteLength
+
+    await expect(
+      fetchJson('https://api.example.test/exact', {}, {
+        fetch: async () => new Response(json),
+        maxJsonBodyBytes: byteLength
+      })
+    ).resolves.toEqual({ ok: true })
+
+    await expect(
+      fetchJson('https://api.example.test/over', {}, {
+        fetch: async () => new Response(json),
+        maxJsonBodyBytes: byteLength - 1
+      })
+    ).rejects.toBeInstanceOf(HttpResponseError)
+  })
+
+  it.each([0, Number.NaN, 1.5])(
+    'rejects invalid maxJsonBodyBytes=%s before fetch',
+    async (maxJsonBodyBytes) => {
+      const fetchImpl = vi.fn(async () => new Response('{}'))
+
+      await expect(
+        fetchJson('https://api.example.test/models', {}, {
+          fetch: fetchImpl,
+          maxJsonBodyBytes
+        })
+      ).rejects.toBeInstanceOf(RangeError)
+      expect(fetchImpl).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each(['multiple small chunks', 'one oversized transport chunk'])(
+    'enforces the JSON byte limit for %s',
+    async (shape) => {
+      let cancelled = false
+      const bytes = encode('{"secret":"chunked-secret"}')
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (shape === 'multiple small chunks') {
+            for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+          } else {
+            controller.enqueue(bytes)
+          }
+        },
+        cancel() {
+          cancelled = true
+        }
+      })
+
+      await expect(
+        fetchJson('https://api.example.test/models', {}, {
+          fetch: async () => new Response(body),
+          maxJsonBodyBytes: 5
+        })
+      ).rejects.toBeInstanceOf(HttpResponseError)
+      expect(cancelled).toBe(true)
+      expect(body.locked).toBe(false)
+    }
+  )
+
+  it('defines the JSON limit in bytes at a split UTF-8 boundary', async () => {
+    const json = '{"value":"你"}'
+    const bytes = encode(json)
+    const splitInsideCharacter = bytes.indexOf(0xe4) + 1
+    const response = (): Response =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes.subarray(0, splitInsideCharacter))
+            controller.enqueue(bytes.subarray(splitInsideCharacter))
+            controller.close()
+          }
+        })
+      )
+
+    await expect(
+      fetchJson('https://api.example.test/unicode', {}, {
+        fetch: async () => response(),
+        maxJsonBodyBytes: bytes.byteLength
+      })
+    ).resolves.toEqual({ value: '你' })
+
+    await expect(
+      fetchJson('https://api.example.test/unicode', {}, {
+        fetch: async () => response(),
+        maxJsonBodyBytes: bytes.byteLength - 1
+      })
+    ).rejects.toBeInstanceOf(HttpResponseError)
+  })
+
   it('throws a typed bounded status error with Retry-After and a redacted body', async () => {
     const secret = 'response-secret'
     const fetchImpl = vi.fn(async () =>
