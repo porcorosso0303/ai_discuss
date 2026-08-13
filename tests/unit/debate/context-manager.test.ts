@@ -292,18 +292,47 @@ describe('ContextManager', () => {
     expect(JSON.stringify(first.summary?.summary).length).toBeLessThan(4000)
   })
 
-  it('passes the exact AbortSignal and falls back when summarization aborts', async () => {
+  it('rejects an already-aborted signal without calling the summary provider', async () => {
+    const reason = new DOMException('user stopped before summary', 'AbortError')
     const controller = new AbortController()
-    const summarize = vi.fn((_request, signal?: AbortSignal) => {
-      expect(signal).toBe(controller.signal)
-      return Promise.reject(new DOMException('secret abort detail', 'AbortError'))
+    controller.abort(reason)
+    const summarize = vi.fn().mockResolvedValue({
+      claims: ['must not be used'],
+      evidence: [],
+      concessions: [],
+      disputes: []
     })
     const manager = new ContextManager({
       summaryProvider: { provider: 'kimi', model: 'kimi-k2', summarize },
       estimateTokens: () => 100
     })
 
-    const result = await manager.prepare({
+    await expect(
+      manager.prepare({
+        session: session(21),
+        currentRoleId: 'role-a',
+        modelCapability: capability(100),
+        signal: controller.signal
+      })
+    ).rejects.toBe(reason)
+
+    expect(summarize).not.toHaveBeenCalled()
+  })
+
+  it('propagates the original AbortError when the active summary call is cancelled', async () => {
+    const controller = new AbortController()
+    const abortError = new DOMException('provider observed cancellation', 'AbortError')
+    let rejectSummary!: (reason: unknown) => void
+    const summarize = vi.fn((_request, signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal)
+      return new Promise<unknown>((_resolve, reject) => {
+        rejectSummary = reject
+      })
+    })
+    const pending = new ContextManager({
+      summaryProvider: { provider: 'kimi', model: 'kimi-k2', summarize },
+      estimateTokens: () => 100
+    }).prepare({
       session: session(21),
       currentRoleId: 'role-a',
       modelCapability: capability(100),
@@ -311,9 +340,56 @@ describe('ContextManager', () => {
     })
 
     expect(summarize).toHaveBeenCalledTimes(1)
-    expect(result.summary?.source).toBe('fallback')
-    expect(result.warning).toMatch(/摘要服务不可用/)
-    expect(result.warning).not.toContain('secret abort detail')
+    controller.abort()
+    rejectSummary(abortError)
+
+    await expect(pending).rejects.toBe(abortError)
+  })
+
+  it('rejects cancellation after an abort-ignoring summary provider resolves', async () => {
+    const controller = new AbortController()
+    const reason = new DOMException('user stopped during summary', 'AbortError')
+    let resolveSummary!: (value: unknown) => void
+    const summarize = vi.fn((_request, signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal)
+      return new Promise<unknown>((resolve) => {
+        resolveSummary = resolve
+      })
+    })
+    const pending = new ContextManager({
+      summaryProvider: { provider: 'openai', model: 'summary-model', summarize },
+      estimateTokens: () => 100
+    }).prepare({
+      session: session(21),
+      currentRoleId: 'role-a',
+      modelCapability: capability(100),
+      signal: controller.signal
+    })
+
+    controller.abort(reason)
+    resolveSummary({ claims: ['late result'], evidence: [], concessions: [], disputes: [] })
+
+    await expect(pending).rejects.toBe(reason)
+  })
+
+  it('passes a non-aborted signal through unchanged and accepts a valid summary', async () => {
+    const controller = new AbortController()
+    const summarize = vi.fn((_request, signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal)
+      return Promise.resolve({ claims: ['valid'], evidence: [], concessions: [], disputes: [] })
+    })
+    const result = await new ContextManager({
+      summaryProvider: { provider: 'deepseek', model: 'summary-model', summarize },
+      estimateTokens: vi.fn().mockReturnValueOnce(100).mockReturnValue(1)
+    }).prepare({
+      session: session(21),
+      currentRoleId: 'role-a',
+      modelCapability: capability(100),
+      signal: controller.signal
+    })
+
+    expect(summarize).toHaveBeenCalledTimes(1)
+    expect(result.summary?.source).toBe('provider')
   })
 
   it.each([

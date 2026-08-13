@@ -107,6 +107,12 @@ const boundedIdentifier = (value: string, fallback: string, maxLength: number): 
 const appendWarning = (current: string | undefined, addition: string): string =>
   current === undefined ? addition : `${current}；${addition}`
 
+const isAbortError = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'name' in error &&
+  error.name === 'AbortError'
+
 const truncateUnicode = (value: string, maxLength: number): string => {
   if (value.length <= maxLength) {
     return value
@@ -220,7 +226,7 @@ export class ContextManager {
       coveredThroughTurn,
       messages: coveredMessages.map((oldMessage) => this.projectMessage(session, oldMessage))
     }
-    let summary: ArgumentSummary
+    let summary: ArgumentSummary | undefined
     let source: 'provider' | 'fallback' = 'provider'
     let provider = boundedIdentifier(
       this.dependencies.summaryProvider.provider,
@@ -230,10 +236,25 @@ export class ContextManager {
     let model = boundedIdentifier(this.dependencies.summaryProvider.model, 'summary-model', 200)
     let warning: string | undefined
 
+    let providerResult: unknown
     try {
-      const parsed = argumentSummarySchema.safeParse(
-        await this.dependencies.summaryProvider.summarize(request, signal)
-      )
+      signal?.throwIfAborted()
+      providerResult = await this.dependencies.summaryProvider.summarize(request, signal)
+      signal?.throwIfAborted()
+    } catch (error) {
+      if (signal?.aborted || isAbortError(error)) {
+        throw error
+      }
+
+      source = 'fallback'
+      provider = 'fallback'
+      model = 'deterministic-local'
+      warning = '论点摘要服务不可用，已使用本地确定性摘要。'
+      summary = deterministicFallback(request)
+    }
+
+    if (summary === undefined) {
+      const parsed = argumentSummarySchema.safeParse(providerResult)
       if (!parsed.success) {
         source = 'fallback'
         provider = 'fallback'
@@ -243,12 +264,6 @@ export class ContextManager {
       } else {
         summary = parsed.data
       }
-    } catch {
-      source = 'fallback'
-      provider = 'fallback'
-      model = 'deterministic-local'
-      warning = '论点摘要服务不可用，已使用本地确定性摘要。'
-      summary = deterministicFallback(request)
     }
 
     let metadata = argumentSummaryMetadataSchema.parse({
