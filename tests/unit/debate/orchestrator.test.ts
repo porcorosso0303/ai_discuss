@@ -658,6 +658,67 @@ describe('DebateOrchestrator provider failures', () => {
     }
   )
 
+  it('fails and persists validation when the configured model is absent from discovery', async () => {
+    const openai = new FakeProvider([
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('不应开始的发言') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    openai.discover = async () => ({
+      provider: 'openai',
+      models: [
+        {
+          id: 'gpt-5-mini',
+          reasoningEfforts: [],
+          thinking: null,
+          samplingParameters: [],
+          structuredOutputModes: ['json-object']
+        }
+      ],
+      defaultModel: 'gpt-5-mini'
+    })
+    const kimi = new FakeProvider([])
+    const repository = new FakeDebateRepository()
+    const events: Array<{
+      type: string
+      code?: string
+      roleId?: string
+      retryable?: boolean
+      state?: string
+    }> = []
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi, deepseek: new FakeProvider([]) },
+      repository,
+      onEvent: (event) => events.push(event)
+    })
+
+    await expect(orchestrator.start(setup(1))).rejects.toBeInstanceOf(
+      ProviderNonRetryableError
+    )
+
+    const failed = orchestrator.getSession()
+    expect(failed).toMatchObject({
+      state: 'failed',
+      terminationReason: 'call-failed',
+      currentTurn: 0,
+      messages: []
+    })
+    expect(openai.requests).toHaveLength(0)
+    expect(kimi.requests).toHaveLength(0)
+    expect(events.at(-2)).toMatchObject({
+      type: 'warning',
+      code: 'provider-discovery-error',
+      roleId: 'role-a',
+      retryable: false
+    })
+    expect(events.at(-1)).toMatchObject({ type: 'state-changed', state: 'failed' })
+    expect(repository.saved.at(-1)).toEqual(failed)
+  })
+
   it('makes at most three total attempts for retryable errors without saving a message', async () => {
     const openai = new FakeProvider([
       { error: new ProviderRetryableError('temporary-1') },

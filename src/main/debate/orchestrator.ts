@@ -8,6 +8,7 @@ import type {
 } from '../../shared/domain'
 import { debateEventSchema, debateSetupSchema } from '../../shared/schemas'
 import {
+  ProviderNonRetryableError,
   ProviderRefusalError,
   isRetryableProviderError,
   type ProviderRegistry
@@ -79,7 +80,12 @@ export class DebateOrchestrator {
 
     for (const role of setup.roles) {
       try {
-        await this.dependencies.registry[role.provider].discover(role)
+        const capabilities = await this.dependencies.registry[role.provider].discover(role)
+        if (!capabilities.models.some(({ id }) => id === role.model)) {
+          throw new ProviderNonRetryableError(
+            'The configured model is not available from provider discovery'
+          )
+        }
       } catch (error) {
         this.emitProviderDiscoveryError(role, error)
         this.transition({ type: 'validationFailed' })

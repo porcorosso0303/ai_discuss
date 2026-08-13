@@ -29,8 +29,8 @@ export interface KimiProviderDependencies {
 const endpoint = (baseUrl: string, path: string): string =>
   `${baseUrl.replace(/\/+$/, '')}/${path}`
 
-const capabilityKey = (baseUrl: string, model: string): string =>
-  `${baseUrl.replace(/\/+$/, '')}\n${model}`
+const capabilityKey = (baseUrl: string, model: string, roleId: string): string =>
+  `${roleId}\n${baseUrl.replace(/\/+$/, '')}\n${model}`
 
 const standardSampling: ModelCapability['samplingParameters'] = [
   { name: 'temperature', min: 0, max: 1 },
@@ -104,9 +104,11 @@ const normalizeError = (error: unknown, signal?: AbortSignal): Error => {
 
 const isOfficialBase = (baseUrl: string): boolean => {
   const url = new URL(baseUrl)
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, '')
   return (
-    (url.origin === 'https://api.moonshot.cn' ||
-      url.origin === 'https://api.moonshot.ai') &&
+    url.protocol === 'https:' &&
+    url.port === '' &&
+    (hostname === 'api.moonshot.cn' || hostname === 'api.moonshot.ai') &&
     url.pathname.replace(/\/+$/, '') === '/v1'
   )
 }
@@ -126,7 +128,10 @@ const requireApiKey = (value: string): string => {
 }
 
 export class KimiProvider implements Provider {
-  private readonly discoveredCapabilities = new Map<string, ModelCapability>()
+  private readonly discoveredCapabilitiesByRole = new Map<
+    string,
+    ReadonlyMap<string, ModelCapability>
+  >()
 
   constructor(private readonly dependencies: KimiProviderDependencies) {}
 
@@ -168,12 +173,14 @@ export class KimiProvider implements Provider {
       ]
     }
 
+    const roleCapabilities = new Map<string, ModelCapability>()
     for (const capability of models) {
-      this.discoveredCapabilities.set(
-        capabilityKey(kimiConfig.baseUrl, capability.id),
+      roleCapabilities.set(
+        capabilityKey(kimiConfig.baseUrl, capability.id, kimiConfig.roleId),
         capability
       )
     }
+    this.discoveredCapabilitiesByRole.set(kimiConfig.roleId, roleCapabilities)
 
     return providerCapabilitiesSchema.parse({
       provider: 'kimi',
@@ -192,9 +199,9 @@ export class KimiProvider implements Provider {
     let apiKey: string
     try {
       config = kimiRoleConfigSchema.parse(request.role)
-      const capability = this.discoveredCapabilities.get(
-        capabilityKey(config.baseUrl, config.model)
-      )
+      const capability = this.discoveredCapabilitiesByRole
+        .get(config.roleId)
+        ?.get(capabilityKey(config.baseUrl, config.model, config.roleId))
       if (
         capability !== undefined &&
         ((capability.thinking === null &&
@@ -287,6 +294,11 @@ export class KimiProvider implements Provider {
           throw new ProviderNonRetryableError('Kimi streaming response contained invalid JSON')
         }
         const chunk = kimiChatChunkSchema.parse(raw)
+        if (completed && chunk.choices.length > 0) {
+          throw new ProviderNonRetryableError(
+            'Kimi streaming response continued after completion'
+          )
+        }
         for (const choice of chunk.choices) {
           if (choice.delta.content !== undefined && choice.delta.content !== '') {
             const nextVisibleContentChars = visibleContentChars + choice.delta.content.length
@@ -299,7 +311,7 @@ export class KimiProvider implements Provider {
             yield { type: 'content', content: choice.delta.content }
           }
         }
-        if (chunk.usage !== undefined) {
+        if (chunk.usage !== undefined && chunk.usage !== null) {
           yield {
             type: 'usage',
             usage: {

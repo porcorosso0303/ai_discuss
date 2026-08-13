@@ -19,15 +19,17 @@ export const kimiChatChunkSchema = z.object({
   choices: z
     .array(
       z.object({
-        index: z.number().int().nonnegative(),
+        index: z.literal(0),
         delta: z.object({
           content: z.string().max(1024 * 1024).optional(),
           reasoning_content: z.string().max(1024 * 1024).optional()
         }),
-        finish_reason: z.string().max(100).nullable()
+        finish_reason: z
+          .enum(['stop', 'length', 'content_filter', 'refusal'])
+          .nullable()
       })
     )
-    .max(8),
+    .max(1),
   usage: z
     .object({
       prompt_tokens: boundedTokenCount,
@@ -35,5 +37,6 @@ export const kimiChatChunkSchema = z.object({
       total_tokens: boundedTokenCount,
       cached_tokens: boundedTokenCount.optional()
     })
+    .nullable()
     .optional()
 })

@@ -154,9 +154,51 @@ describe('KimiProvider model discovery', () => {
     })
   })
 
+  it('isolates discovered capabilities between roles sharing an endpoint and model', async () => {
+    const shared = role({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'custom-shared-model',
+      effort: undefined,
+      thinking: undefined
+    })
+    const roleB = { ...shared, roleId: 'role-b' as const }
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const authorization = (init?.headers as Record<string, string>).Authorization
+      return Response.json({
+        object: 'list',
+        data: [
+          {
+            id: shared.model,
+            context_length: 64_000,
+            supports_reasoning: authorization === 'Bearer key-role-b'
+          }
+        ]
+      })
+    })
+    const provider = new KimiProvider({
+      fetch: fetchImpl,
+      getApiKey: async (config) => `key-${config.roleId}`
+    })
+
+    await provider.discover(shared)
+    await provider.discover(roleB)
+
+    await expect(
+      collect(
+        provider.streamReply(
+          request({ ...shared, thinking: true }),
+          new AbortController().signal
+        )
+      )
+    ).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
   it.each([
     ['https://api.moonshot.cn/v1', 401, ProviderNonRetryableError],
-    ['https://api.moonshot.ai/v1/', 503, ProviderRetryableError]
+    ['https://api.moonshot.ai/v1/', 503, ProviderRetryableError],
+    ['https://api.moonshot.cn./v1', 401, ProviderNonRetryableError],
+    ['https://api.moonshot.ai./v1/', 401, ProviderNonRetryableError]
   ] as const)(
     'propagates a safe typed discovery failure from official base %s',
     async (baseUrl, status, ErrorType) => {
@@ -290,6 +332,52 @@ describe('KimiProvider model discovery', () => {
 })
 
 describe('KimiProvider chat completions', () => {
+  it('accepts official nullable usage and a final empty-choices usage chunk', async () => {
+    const provider = new KimiProvider({
+      fetch: async () =>
+        sseResponse([
+          {
+            choices: [
+              { index: 0, delta: { content: '{"speech":"ok"' }, finish_reason: null }
+            ],
+            usage: null
+          },
+          {
+            choices: [
+              {
+                index: 0,
+                delta: { content: ',"status":"continue"}' },
+                finish_reason: 'stop'
+              }
+            ],
+            usage: null
+          },
+          {
+            choices: [],
+            usage: {
+              prompt_tokens: 11,
+              completion_tokens: 7,
+              total_tokens: 18,
+              cached_tokens: 3
+            }
+          }
+        ]),
+      getApiKey: async () => secret
+    })
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).resolves.toEqual([
+      { type: 'content', content: '{"speech":"ok"' },
+      { type: 'content', content: ',"status":"continue"}' },
+      { type: 'final', finishReason: 'stop' },
+      {
+        type: 'usage',
+        usage: { inputTokens: 11, outputTokens: 7, totalTokens: 18, cacheReadTokens: 3 }
+      }
+    ])
+  })
+
   it('sends the current K3 strict streaming contract and exposes content but never reasoning', async () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       sseResponse(chatFixture)
@@ -517,6 +605,74 @@ describe('KimiProvider chat completions', () => {
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
     ).resolves.toEqual([{ type: 'final', finishReason: expected }])
+  })
+
+  it.each([
+    [
+      'multiple choices',
+      [
+        { index: 0, delta: {}, finish_reason: 'stop' },
+        { index: 0, delta: {}, finish_reason: 'stop' }
+      ]
+    ],
+    ['a nonzero choice index', [{ index: 1, delta: {}, finish_reason: 'stop' }]]
+  ])('rejects %s before yielding provider chunks', async (_shape, choices) => {
+    const provider = new KimiProvider({
+      fetch: async () => sseResponse([{ choices }]),
+      getApiKey: async () => secret
+    })
+    const iterator = provider
+      .streamReply(request(), new AbortController().signal)
+      [Symbol.asyncIterator]()
+
+    await expect(iterator.next()).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
+  it.each([
+    [
+      'a repeated finish',
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+    ],
+    [
+      'content after finish',
+      {
+        choices: [
+          { index: 0, delta: { content: 'late upstream content' }, finish_reason: null }
+        ]
+      }
+    ]
+  ])('rejects %s without yielding it', async (_shape, trailingEvent) => {
+    const provider = new KimiProvider({
+      fetch: async () =>
+        sseResponse([
+          { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          trailingEvent
+        ]),
+      getApiKey: async () => secret
+    })
+    const iterator = provider
+      .streamReply(request(), new AbortController().signal)
+      [Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: { type: 'final', finishReason: 'stop' }
+    })
+    await expect(iterator.next()).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
+  it('rejects an unknown finish reason', async () => {
+    const provider = new KimiProvider({
+      fetch: async () =>
+        sseResponse([
+          { choices: [{ index: 0, delta: {}, finish_reason: 'future_reason' }] }
+        ]),
+      getApiKey: async () => secret
+    })
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderNonRetryableError)
   })
 
   it.each([
