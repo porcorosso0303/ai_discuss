@@ -59,7 +59,7 @@ const throwIfAborted = (signal: AbortSignal | undefined): void => {
   if (signal?.aborted) throw abortReason(signal)
 }
 
-const defaultSleep: RetrySleep = (delayMs, signal) =>
+export const defaultRetrySleep: RetrySleep = (delayMs, signal) =>
   new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
       reject(abortReason(signal))
@@ -132,18 +132,41 @@ const normalizedRandom = (random: () => number): number => {
 }
 
 const retryDelay = (
-  error: HttpNetworkError | HttpStatusError,
+  retryAfter: string | undefined,
   failedAttempt: number,
   options: Required<Pick<RetryOptions, 'baseDelayMs' | 'maxDelayMs' | 'random' | 'now'>>
 ): number => {
-  const headerDelay =
-    error instanceof HttpStatusError
-      ? retryAfterDelay(error.retryAfter, options.now())
-      : undefined
+  const headerDelay = retryAfterDelay(retryAfter, options.now())
   const exponential = options.baseDelayMs * 2 ** (failedAttempt - 1)
   const jittered = exponential * (0.5 + normalizedRandom(options.random) * 0.5)
   const selected = headerDelay ?? jittered
   return Math.min(options.maxDelayMs, Math.max(0, selected))
+}
+
+export type RetryDelayOptions = Pick<
+  RetryOptions,
+  'baseDelayMs' | 'maxDelayMs' | 'random' | 'now'
+>
+
+export const retryDelayMs = (
+  retryAfter: string | undefined,
+  failedAttempt: number,
+  options: RetryDelayOptions = {}
+): number => {
+  if (!Number.isSafeInteger(failedAttempt) || failedAttempt < 1) {
+    throw new RangeError('failedAttempt must be a positive integer')
+  }
+
+  return retryDelay(retryAfter, failedAttempt, {
+    baseDelayMs: boundedPositive(options.baseDelayMs, DEFAULT_BASE_DELAY_MS),
+    maxDelayMs: boundedPositive(
+      options.maxDelayMs,
+      DEFAULT_MAX_DELAY_MS,
+      HARD_MAX_DELAY_MS
+    ),
+    random: options.random ?? Math.random,
+    now: options.now ?? Date.now
+  })
 }
 
 export const withRetry = async <T>(
@@ -162,7 +185,7 @@ export const withRetry = async <T>(
     random: options.random ?? Math.random,
     now: options.now ?? Date.now
   }
-  const sleep = options.sleep ?? defaultSleep
+  const sleep = options.sleep ?? defaultRetrySleep
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     throwIfAborted(options.signal)
@@ -178,7 +201,11 @@ export const withRetry = async <T>(
         throw error
       }
 
-      const delay = retryDelay(error, attempt, resolved)
+      const delay = retryDelayMs(
+        error instanceof HttpStatusError ? error.retryAfter : undefined,
+        attempt,
+        resolved
+      )
       throwIfAborted(options.signal)
       await sleep(delay, options.signal)
       throwIfAborted(options.signal)

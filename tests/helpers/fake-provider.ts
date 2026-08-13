@@ -232,11 +232,14 @@ export class FirstSaveRejectingRepository implements DebateRepository {
 
 export const deterministicDependencies = (): Pick<
   OrchestratorDependencies,
-  'clock' | 'idFactory'
+  'clock' | 'idFactory' | 'retrySleep' | 'retryNow' | 'retryRandom'
 > => {
   let id = 0
   return {
     clock: () => new Date('2026-08-12T00:00:00.000Z'),
-    idFactory: () => `generated-${++id}`
+    idFactory: () => `generated-${++id}`,
+    retrySleep: async () => undefined,
+    retryNow: () => Date.parse('2026-08-12T00:00:00.000Z'),
+    retryRandom: () => 0.5
   }
 }

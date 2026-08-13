@@ -473,6 +473,222 @@ describe('DebateOrchestrator pause and stop controls', () => {
 })
 
 describe('DebateOrchestrator provider failures', () => {
+  it('awaits Retry-After delta-seconds before starting the next attempt', async () => {
+    const delays: number[] = []
+    let announceSleep = (): void => undefined
+    const sleepStarted = new Promise<void>((resolve) => {
+      announceSleep = resolve
+    })
+    let releaseSleep = (): void => undefined
+    const sleeping = new Promise<void>((resolve) => {
+      releaseSleep = resolve
+    })
+    const openai = new FakeProvider([
+      { error: new ProviderRetryableError('rate limited', { retryAfter: '17' }) },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('等待后成功') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      retrySleep: async (delayMs, signal) => {
+        expect(signal?.aborted).toBe(false)
+        delays.push(delayMs)
+        announceSleep()
+        await sleeping
+      }
+    })
+
+    const starting = orchestrator.start(setup(1))
+    await sleepStarted
+    expect(openai.requests).toHaveLength(1)
+    releaseSleep()
+    const session = await starting
+
+    expect(delays).toEqual([17_000])
+    expect(openai.requests).toHaveLength(2)
+    expect(session.messages.map(({ speech }) => speech)).toEqual(['等待后成功'])
+  })
+
+  it('parses Retry-After HTTP dates using the injected current time', async () => {
+    const now = Date.parse('2026-08-13T00:00:00.000Z')
+    const delays: number[] = []
+    const openai = new FakeProvider([
+      {
+        error: new ProviderRetryableError('temporarily unavailable', {
+          retryAfter: 'Thu, 13 Aug 2026 00:00:17 GMT'
+        })
+      },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('日期等待后成功') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      retryNow: () => now,
+      retrySleep: async (delayMs) => {
+        delays.push(delayMs)
+      }
+    })
+
+    await orchestrator.start(setup(1))
+
+    expect(delays).toEqual([17_000])
+  })
+
+  it.each([undefined, 'not-a-date'])(
+    'uses deterministic jittered exponential backoff for Retry-After %s',
+    async (retryAfter) => {
+      const delays: number[] = []
+      const retryable = (message: string): ProviderRetryableError =>
+        new ProviderRetryableError(
+          message,
+          retryAfter === undefined ? {} : { retryAfter }
+        )
+      const openai = new FakeProvider([
+        { error: retryable('temporary-1') },
+        { error: retryable('temporary-2') },
+        {
+          chunks: [
+            { type: 'content', content: jsonReply('退避后成功') },
+            { type: 'final', finishReason: 'stop' }
+          ]
+        }
+      ])
+      const orchestrator = new DebateOrchestrator({
+        ...deterministicDependencies(),
+        registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+        repository: new FakeDebateRepository(),
+        retryRandom: () => 0.5,
+        retrySleep: async (delayMs) => {
+          delays.push(delayMs)
+        }
+      })
+
+      await orchestrator.start(setup(1))
+
+      expect(delays).toEqual([375, 750])
+    }
+  )
+
+  it('clamps retry waits to the 120-second hard maximum', async () => {
+    const delays: number[] = []
+    const openai = new FakeProvider([
+      {
+        error: new ProviderRetryableError('hostile delay', {
+          retryAfter: '999999999'
+        })
+      },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('封顶后成功') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      retryMaxDelayMs: Number.MAX_SAFE_INTEGER,
+      retrySleep: async (delayMs) => {
+        delays.push(delayMs)
+      }
+    })
+
+    await orchestrator.start(setup(1))
+
+    expect(delays).toEqual([120_000])
+  })
+
+  it('uses a 30-second default maximum for retry waits', async () => {
+    const delays: number[] = []
+    const openai = new FakeProvider([
+      {
+        error: new ProviderRetryableError('long server delay', {
+          retryAfter: '999999999'
+        })
+      },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('默认封顶后成功') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      retrySleep: async (delayMs) => {
+        delays.push(delayMs)
+      }
+    })
+
+    await orchestrator.start(setup(1))
+
+    expect(delays).toEqual([30_000])
+  })
+
+  it('cancels an in-progress retry wait on stop without starting another attempt', async () => {
+    let signalSeen: AbortSignal | undefined
+    let announceSleep = (): void => undefined
+    const sleepStarted = new Promise<void>((resolve) => {
+      announceSleep = resolve
+    })
+    const openai = new FakeProvider([
+      { error: new ProviderRetryableError('wait before retry', { retryAfter: '17' }) },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('绝不应请求') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const events: Array<{ type: string; code?: string }> = []
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      onEvent: (event) => events.push(event),
+      retrySleep: (_delayMs, signal) => {
+        signalSeen = signal
+        announceSleep()
+        return new Promise<void>((_resolve, reject) => {
+          const rejectAbort = (): void =>
+            reject(signal?.reason ?? new DOMException('stopped', 'AbortError'))
+          if (signal?.aborted) {
+            rejectAbort()
+          } else {
+            signal?.addEventListener('abort', rejectAbort, { once: true })
+          }
+        })
+      }
+    })
+
+    const starting = orchestrator.start(setup(1))
+    await sleepStarted
+    expect(signalSeen?.aborted).toBe(false)
+    const stopped = await orchestrator.stop()
+    const completedStart = await starting
+
+    expect(signalSeen?.aborted).toBe(true)
+    expect(openai.requests).toHaveLength(1)
+    expect(events.filter(({ type }) => type === 'warning')).toHaveLength(1)
+    expect(stopped.state).toBe('stopped')
+    expect(completedStart.state).toBe('stopped')
+  })
+
   it('resets a failed attempt draft before streaming the successful retry', async () => {
     const openai = new FakeProvider([
       {

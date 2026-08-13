@@ -10,9 +10,15 @@ import { debateEventSchema, debateSetupSchema } from '../../shared/schemas'
 import {
   ProviderNonRetryableError,
   ProviderRefusalError,
+  ProviderRetryableError,
   isRetryableProviderError,
   type ProviderRegistry
 } from '../providers/provider'
+import {
+  defaultRetrySleep,
+  retryDelayMs,
+  type RetrySleep
+} from '../providers/http/retry-policy'
 import { buildRoleView } from './prompt-builder'
 import { parseReply } from './reply-parser'
 import {
@@ -37,6 +43,10 @@ export interface OrchestratorDependencies {
   clock?: () => Date
   idFactory?: () => string
   retryPolicy?: RetryPolicy
+  retrySleep?: RetrySleep
+  retryNow?: () => number
+  retryRandom?: () => number
+  retryMaxDelayMs?: number
   onEvent?: (event: DebateEvent) => void
 }
 
@@ -57,6 +67,10 @@ export class DebateOrchestrator {
   private readonly clock: () => Date
   private readonly idFactory: () => string
   private readonly retryPolicy: RetryPolicy
+  private readonly retrySleep: RetrySleep
+  private readonly retryNow: () => number
+  private readonly retryRandom: () => number
+  private readonly retryMaxDelayMs: number | undefined
 
   constructor(private readonly dependencies: OrchestratorDependencies) {
     this.clock = dependencies.clock ?? (() => new Date())
@@ -65,6 +79,10 @@ export class DebateOrchestrator {
       maxAttempts: 3,
       shouldRetry: isRetryableProviderError
     }
+    this.retrySleep = dependencies.retrySleep ?? defaultRetrySleep
+    this.retryNow = dependencies.retryNow ?? Date.now
+    this.retryRandom = dependencies.retryRandom ?? Math.random
+    this.retryMaxDelayMs = dependencies.retryMaxDelayMs
   }
 
   async start(input: DebateSetup): Promise<DebateSession> {
@@ -264,6 +282,32 @@ export class DebateOrchestrator {
         if (!retryable || attempt === this.retryPolicy.maxAttempts) {
           this.transition({ type: 'turnFailed' })
           await this.enqueueSave()
+          return
+        }
+
+        const delayMs = retryDelayMs(
+          error instanceof ProviderRetryableError ? error.retryAfter : undefined,
+          attempt,
+          {
+            now: this.retryNow,
+            random: this.retryRandom,
+            ...(this.retryMaxDelayMs === undefined
+              ? {}
+              : { maxDelayMs: this.retryMaxDelayMs })
+          }
+        )
+        try {
+          await this.retrySleep(delayMs, controller.signal)
+        } catch (sleepError) {
+          if (
+            generation !== this.generation ||
+            (controller.signal.aborted && this.requireMachine().phase === 'stopped')
+          ) {
+            return
+          }
+          throw sleepError
+        }
+        if (generation !== this.generation || controller.signal.aborted) {
           return
         }
       } finally {
