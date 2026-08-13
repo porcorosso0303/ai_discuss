@@ -38,15 +38,8 @@ const kimiRole = {
   provider: 'kimi',
   baseUrl: 'https://api.moonshot.cn/v1',
   model: 'kimi-k2.5',
-  thinking: true,
-  thinkingKeep: 'none',
-  maxCompletionTokens: 4096,
-  sampling: {
-    temperature: 0.3,
-    topP: 0.9,
-    frequencyPenalty: 0,
-    presencePenalty: 0
-  }
+  thinking: false,
+  maxCompletionTokens: 4096
 } as const
 
 describe('schema type ownership', () => {
@@ -104,7 +97,7 @@ describe('role and provider schemas', () => {
       maxTokens: 8192
     } as const
 
-    expect(roleConfigSchema.parse(kimiRole)).toMatchObject({
+    expect(roleConfigSchema.parse({ ...kimiRole, thinking: true, sampling: undefined })).toMatchObject({
       provider: 'kimi',
       thinking: true
     })
@@ -120,19 +113,99 @@ describe('role and provider schemas', () => {
   })
 
   it('allows Kimi thinkingKeep all only while thinking is enabled', () => {
+    const kimiK26Role = { ...kimiRole, model: 'kimi-k2.6', sampling: undefined }
     expect(
-      roleConfigSchema.safeParse({ ...kimiRole, thinking: true, thinkingKeep: 'all' }).success
+      roleConfigSchema.safeParse({ ...kimiK26Role, thinking: true, thinkingKeep: 'all' }).success
     ).toBe(true)
     expect(
-      roleConfigSchema.safeParse({ ...kimiRole, thinking: false, thinkingKeep: 'none' }).success
+      roleConfigSchema.safeParse({ ...kimiK26Role, thinking: false, thinkingKeep: 'none' }).success
     ).toBe(true)
-    const { thinkingKeep: _thinkingKeep, ...withoutThinkingKeep } = kimiRole
-    expect(roleConfigSchema.safeParse({ ...withoutThinkingKeep, thinking: false }).success).toBe(
+    expect(roleConfigSchema.safeParse({ ...kimiRole, thinking: false }).success).toBe(
       true
     )
     expect(
-      roleConfigSchema.safeParse({ ...kimiRole, thinking: false, thinkingKeep: 'all' }).success
+      roleConfigSchema.safeParse({ ...kimiK26Role, thinking: false, thinkingKeep: 'all' }).success
     ).toBe(false)
+  })
+
+  it('models current Kimi K3 reasoning controls without legacy thinking or sampling', () => {
+    const { thinking: _thinking, ...withoutThinking } = kimiRole
+    const valid = { ...withoutThinking, model: 'kimi-k3', effort: 'high' as const }
+
+    expect(roleConfigSchema.safeParse(valid).success).toBe(true)
+    expect(roleConfigSchema.safeParse({ ...valid, thinking: true }).success).toBe(false)
+    expect(roleConfigSchema.safeParse({ ...valid, thinkingKeep: 'all' }).success).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({ ...valid, sampling: { temperature: 1 } }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({ ...valid, maxCompletionTokens: 1_048_577 }).success
+    ).toBe(false)
+  })
+
+  it('rejects invalid current Kimi K2.6 and K2.7 reasoning combinations', () => {
+    const common = {
+      roleId: 'role-b',
+      name: '乙方',
+      personaOrStance: '',
+      provider: 'kimi',
+      baseUrl: 'https://api.moonshot.cn/v1',
+      maxCompletionTokens: 4096
+    } as const
+
+    expect(
+      roleConfigSchema.safeParse({
+        ...common,
+        model: 'kimi-k2.6',
+        thinking: true,
+        thinkingKeep: 'all'
+      }).success
+    ).toBe(true)
+    expect(
+      roleConfigSchema.safeParse({
+        ...common,
+        model: 'kimi-k2.6',
+        thinking: false,
+        sampling: { temperature: 0.4 }
+      }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({
+        ...common,
+        model: 'kimi-k2.6',
+        effort: 'high'
+      }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({
+        ...common,
+        model: 'kimi-k2.6',
+        thinking: true,
+        sampling: { topP: 0.9 }
+      }).success
+    ).toBe(false)
+
+    expect(
+      roleConfigSchema.safeParse({ ...common, model: 'kimi-k2.7-code' }).success
+    ).toBe(true)
+    for (const invalid of [
+      { thinking: false },
+      { effort: 'high' },
+      { thinkingKeep: 'none' },
+      { sampling: { presencePenalty: 0 } }
+    ]) {
+      expect(
+        roleConfigSchema.safeParse({ ...common, model: 'kimi-k2.7-code', ...invalid }).success
+      ).toBe(false)
+    }
+  })
+
+  it('rejects every preserved-thinking setting for Kimi K2.5', () => {
+    for (const thinkingKeep of ['none', 'all'] as const) {
+      expect(
+        roleConfigSchema.safeParse({ ...kimiRole, thinkingKeep }).success
+      ).toBe(false)
+    }
   })
 
   it('keeps DeepSeek effort and sampling mutually exclusive by thinking mode', () => {
@@ -180,7 +253,7 @@ describe('role and provider schemas', () => {
     expect(() =>
       roleConfigSchema.parse({
         ...kimiRole,
-        sampling: { ...kimiRole.sampling, arbitraryParameter: 1 }
+        sampling: { temperature: 0.3, arbitraryParameter: 1 }
       })
     ).toThrow()
   })

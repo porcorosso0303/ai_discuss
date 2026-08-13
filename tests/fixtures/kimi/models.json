@@ -1,0 +1,36 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "kimi-k3",
+      "object": "model",
+      "created": 1786400000,
+      "owned_by": "moonshot",
+      "context_length": 1048576,
+      "supports_image_in": true,
+      "supports_video_in": true,
+      "supports_reasoning": true,
+      "future_field": "ignored"
+    },
+    {
+      "id": "kimi-k2.6",
+      "object": "model",
+      "created": 1760000000,
+      "owned_by": "moonshot",
+      "context_length": 262144,
+      "supports_image_in": true,
+      "supports_video_in": false,
+      "supports_reasoning": true
+    },
+    {
+      "id": "moonshot-v1-32k",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "moonshot",
+      "context_length": 32768,
+      "supports_image_in": false,
+      "supports_video_in": false,
+      "supports_reasoning": false
+    }
+  ]
+}

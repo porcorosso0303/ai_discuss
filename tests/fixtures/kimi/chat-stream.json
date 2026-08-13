@@ -1,0 +1,57 @@
+[
+  {
+    "id": "cmpl-contract",
+    "object": "chat.completion.chunk",
+    "created": 1786400001,
+    "model": "kimi-k3",
+    "choices": [
+      {
+        "index": 0,
+        "delta": {
+          "role": "assistant",
+          "reasoning_content": "private chain of thought"
+        },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "cmpl-contract",
+    "object": "chat.completion.chunk",
+    "created": 1786400001,
+    "model": "kimi-k3",
+    "choices": [
+      {
+        "index": 0,
+        "delta": { "content": "{\"speech\":\"有道理，" },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "cmpl-contract",
+    "object": "chat.completion.chunk",
+    "created": 1786400001,
+    "model": "kimi-k3",
+    "choices": [
+      {
+        "index": 0,
+        "delta": { "content": "但仍需论证。\",\"status\":\"continue\"}" },
+        "finish_reason": null
+      }
+    ]
+  },
+  {
+    "id": "cmpl-contract",
+    "object": "chat.completion.chunk",
+    "created": 1786400001,
+    "model": "kimi-k3",
+    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+    "usage": {
+      "prompt_tokens": 120,
+      "completion_tokens": 30,
+      "total_tokens": 150,
+      "cached_tokens": 20
+    }
+  }
+]

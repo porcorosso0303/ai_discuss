@@ -109,13 +109,108 @@ export const kimiRoleConfigSchema = z
     ...commonRoleShape,
     provider: z.literal('kimi'),
     baseUrl: baseUrlSchema,
-    thinking: z.boolean(),
+    thinking: z.boolean().optional(),
     thinkingKeep: z.enum(['none', 'all']).optional(),
+    effort: z.enum(['low', 'high', 'max']).optional(),
     maxCompletionTokens: positiveIntegerSchema,
     sampling: kimiSamplingConfigSchema.optional()
   })
-  .superRefine(({ thinking, thinkingKeep }, context) => {
-    if (!thinking && thinkingKeep === 'all') {
+  .superRefine(({ model, thinking, thinkingKeep, effort, maxCompletionTokens, sampling }, context) => {
+    const isK3 = /^kimi-k3(?:$|-)/.test(model)
+    const isK27Code = /^kimi-k2\.7-code(?:$|-)/.test(model)
+    const isK26 = /^kimi-k2\.6(?:$|-)/.test(model)
+    const isK25 = /^kimi-k2\.5(?:$|-)/.test(model)
+
+    if (!isK3 && effort !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['effort'],
+        message: 'reasoning effort is supported only by Kimi K3'
+      })
+    }
+
+    if (isK3) {
+      if (maxCompletionTokens > 1_048_576) {
+        context.addIssue({
+          code: 'custom',
+          path: ['maxCompletionTokens'],
+          message: 'Kimi K3 maxCompletionTokens must not exceed 1048576'
+        })
+      }
+      if (thinking !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: ['thinking'],
+          message: 'Kimi K3 always reasons and does not accept thinking'
+        })
+      }
+      if (thinkingKeep !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: ['thinkingKeep'],
+          message: 'Kimi K3 preserved thinking is fixed and not configurable'
+        })
+      }
+      if (sampling !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: ['sampling'],
+          message: 'Kimi K3 sampling values are fixed and must be omitted'
+        })
+      }
+      return
+    }
+
+    if (isK27Code) {
+      if (thinking === false) {
+        context.addIssue({
+          code: 'custom',
+          path: ['thinking'],
+          message: 'Kimi K2.7 Code thinking cannot be disabled'
+        })
+      }
+      if (thinkingKeep === 'none') {
+        context.addIssue({
+          code: 'custom',
+          path: ['thinkingKeep'],
+          message: 'Kimi K2.7 Code preserved thinking is always enabled'
+        })
+      }
+      if (sampling !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: ['sampling'],
+          message: 'Kimi K2.7 Code sampling values are fixed and must be omitted'
+        })
+      }
+      return
+    }
+
+    if ((isK26 || isK25) && sampling !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sampling'],
+        message: 'sampling values are fixed for this Kimi model and must be omitted'
+      })
+    }
+
+    if (isK25 && thinkingKeep !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['thinkingKeep'],
+        message: 'Kimi K2.5 does not support preserved thinking'
+      })
+    }
+
+    if (!isK26 && !isK25 && thinking === true && sampling !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sampling'],
+        message: 'sampling parameters are unavailable while Kimi thinking is enabled'
+      })
+    }
+
+    if (thinking === false && thinkingKeep === 'all') {
       context.addIssue({
         code: 'custom',
         path: ['thinkingKeep'],
