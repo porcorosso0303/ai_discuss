@@ -8,6 +8,7 @@ import {
   debateReplySchema,
   debateSessionSchema,
   debateSetupSchema,
+  deepSeekRoleConfigSchema,
   kimiRoleConfigSchema,
   providerCapabilitiesSchema,
   providerSchema,
@@ -208,7 +209,7 @@ describe('role and provider schemas', () => {
     }
   })
 
-  it('keeps DeepSeek effort and sampling mutually exclusive by thinking mode', () => {
+  it('models current DeepSeek V4 reasoning controls and output limit', () => {
     const baseDeepSeekRole = {
       roleId: 'role-b',
       name: '乙方',
@@ -220,8 +221,33 @@ describe('role and provider schemas', () => {
     } as const
 
     expect(
-      roleConfigSchema.safeParse({ ...baseDeepSeekRole, thinking: true, effort: 'high' }).success
+      roleConfigSchema.safeParse({ ...baseDeepSeekRole, effort: 'low' }).success
     ).toBe(true)
+    expect(roleConfigSchema.safeParse({ ...baseDeepSeekRole, effort: 'high' }).success).toBe(true)
+    expect(roleConfigSchema.safeParse({ ...baseDeepSeekRole, effort: 'max' }).success).toBe(true)
+    for (const effort of ['none', 'minimal', 'medium', 'xhigh']) {
+      expect(roleConfigSchema.safeParse({ ...baseDeepSeekRole, effort }).success).toBe(false)
+    }
+    expect(
+      roleConfigSchema.safeParse({ ...baseDeepSeekRole, maxTokens: 384_000 }).success
+    ).toBe(true)
+    expect(
+      roleConfigSchema.safeParse({ ...baseDeepSeekRole, maxTokens: 384_001 }).success
+    ).toBe(false)
+  })
+
+  it('allows minimal custom DeepSeek config and gates sampling on explicit non-thinking mode', () => {
+    const baseDeepSeekRole = {
+      roleId: 'role-b',
+      name: '乙方',
+      personaOrStance: '',
+      provider: 'deepseek',
+      baseUrl: 'https://compatible.example.test/v1',
+      model: 'custom-chat-model',
+      maxTokens: 8192
+    } as const
+
+    expect(roleConfigSchema.safeParse(baseDeepSeekRole).success).toBe(true)
     expect(
       roleConfigSchema.safeParse({
         ...baseDeepSeekRole,
@@ -232,13 +258,40 @@ describe('role and provider schemas', () => {
     expect(
       roleConfigSchema.safeParse({
         ...baseDeepSeekRole,
-        thinking: true,
+        thinking: undefined,
         effort: 'high',
         sampling: { temperature: 1 }
       }).success
     ).toBe(false)
     expect(
       roleConfigSchema.safeParse({ ...baseDeepSeekRole, thinking: false, effort: 'high' }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        sampling: { temperature: 1 }
+      }).success
+    ).toBe(false)
+    expect(
+      roleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        thinking: false,
+        sampling: { temperature: 0.4, topP: 0.8 }
+      }).success
+    ).toBe(true)
+    expect(
+      deepSeekRoleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        thinking: false,
+        sampling: { frequencyPenalty: 1 }
+      }).success
+    ).toBe(false)
+    expect(
+      deepSeekRoleConfigSchema.safeParse({
+        ...baseDeepSeekRole,
+        thinking: false,
+        sampling: { presencePenalty: 1 }
+      }).success
     ).toBe(false)
   })
 

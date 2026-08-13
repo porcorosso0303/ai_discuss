@@ -87,8 +87,8 @@ export const kimiSamplingConfigSchema = z.strictObject({
 })
 
 export const deepSeekSamplingConfigSchema = z.strictObject({
-  ...commonSamplingShape,
-  temperature: z.number().min(0).max(2).optional()
+  temperature: z.number().min(0).max(2).optional(),
+  topP: z.number().min(0).max(1).optional()
 })
 
 const commonRoleShape = {
@@ -224,21 +224,29 @@ export const deepSeekRoleConfigSchema = z
     ...commonRoleShape,
     provider: z.literal('deepseek'),
     baseUrl: baseUrlSchema,
-    thinking: z.boolean(),
+    thinking: z.boolean().optional(),
     effort: z.enum(['low', 'high', 'max']).optional(),
     maxTokens: positiveIntegerSchema,
     sampling: deepSeekSamplingConfigSchema.optional()
   })
-  .superRefine(({ thinking, effort, sampling }, context) => {
-    if (thinking && sampling !== undefined) {
+  .superRefine(({ model, thinking, effort, maxTokens, sampling }, context) => {
+    if (/^deepseek-v4-(?:flash|pro)$/.test(model) && maxTokens > 384_000) {
       context.addIssue({
         code: 'custom',
-        path: ['sampling'],
-        message: 'sampling parameters are unavailable while thinking is enabled'
+        path: ['maxTokens'],
+        message: 'DeepSeek V4 maxTokens must not exceed 384000'
       })
     }
 
-    if (!thinking && effort !== undefined) {
+    if (thinking !== false && sampling !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sampling'],
+        message: 'sampling parameters require explicitly disabled thinking'
+      })
+    }
+
+    if (thinking === false && effort !== undefined) {
       context.addIssue({
         code: 'custom',
         path: ['effort'],
