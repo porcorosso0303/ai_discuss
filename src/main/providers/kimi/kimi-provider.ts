@@ -43,6 +43,7 @@ const isK3 = (model: string): boolean => /^kimi-k3(?:$|-)/.test(model)
 const isK27Code = (model: string): boolean => /^kimi-k2\.7-code(?:$|-)/.test(model)
 const isK26 = (model: string): boolean => /^kimi-k2\.6(?:$|-)/.test(model)
 const isK25 = (model: string): boolean => /^kimi-k2\.5(?:$|-)/.test(model)
+const MAX_VISIBLE_CONTENT_CHARS = 201_000
 
 const debateReplyJsonSchema = {
   type: 'object',
@@ -152,12 +153,6 @@ export class KimiProvider implements Provider {
       )
       const response = kimiModelsResponseSchema.parse(raw)
       models = response.data.map(modelCapability)
-      for (const capability of models) {
-        this.discoveredCapabilities.set(
-          capabilityKey(kimiConfig.baseUrl, capability.id),
-          capability
-        )
-      }
     } catch (error) {
       if (isAbort(error, signal)) throw error
       if (isOfficialBase(kimiConfig.baseUrl)) throw normalizeError(error, signal)
@@ -171,6 +166,13 @@ export class KimiProvider implements Provider {
             isK25(kimiConfig.model)
         })
       ]
+    }
+
+    for (const capability of models) {
+      this.discoveredCapabilities.set(
+        capabilityKey(kimiConfig.baseUrl, capability.id),
+        capability
+      )
     }
 
     return providerCapabilitiesSchema.parse({
@@ -261,6 +263,8 @@ export class KimiProvider implements Provider {
       }
     }
 
+    let completed = false
+    let visibleContentChars = 0
     try {
       for await (const event of streamSse(
         endpoint(config.baseUrl, 'chat/completions'),
@@ -285,6 +289,13 @@ export class KimiProvider implements Provider {
         const chunk = kimiChatChunkSchema.parse(raw)
         for (const choice of chunk.choices) {
           if (choice.delta.content !== undefined && choice.delta.content !== '') {
+            const nextVisibleContentChars = visibleContentChars + choice.delta.content.length
+            if (nextVisibleContentChars > MAX_VISIBLE_CONTENT_CHARS) {
+              throw new ProviderNonRetryableError(
+                'Kimi visible response exceeded the debate reply limit'
+              )
+            }
+            visibleContentChars = nextVisibleContentChars
             yield { type: 'content', content: choice.delta.content }
           }
         }
@@ -303,12 +314,16 @@ export class KimiProvider implements Provider {
         }
         for (const choice of chunk.choices) {
           if (choice.finish_reason !== null) {
+            completed = true
             const mapped = finishReason(choice.finish_reason)
             yield mapped === undefined
               ? { type: 'final' }
               : { type: 'final', finishReason: mapped }
           }
         }
+      }
+      if (!completed) {
+        throw new ProviderRetryableError('Kimi streaming response ended before completion')
       }
     } catch (error) {
       throw normalizeError(error, signal)

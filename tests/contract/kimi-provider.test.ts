@@ -45,8 +45,14 @@ const request = (config: KimiRoleConfig = role()): ProviderReplyRequest => ({
   }
 })
 
-const sseResponse = (events: unknown[]): Response =>
-  new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`)
+const sseResponse = (events: unknown[]): Response => {
+  const completedEvents = events.length === 0
+    ? [{ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }]
+    : events
+  return new Response(
+    `${completedEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`
+  )
+}
 
 const collect = async (iterable: AsyncIterable<ProviderChunk>): Promise<ProviderChunk[]> => {
   const chunks: ProviderChunk[] = []
@@ -191,6 +197,49 @@ describe('KimiProvider model discovery', () => {
         }
       ]
     })
+  })
+
+  it('enforces a custom fallback non-reasoning capability before chat fetch', async () => {
+    const config = role({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'custom-chat-model',
+      effort: undefined,
+      thinking: true
+    })
+    const fetchImpl = vi.fn(async () => new Response('models unavailable', { status: 404 }))
+    const provider = new KimiProvider({ fetch: fetchImpl, getApiKey: async () => secret })
+
+    await expect(provider.discover(config)).resolves.toMatchObject({
+      models: [{ id: 'custom-chat-model', thinking: null }]
+    })
+    await expect(
+      collect(provider.streamReply(request(config), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows a custom fallback model without reasoning controls to chat', async () => {
+    const config = role({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'custom-chat-model',
+      effort: undefined,
+      thinking: undefined
+    })
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      fetchImpl.mock.calls.length === 1
+        ? new Response('models unavailable', { status: 404 })
+        : sseResponse([])
+    )
+    const provider = new KimiProvider({ fetch: fetchImpl, getApiKey: async () => secret })
+
+    await provider.discover(config)
+    await expect(
+      collect(provider.streamReply(request(config), new AbortController().signal))
+    ).resolves.toEqual([{ type: 'final', finishReason: 'stop' }])
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl.mock.calls[1]?.[0]).toBe(
+      'https://gateway.example.test/v1/chat/completions'
+    )
   })
 
   it('never converts cancellation into custom endpoint fallback', async () => {
@@ -468,6 +517,86 @@ describe('KimiProvider chat completions', () => {
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
     ).resolves.toEqual([{ type: 'final', finishReason: expected }])
+  })
+
+  it.each([
+    [
+      'content EOF',
+      `data: ${JSON.stringify({
+        choices: [
+          { index: 0, delta: { content: '{"speech":"partial' }, finish_reason: null }
+        ]
+      })}\n\n`
+    ],
+    ['empty EOF', '']
+  ])('rejects a truncated Kimi stream at %s as retryable', async (_shape, body) => {
+    const provider = new KimiProvider({
+      fetch: async () => new Response(body),
+      getApiKey: async () => secret
+    })
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderRetryableError)
+  })
+
+  it('allows the exact visible-content budget and does not count reasoning', async () => {
+    const visibleContent = 'v'.repeat(201_000)
+    const provider = new KimiProvider({
+      fetch: async () =>
+        sseResponse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: { reasoning_content: 'private'.repeat(35_715) },
+                finish_reason: null
+              }
+            ]
+          },
+          {
+            choices: [
+              { index: 0, delta: { content: visibleContent }, finish_reason: null }
+            ]
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+        ]),
+      getApiKey: async () => secret
+    })
+
+    let visibleLength = 0
+    let finalCount = 0
+    for await (const chunk of provider.streamReply(request(), new AbortController().signal)) {
+      if (chunk.type === 'content') visibleLength += chunk.content.length
+      if (chunk.type === 'final') finalCount += 1
+    }
+
+    expect(visibleLength).toBe(201_000)
+    expect(finalCount).toBe(1)
+  })
+
+  it('rejects cumulative visible content before yielding the chunk that crosses the budget', async () => {
+    const events: unknown[] = Array.from({ length: 202 }, () => ({
+      choices: [{ index: 0, delta: { content: 'v'.repeat(1_000) }, finish_reason: null }]
+    }))
+    events.push({
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+    })
+    const provider = new KimiProvider({
+      fetch: async () => sseResponse(events),
+      getApiKey: async () => secret
+    })
+    const iterator = provider
+      .streamReply(request(), new AbortController().signal)
+      [Symbol.asyncIterator]()
+
+    for (let index = 0; index < 201; index += 1) {
+      await expect(iterator.next()).resolves.toMatchObject({
+        done: false,
+        value: { type: 'content' }
+      })
+    }
+    await expect(iterator.next()).rejects.toBeInstanceOf(ProviderNonRetryableError)
   })
 
   it.each([
