@@ -78,7 +78,14 @@ export class DebateOrchestrator {
     this.transition({ type: 'beginValidation' })
 
     for (const role of setup.roles) {
-      await this.dependencies.registry[role.provider].discover(role)
+      try {
+        await this.dependencies.registry[role.provider].discover(role)
+      } catch (error) {
+        this.emitProviderDiscoveryError(role, error)
+        this.transition({ type: 'validationFailed' })
+        await this.enqueueSave()
+        throw error
+      }
     }
 
     this.transition({ type: 'validationSucceeded' })
@@ -179,6 +186,7 @@ export class DebateOrchestrator {
       let raw = ''
       let usage: Usage | undefined
       let refused = false
+      let draftVisible = false
 
       try {
         for await (const chunk of this.dependencies.registry[role.provider].streamReply(
@@ -196,6 +204,7 @@ export class DebateOrchestrator {
 
           if (chunk.type === 'content') {
             raw += chunk.content
+            draftVisible ||= chunk.content.length > 0
             this.emit(
               { type: 'speech-delta', roleId: role.roleId, turn, delta: chunk.content },
               false
@@ -213,6 +222,9 @@ export class DebateOrchestrator {
         }
 
         if (refused) {
+          if (draftVisible) {
+            this.emitSpeechReset(role, turn)
+          }
           this.emitProviderError(role, turn, attempt, false, '模型明确拒绝继续发言')
           this.transition({ type: 'turnRefused' })
           await this.enqueueSave()
@@ -233,6 +245,9 @@ export class DebateOrchestrator {
         const refusedByError = error instanceof ProviderRefusalError
         const retryable = !refusedByError && this.retryPolicy.shouldRetry(error)
         this.emitProviderError(role, turn, attempt, retryable, this.errorMessage(error))
+        if (draftVisible) {
+          this.emitSpeechReset(role, turn)
+        }
 
         if (refusedByError) {
           this.transition({ type: 'turnRefused' })
@@ -327,6 +342,20 @@ export class DebateOrchestrator {
       message,
       retryable,
       attempt
+    })
+  }
+
+  private emitSpeechReset(role: RoleConfig, turn: number): void {
+    this.emit({ type: 'speech-reset', roleId: role.roleId, turn }, false)
+  }
+
+  private emitProviderDiscoveryError(role: RoleConfig, error: unknown): void {
+    this.emit({
+      type: 'warning',
+      code: 'provider-discovery-error',
+      roleId: role.roleId,
+      message: this.errorMessage(error),
+      retryable: this.retryPolicy.shouldRetry(error)
     })
   }
 

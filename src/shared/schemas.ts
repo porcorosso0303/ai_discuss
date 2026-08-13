@@ -242,6 +242,12 @@ export const debateEventSchema = z.discriminatedUnion('type', [
   }),
   z.strictObject({
     ...eventBaseShape,
+    type: z.literal('speech-reset'),
+    roleId: roleIdSchema,
+    turn: positiveIntegerSchema
+  }),
+  z.strictObject({
+    ...eventBaseShape,
     type: z.literal('message-completed'),
     message: debateMessageSchema
   }),

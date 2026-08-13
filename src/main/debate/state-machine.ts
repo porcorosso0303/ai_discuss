@@ -17,11 +17,13 @@ export interface DebateMachineState {
   pendingAgreementRoleId?: RoleId
   winnerRoleId?: RoleId
   terminationReason?: DebateTerminationReason
+  failureStage?: 'validation' | 'turn'
 }
 
 export type DebateMachineAction =
   | { type: 'beginValidation' }
   | { type: 'validationSucceeded' }
+  | { type: 'validationFailed' }
   | { type: 'turnStarted'; roleId: RoleId }
   | { type: 'turnCompleted'; message: DebateMessage }
   | { type: 'pauseRequested' }
@@ -74,6 +76,19 @@ export const reduceDebateState = (
     case 'validationSucceeded':
       return state.phase === 'validating'
         ? { state: { ...state, phase: 'running' } }
+        : unchanged(state, action)
+
+    case 'validationFailed':
+      return state.phase === 'validating'
+        ? {
+            state: {
+              ...state,
+              phase: 'failed',
+              turnInFlight: false,
+              terminationReason: 'call-failed',
+              failureStage: 'validation'
+            }
+          }
         : unchanged(state, action)
 
     case 'turnStarted':
@@ -199,7 +214,8 @@ export const reduceDebateState = (
           ...state,
           phase: 'failed',
           turnInFlight: false,
-          terminationReason: 'call-failed'
+          terminationReason: 'call-failed',
+          failureStage: 'turn'
         }
       }
 
@@ -221,15 +237,20 @@ export const reduceDebateState = (
       }
 
     case 'retryCurrentTurn':
-      if (state.phase !== 'failed') {
-        return unchanged(state, action)
+      if (state.phase !== 'failed' || state.failureStage !== 'turn') {
+        return unchanged(
+          state,
+          action,
+          state.failureStage === undefined ? undefined : ` after ${state.failureStage} failure`
+        )
       }
 
       return {
         state: {
           ...state,
           phase: 'running',
-          terminationReason: undefined
+          terminationReason: undefined,
+          failureStage: undefined
         }
       }
 

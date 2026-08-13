@@ -473,6 +473,191 @@ describe('DebateOrchestrator pause and stop controls', () => {
 })
 
 describe('DebateOrchestrator provider failures', () => {
+  it('resets a failed attempt draft before streaming the successful retry', async () => {
+    const openai = new FakeProvider([
+      {
+        chunks: [{ type: 'content', content: '失败草稿' }],
+        error: new ProviderRetryableError('retry this attempt')
+      },
+      {
+        chunks: [
+          { type: 'content', content: jsonReply('成功正文') },
+          { type: 'final', finishReason: 'stop' }
+        ]
+      }
+    ])
+    const repository = new FakeDebateRepository()
+    const events: Array<{ type: string; delta?: string }> = []
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository,
+      onEvent: (event) => events.push(event)
+    })
+
+    const session = await orchestrator.start(setup(1))
+    const failedDeltaIndex = events.findIndex(({ delta }) => delta === '失败草稿')
+    const resetIndex = events.findIndex(({ type }) => type === 'speech-reset')
+    const successfulDeltaIndex = events.findIndex(({ delta }) => delta?.includes('成功正文'))
+
+    expect(failedDeltaIndex).toBeGreaterThan(-1)
+    expect(resetIndex).toBeGreaterThan(failedDeltaIndex)
+    expect(successfulDeltaIndex).toBeGreaterThan(resetIndex)
+    const resetEvent = events[resetIndex]
+    expect(debateEventSchema.parse(resetEvent)).toEqual(resetEvent)
+    expect(Object.keys(resetEvent ?? {}).sort()).toEqual([
+      'createdAt',
+      'id',
+      'roleId',
+      'sessionId',
+      'turn',
+      'type'
+    ])
+    expect(session.messages.map(({ speech }) => speech)).toEqual(['成功正文'])
+    expect(session.events.some(({ type }) => type === 'speech-delta')).toBe(false)
+    expect(session.events.some(({ type }) => type === 'speech-reset')).toBe(false)
+    expect(JSON.stringify(session)).not.toContain('失败草稿')
+    expect(JSON.stringify(repository.saved)).not.toContain('失败草稿')
+  })
+
+  it.each([
+    {
+      label: 'a non-retryable error',
+      scripts: [
+        {
+          chunks: [{ type: 'content' as const, content: '不可重试草稿' }],
+          error: new ProviderNonRetryableError('invalid request')
+        }
+      ],
+      state: 'failed',
+      expectedResets: 1
+    },
+    {
+      label: 'a refusal error',
+      scripts: [
+        {
+          chunks: [{ type: 'content' as const, content: '拒绝前草稿' }],
+          error: new ProviderRefusalError('content refused')
+        }
+      ],
+      state: 'refused',
+      expectedResets: 1
+    },
+    {
+      label: 'a refusal finish reason',
+      scripts: [
+        {
+          chunks: [
+            { type: 'content' as const, content: '拒绝完成原因前草稿' },
+            { type: 'final' as const, finishReason: 'refusal' as const }
+          ]
+        }
+      ],
+      state: 'refused',
+      expectedResets: 1
+    },
+    {
+      label: 'the final retryable failure',
+      scripts: [1, 2, 3].map((attempt) => ({
+        chunks: [{ type: 'content' as const, content: `失败草稿${attempt}` }],
+        error: new ProviderRetryableError(`temporary-${attempt}`)
+      })),
+      state: 'failed',
+      expectedResets: 3
+    }
+  ])('resets every partial draft before ending on $label', async ({ scripts, state, expectedResets }) => {
+    const openai = new FakeProvider(scripts)
+    const repository = new FakeDebateRepository()
+    const events: Array<{ type: string; state?: string }> = []
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository,
+      onEvent: (event) => events.push(event)
+    })
+
+    const session = await orchestrator.start(setup(1))
+
+    expect(session.state).toBe(state)
+    const resetIndexes = events.flatMap(({ type }, index) =>
+      type === 'speech-reset' ? [index] : []
+    )
+    expect(resetIndexes).toHaveLength(expectedResets)
+    const terminalStateIndex = events.reduce(
+      (lastIndex, { type, state: eventState }, index) =>
+        type === 'state-changed' && eventState === state ? index : lastIndex,
+      -1
+    )
+    expect(resetIndexes.every((index) => index < terminalStateIndex)).toBe(true)
+    expect(session.events.some(({ type }) => type === 'speech-reset')).toBe(false)
+    expect(session.messages).toEqual([])
+    expect(JSON.stringify(session)).not.toContain('草稿')
+    expect(JSON.stringify(repository.saved)).not.toContain('草稿')
+  })
+
+  it.each([
+    {
+      label: 'non-retryable',
+      error: new ProviderNonRetryableError('discovery credentials invalid'),
+      retryable: false
+    },
+    {
+      label: 'retryable',
+      error: new ProviderRetryableError('discovery temporarily unavailable'),
+      retryable: true
+    }
+  ])(
+    'fails and persists validation when discovery throws a $label error',
+    async ({ error, retryable }) => {
+      const openai = new FakeProvider([])
+      openai.discover = async () => {
+        throw error
+      }
+      const kimi = new FakeProvider([])
+      const repository = new FakeDebateRepository()
+      const events: Array<{
+        type: string
+        code?: string
+        roleId?: string
+        retryable?: boolean
+        state?: string
+      }> = []
+      const orchestrator = new DebateOrchestrator({
+        ...deterministicDependencies(),
+        registry: { openai, kimi, deepseek: new FakeProvider([]) },
+        repository,
+        onEvent: (event) => events.push(event)
+      })
+
+      await expect(orchestrator.start(setup(1))).rejects.toBe(error)
+
+      const failed = orchestrator.getSession()
+      expect(failed.state).toBe('failed')
+      expect(failed.terminationReason).toBe('call-failed')
+      expect(failed.currentTurn).toBe(0)
+      expect(failed.messages).toEqual([])
+      expect(openai.requests).toHaveLength(0)
+      expect(kimi.requests).toHaveLength(0)
+      expect(events.at(-2)).toMatchObject({
+        type: 'warning',
+        code: 'provider-discovery-error',
+        roleId: 'role-a',
+        retryable
+      })
+      expect(events.at(-1)).toMatchObject({ type: 'state-changed', state: 'failed' })
+      expect(repository.saved.at(-1)).toEqual(failed)
+
+      const afterRetry = await orchestrator.retryCurrentTurn()
+      expect(afterRetry.state).toBe('failed')
+      expect(openai.requests).toHaveLength(0)
+      expect(kimi.requests).toHaveLength(0)
+
+      const finished = await orchestrator.finishFailed()
+      expect(finished.state).toBe('failed')
+      expect(repository.saved.at(-1)).toEqual(finished)
+    }
+  )
+
   it('makes at most three total attempts for retryable errors without saving a message', async () => {
     const openai = new FakeProvider([
       { error: new ProviderRetryableError('temporary-1') },

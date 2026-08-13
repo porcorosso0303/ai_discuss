@@ -220,6 +220,21 @@ describe('debate state machine termination rules', () => {
 })
 
 describe('debate state machine controls and failures', () => {
+  it('records validation failure and refuses retryCurrentTurn for that failure stage', () => {
+    let machine = createDebateMachine('session-1', setup())
+    machine = reduceDebateState(machine, { type: 'beginValidation' }).state
+    machine = reduceDebateState(machine, { type: 'validationFailed' }).state
+
+    expect(machine.phase).toBe('failed')
+    expect(machine.failureStage).toBe('validation')
+    expect(machine.terminationReason).toBe('call-failed')
+    expect(machine.turnInFlight).toBe(false)
+
+    const retry = reduceDebateState(machine, { type: 'retryCurrentTurn' })
+    expect(retry.state).toBe(machine)
+    expect(retry.warning).toContain('validation')
+  })
+
   it('pauses immediately when no turn is in flight and resumes the same speaker', () => {
     const running = start('role-b')
     const paused = reduceDebateState(running, { type: 'pauseRequested' }).state
@@ -281,6 +296,7 @@ describe('debate state machine controls and failures', () => {
 
     expect(machine.phase).toBe('failed')
     expect(machine.terminationReason).toBe('call-failed')
+    expect(machine.failureStage).toBe('turn')
     expect(machine.turnCount).toBe(0)
     expect(machine.messages).toEqual([])
     expect(machine.currentSpeaker).toBe('role-b')
@@ -288,6 +304,7 @@ describe('debate state machine controls and failures', () => {
     machine = reduceDebateState(machine, { type: 'retryCurrentTurn' }).state
     expect(machine.phase).toBe('running')
     expect(machine.terminationReason).toBeUndefined()
+    expect(machine.failureStage).toBeUndefined()
     expect(machine.currentSpeaker).toBe('role-b')
   })
 
