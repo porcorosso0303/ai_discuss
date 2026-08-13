@@ -800,6 +800,26 @@ describe('KimiProvider chat completions', () => {
     expect(JSON.stringify(error)).not.toContain(secret)
   })
 
+  it('preserves safe Retry-After metadata from a retryable HTTP response', async () => {
+    const provider = new KimiProvider({
+      fetch: async () =>
+        new Response(`Authorization: Bearer ${secret}\nprivate failure`, {
+          status: 429,
+          headers: { 'Retry-After': '19' }
+        }),
+      getApiKey: async () => secret
+    })
+
+    const error = await collect(
+      provider.streamReply(request(), new AbortController().signal)
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ProviderRetryableError)
+    expect((error as ProviderRetryableError).retryAfter).toBe('19')
+    expect((error as Error).cause).toBeUndefined()
+    expect(JSON.stringify(error)).not.toContain(secret)
+  })
+
   it('preserves the exact abort reason through streaming', async () => {
     const reason = new DOMException('user cancelled', 'AbortError')
     const provider = new KimiProvider({

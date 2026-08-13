@@ -5,6 +5,7 @@ import type {
   Usage
 } from '../../shared/domain'
 import type { RoleView } from '../debate/prompt-builder'
+import { redactString } from './http/redaction'
 
 export interface ProviderReplyRequest {
   sessionId: string
@@ -32,6 +33,14 @@ export type ProviderRegistry = Record<ProviderId, Provider>
 
 export class ProviderRetryableError extends Error {
   readonly retryable = true
+  readonly retryAfter?: string
+
+  constructor(message?: string, options: { retryAfter?: string } = {}) {
+    super(message)
+    if (options.retryAfter !== undefined) {
+      this.retryAfter = redactString(options.retryAfter, { maxLength: 128 })
+    }
+  }
 }
 
 export class ProviderNonRetryableError extends Error {

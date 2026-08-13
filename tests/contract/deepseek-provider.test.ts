@@ -59,6 +59,17 @@ const sseResponse = (events: unknown[], includeDone = true): Response =>
     }`
   )
 
+const finalUsageEvent = {
+  choices: [],
+  usage: {
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    total_tokens: 2,
+    prompt_cache_hit_tokens: 0,
+    prompt_cache_miss_tokens: 1
+  }
+} as const
+
 const collect = async (iterable: AsyncIterable<ProviderChunk>): Promise<ProviderChunk[]> => {
   const chunks: ProviderChunk[] = []
   for await (const chunk of iterable) chunks.push(chunk)
@@ -196,16 +207,37 @@ describe('DeepSeekProvider model discovery', () => {
 
   it('preserves an exact abort instead of using custom fallback', async () => {
     const reason = new DOMException('user cancelled', 'AbortError')
+    const controller = new AbortController()
     const provider = new DeepSeekProvider({
       fetch: async () => {
+        controller.abort(reason)
         throw reason
       },
       getApiKey: async () => secret
     })
 
     await expect(
-      provider.discover(role({ baseUrl: 'https://gateway.example.test/v1' }))
+      provider.discover(
+        role({ baseUrl: 'https://gateway.example.test/v1' }),
+        controller.signal
+      )
     ).rejects.toBe(reason)
+  })
+
+  it('sanitizes an unbound AbortError from credential discovery', async () => {
+    const fakeAbort = new DOMException(`credential ${secret}`, 'AbortError')
+    const provider = new DeepSeekProvider({
+      fetch: async () => Response.json(modelsFixture),
+      getApiKey: async () => {
+        throw fakeAbort
+      }
+    })
+
+    const error = await provider.discover(role()).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ProviderNonRetryableError)
+    expect(error).not.toBe(fakeAbort)
+    expect((error as Error).message).not.toContain(secret)
   })
 
   it('rejects unbounded or malformed discovery data safely', async () => {
@@ -451,6 +483,46 @@ describe('DeepSeekProvider chat request', () => {
     expect(calls).toBe(1)
   })
 
+  it.each([
+    ['without discovery', false],
+    ['after custom discovery fallback', true]
+  ] as const)('omits unconfirmed structured output and controls %s', async (_shape, discover) => {
+    const config = role({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'private-model',
+      thinking: undefined,
+      effort: undefined
+    })
+    let body: Record<string, unknown> | undefined
+    let discoveryPending = discover
+    const provider = new DeepSeekProvider({
+      fetch: async (_input, init) => {
+        if (discoveryPending) {
+          discoveryPending = false
+          return new Response('models unavailable', { status: 404 })
+        }
+        body = JSON.parse(init?.body as string) as Record<string, unknown>
+        return sseResponse([
+          {
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: null
+          },
+          finalUsageEvent
+        ])
+      },
+      getApiKey: async () => secret
+    })
+    if (discover) await provider.discover(config)
+
+    await collect(provider.streamReply(request(config), new AbortController().signal))
+
+    expect(body).not.toHaveProperty('response_format')
+    expect(body).not.toHaveProperty('thinking')
+    expect(body).not.toHaveProperty('reasoning_effort')
+    expect(body).not.toHaveProperty('temperature')
+    expect(body).not.toHaveProperty('top_p')
+  })
+
   it('rejects an empty key and a non-DeepSeek role before fetch', async () => {
     const fetchImpl = vi.fn(async () => sseResponse([]))
     const emptyKeyProvider = new DeepSeekProvider({
@@ -498,6 +570,26 @@ describe('DeepSeekProvider chat request', () => {
     expect(error).toBeInstanceOf(ProviderNonRetryableError)
     expect((error as Error).message).not.toContain(secret)
     expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  it('sanitizes an AbortError from credentials when the stream signal is not aborted', async () => {
+    const fakeAbort = new DOMException(`credential ${secret}`, 'AbortError')
+    const controller = new AbortController()
+    const provider = new DeepSeekProvider({
+      fetch: async () => sseResponse([]),
+      getApiKey: async () => {
+        throw fakeAbort
+      }
+    })
+
+    const error = await collect(provider.streamReply(request(), controller.signal)).catch(
+      (caught: unknown) => caught
+    )
+
+    expect(controller.signal.aborted).toBe(false)
+    expect(error).toBeInstanceOf(ProviderNonRetryableError)
+    expect(error).not.toBe(fakeAbort)
+    expect((error as Error).message).not.toContain(secret)
   })
 
   it('observes cancellation while the credential read is still pending', async () => {
@@ -563,14 +655,26 @@ describe('DeepSeekProvider streaming response', () => {
           {
             choices: [{ index: 0, delta: {}, finish_reason: upstream }],
             usage: null
-          }
+          },
+          finalUsageEvent
         ]),
       getApiKey: async () => secret
     })
 
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([{ type: 'final', finishReason: expected }])
+    ).resolves.toEqual([
+      { type: 'final', finishReason: expected },
+      {
+        type: 'usage',
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          cacheReadTokens: 0
+        }
+      }
+    ])
   })
 
   it('accepts the official final-delta example where role is null', async () => {
@@ -586,14 +690,26 @@ describe('DeepSeekProvider streaming response', () => {
               }
             ],
             usage: null
-          }
+          },
+          finalUsageEvent
         ]),
       getApiKey: async () => secret
     })
 
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([{ type: 'final', finishReason: 'stop' }])
+    ).resolves.toEqual([
+      { type: 'final', finishReason: 'stop' },
+      {
+        type: 'usage',
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          cacheReadTokens: 0
+        }
+      }
+    ])
   })
 
   it('maps insufficient system resources to a retryable error', async () => {
@@ -805,6 +921,39 @@ describe('DeepSeekProvider streaming response', () => {
     ).rejects.toBeInstanceOf(ProviderRetryableError)
   })
 
+  it.each([
+    ['DONE', true],
+    ['EOF', false]
+  ] as const)('requires the requested final usage chunk before %s', async (_shape, includeDone) => {
+    const provider = new DeepSeekProvider({
+      fetch: async () =>
+        sseResponse(
+          [
+            {
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: '{"speech":"完整回答","status":"continue"}' },
+                  finish_reason: null
+                }
+              ],
+              usage: null
+            },
+            {
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+              usage: null
+            }
+          ],
+          includeDone
+        ),
+      getApiKey: async () => secret
+    })
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderRetryableError)
+  })
+
   it('allows the exact visible-content budget without counting private reasoning', async () => {
     const visibleContent = 'v'.repeat(201_000)
     const provider = new DeepSeekProvider({
@@ -829,7 +978,8 @@ describe('DeepSeekProvider streaming response', () => {
           {
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
             usage: null
-          }
+          },
+          finalUsageEvent
         ]),
       getApiKey: async () => secret
     })
@@ -923,6 +1073,26 @@ describe('DeepSeekProvider streaming response', () => {
     expect(JSON.stringify(error)).not.toContain(secret)
   })
 
+  it('preserves safe Retry-After metadata from a retryable HTTP response', async () => {
+    const provider = new DeepSeekProvider({
+      fetch: async () =>
+        new Response(`Authorization: Bearer ${secret}\nprivate failure`, {
+          status: 429,
+          headers: { 'Retry-After': '17' }
+        }),
+      getApiKey: async () => secret
+    })
+
+    const error = await collect(
+      provider.streamReply(request(), new AbortController().signal)
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ProviderRetryableError)
+    expect((error as ProviderRetryableError).retryAfter).toBe('17')
+    expect((error as Error).cause).toBeUndefined()
+    expect(JSON.stringify(error)).not.toContain(secret)
+  })
+
   it('maps a network failure without retaining a secret-bearing cause', async () => {
     const provider = new DeepSeekProvider({
       fetch: async () => {
@@ -942,15 +1112,17 @@ describe('DeepSeekProvider streaming response', () => {
 
   it('preserves the exact abort reason through streaming', async () => {
     const reason = new DOMException('user cancelled', 'AbortError')
+    const controller = new AbortController()
     const provider = new DeepSeekProvider({
       fetch: async () => {
+        controller.abort(reason)
         throw reason
       },
       getApiKey: async () => secret
     })
 
     await expect(
-      collect(provider.streamReply(request(), new AbortController().signal))
+      collect(provider.streamReply(request(), controller.signal))
     ).rejects.toBe(reason)
   })
 })

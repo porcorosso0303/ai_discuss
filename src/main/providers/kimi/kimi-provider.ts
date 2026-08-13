@@ -91,7 +91,11 @@ const normalizeError = (error: unknown, signal?: AbortSignal): Error => {
     (error instanceof HttpStatusError &&
       (error.status === 429 || (error.status >= 500 && error.status <= 599)))
   ) {
-    return new ProviderRetryableError('Kimi API request failed temporarily')
+    return new ProviderRetryableError('Kimi API request failed temporarily', {
+      ...(error instanceof HttpStatusError && error.retryAfter !== undefined
+        ? { retryAfter: error.retryAfter }
+        : {})
+    })
   }
   if (error instanceof ProviderRetryableError || error instanceof ProviderNonRetryableError) {
     return error

@@ -42,8 +42,8 @@ const capabilityKey = (baseUrl: string, model: string): string =>
 const MAX_VISIBLE_CONTENT_CHARS = 201_000
 
 const isAbort = (error: unknown, signal?: AbortSignal): boolean =>
-  (error instanceof Error && error.name === 'AbortError') ||
-  (signal?.aborted === true && error === signal.reason)
+  signal?.aborted === true &&
+  (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))
 
 const normalizeError = (error: unknown, signal?: AbortSignal): unknown => {
   if (isAbort(error, signal)) return error
@@ -52,7 +52,11 @@ const normalizeError = (error: unknown, signal?: AbortSignal): unknown => {
     (error instanceof HttpStatusError &&
       (error.status === 429 || (error.status >= 500 && error.status <= 599)))
   ) {
-    return new ProviderRetryableError('DeepSeek API request failed temporarily')
+    return new ProviderRetryableError('DeepSeek API request failed temporarily', {
+      ...(error instanceof HttpStatusError && error.retryAfter !== undefined
+        ? { retryAfter: error.retryAfter }
+        : {})
+    })
   }
   if (error instanceof ProviderRetryableError || error instanceof ProviderNonRetryableError) {
     return error
@@ -178,10 +182,11 @@ export class DeepSeekProvider implements Provider {
     signal: AbortSignal
   ): AsyncIterable<ProviderChunk> {
     let config: DeepSeekRoleConfig
+    let capability: ModelCapability
     let apiKey: string
     try {
       config = deepSeekRoleConfigSchema.parse(request.role)
-      const capability =
+      capability =
         this.discoveredCapabilitiesByRole
           .get(config.roleId)
           ?.get(capabilityKey(config.baseUrl, config.model)) ??
@@ -214,8 +219,10 @@ export class DeepSeekProvider implements Provider {
       ],
       max_tokens: config.maxTokens,
       stream: true,
-      stream_options: { include_usage: true },
-      response_format: { type: 'json_object' }
+      stream_options: { include_usage: true }
+    }
+    if (capability.structuredOutputModes.includes('json-object')) {
+      body.response_format = { type: 'json_object' }
     }
     if (config.thinking !== undefined) {
       body.thinking = { type: config.thinking ? 'enabled' : 'disabled' }
@@ -331,9 +338,9 @@ export class DeepSeekProvider implements Provider {
           }
         }
       }
-      if (!completed) {
+      if (!completed || !usageReceived) {
         throw new ProviderRetryableError(
-          'DeepSeek streaming response ended before completion'
+          'DeepSeek streaming response ended before completion metadata'
         )
       }
     } catch (error) {
