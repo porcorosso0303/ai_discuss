@@ -195,6 +195,61 @@ describe('CodexJsonRpcClient', () => {
       client.request('emit/server-request-invalid-trace', {}, z.strictObject({}))
     ).rejects.toBeInstanceOf(JsonRpcProtocolError)
   })
+
+  it.each([
+    ['max', '9223372036854775807'],
+    ['min', '-9223372036854775808']
+  ] as const)('echoes the exact signed int64 boundary token in Method not found: %s', async (variant, rawId) => {
+    const client = await startClient()
+
+    await client.request(
+      'emit/server-request-raw',
+      { case: variant },
+      z.strictObject({})
+    )
+    const raw = transports.get(client)?.rawTranscript ?? []
+
+    expect(raw).toContain(
+      `{"id":${rawId},"error":{"code":-32601,"message":"Method not found"}}`
+    )
+  })
+
+  it.each([
+    'maxPlusOne',
+    'minMinusOne',
+    'exponent',
+    'duplicateId',
+    'duplicateEscapedId'
+  ] as const)(
+    'fails closed for a non-int64 raw server request ID: %s',
+    async (variant) => {
+      const client = await startClient()
+
+      await expect(
+        client.request(
+          'emit/server-request-raw',
+          { case: variant },
+          z.strictObject({})
+        )
+      ).rejects.toBeInstanceOf(JsonRpcProtocolError)
+    }
+  )
+
+  it('extracts only a top-level escaped string ID despite field order and nested IDs', async () => {
+    const client = await startClient()
+
+    await client.request(
+      'emit/server-request-raw',
+      { case: 'trickyString' },
+      z.strictObject({})
+    )
+    const messages = transports.get(client)?.transcript ?? []
+
+    expect(messages).toContainEqual({
+      id: 'escaped"id\\taila',
+      error: { code: -32601, message: 'Method not found' }
+    })
+  })
 })
 
 describe('Codex executable resolution', () => {

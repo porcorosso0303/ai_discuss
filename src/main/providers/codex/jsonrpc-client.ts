@@ -58,12 +58,118 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 const hasOnlyKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(value).every((key) => keys.includes(key))
 
-const isJsonRpcRequestId = (value: unknown): value is string | number =>
-  typeof value === 'string' ||
-  (typeof value === 'number' &&
-    Number.isInteger(value) &&
-    value >= -9_223_372_036_854_776_000 &&
-    value <= 9_223_372_036_854_776_000)
+const MIN_INT64 = -(1n << 63n)
+const MAX_INT64 = (1n << 63n) - 1n
+
+const skipWhitespace = (source: string, start: number): number => {
+  let index = start
+  while (/\s/u.test(source[index] ?? '')) index += 1
+  return index
+}
+
+const scanStringEnd = (source: string, start: number): number => {
+  if (source[start] !== '"') throw new JsonRpcProtocolError('Invalid JSON object member')
+  let index = start + 1
+  while (index < source.length) {
+    if (source[index] === '\\') {
+      index += 2
+      continue
+    }
+    if (source[index] === '"') return index + 1
+    index += 1
+  }
+  throw new JsonRpcProtocolError('Unterminated JSON string')
+}
+
+const scanValueEnd = (source: string, start: number): number => {
+  const first = source[start]
+  if (first === '"') return scanStringEnd(source, start)
+  if (first !== '{' && first !== '[') {
+    let index = start
+    while (index < source.length && !/[\s,}]/u.test(source[index])) index += 1
+    return index
+  }
+
+  const stack: string[] = [first]
+  let index = start + 1
+  while (index < source.length && stack.length > 0) {
+    const character = source[index]
+    if (character === '"') {
+      index = scanStringEnd(source, index)
+      continue
+    }
+    if (character === '{' || character === '[') {
+      stack.push(character)
+    } else if (character === '}' || character === ']') {
+      const expected = character === '}' ? '{' : '['
+      if (stack.pop() !== expected) {
+        throw new JsonRpcProtocolError('Mismatched JSON container')
+      }
+    }
+    index += 1
+  }
+  if (stack.length !== 0) throw new JsonRpcProtocolError('Unterminated JSON container')
+  return index
+}
+
+const extractRawTopLevelId = (line: string): string | undefined => {
+  let index = skipWhitespace(line, 0)
+  if (line[index] !== '{') throw new JsonRpcProtocolError('Expected a JSON object')
+  index += 1
+  let rawId: string | undefined
+  let idCount = 0
+
+  while (true) {
+    index = skipWhitespace(line, index)
+    if (line[index] === '}') {
+      index = skipWhitespace(line, index + 1)
+      if (index !== line.length) throw new JsonRpcProtocolError('Invalid JSON object suffix')
+      break
+    }
+    const keyEnd = scanStringEnd(line, index)
+    const key = JSON.parse(line.slice(index, keyEnd)) as unknown
+    if (typeof key !== 'string') throw new JsonRpcProtocolError('Invalid JSON object key')
+    index = skipWhitespace(line, keyEnd)
+    if (line[index] !== ':') throw new JsonRpcProtocolError('Invalid JSON object member')
+    const valueStart = skipWhitespace(line, index + 1)
+    const valueEnd = scanValueEnd(line, valueStart)
+    if (key === 'id') {
+      idCount += 1
+      rawId = line.slice(valueStart, valueEnd)
+    }
+    index = skipWhitespace(line, valueEnd)
+    if (line[index] === ',') {
+      index += 1
+      continue
+    }
+    if (line[index] !== '}') throw new JsonRpcProtocolError('Invalid JSON object delimiter')
+  }
+  if (idCount > 1) throw new JsonRpcProtocolError('Duplicate top-level response id')
+  return rawId
+}
+
+const serializeServerRequestId = (rawId: string | undefined, parsedId: unknown): string => {
+  if (rawId?.startsWith('"') === true) {
+    const decoded = JSON.parse(rawId) as unknown
+    if (typeof decoded !== 'string' || decoded !== parsedId) {
+      throw new JsonRpcProtocolError('Invalid server request id')
+    }
+    return JSON.stringify(decoded)
+  }
+  if (rawId === undefined || !/^-?(?:0|[1-9]\d*)$/u.test(rawId)) {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  let integer: bigint
+  try {
+    integer = BigInt(rawId)
+  } catch {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  if (integer < MIN_INT64 || integer > MAX_INT64 || typeof parsedId !== 'number') {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  return rawId
+}
 
 const isW3cTraceContext = (value: unknown): boolean => {
   if (value === null) return true
@@ -229,10 +335,14 @@ export class CodexJsonRpcClient {
   }
 
   private writeMessage(message: unknown): void {
+    this.writeSerializedMessage(JSON.stringify(message))
+  }
+
+  private writeSerializedMessage(serialized: string): void {
     if (this.child.stdin.destroyed || !this.child.stdin.writable) {
       throw new JsonRpcTransportError('Codex App Server stdin is unavailable')
     }
-    const encoded = `${JSON.stringify(message)}\n`
+    const encoded = `${serialized}\n`
     if (Buffer.byteLength(encoded) > this.maxLineBytes) {
       throw new JsonRpcProtocolError('Outbound Codex message exceeds the line limit')
     }
@@ -282,21 +392,21 @@ export class CodexJsonRpcClient {
       throw new JsonRpcProtocolError('Codex emitted malformed JSON')
     }
     if (!isObject(value)) throw new JsonRpcProtocolError('Codex emitted a non-object message')
+    const rawId = extractRawTopLevelId(line)
 
     const hasId = Object.hasOwn(value, 'id')
     const hasMethod = typeof value.method === 'string'
     if (hasId && hasMethod) {
       if (
         !hasOnlyKeys(value, ['id', 'method', 'params', 'trace']) ||
-        !isJsonRpcRequestId(value.id) ||
         (Object.hasOwn(value, 'trace') && !isW3cTraceContext(value.trace))
       ) {
         throw new JsonRpcProtocolError('Invalid server request envelope')
       }
-      this.writeMessage({
-        id: value.id,
-        error: { code: -32601, message: 'Method not found' }
-      })
+      const serializedId = serializeServerRequestId(rawId, value.id)
+      this.writeSerializedMessage(
+        `{"id":${serializedId},"error":{"code":-32601,"message":"Method not found"}}`
+      )
       return
     }
     if (hasMethod) {

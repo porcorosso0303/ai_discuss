@@ -40,6 +40,7 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
   readonly transcript: Array<Record<string, any>> = []
+  readonly rawTranscript: string[] = []
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
   private readonly mode: FakeCodexMode
@@ -77,7 +78,10 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
     while (newline !== -1) {
       const line = this.inputBuffer.slice(0, newline)
       this.inputBuffer = this.inputBuffer.slice(newline + 1)
-      if (line !== '') this.handle(JSON.parse(line) as Record<string, any>)
+      if (line !== '') {
+        this.rawTranscript.push(line)
+        this.handle(JSON.parse(line) as Record<string, any>)
+      }
       newline = this.inputBuffer.indexOf('\n')
     }
   }
@@ -85,6 +89,12 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   private send(value: unknown): void {
     if (!this.stdout.destroyed && !this.stdout.writableEnded) {
       this.stdout.write(`${JSON.stringify(value)}\n`)
+    }
+  }
+
+  private sendRaw(value: string): void {
+    if (!this.stdout.destroyed && !this.stdout.writableEnded) {
+      this.stdout.write(`${value}\n`)
     }
   }
 
@@ -170,6 +180,22 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         params: {},
         trace: { traceparent: 7 }
       })
+      return this.send({ id: message.id, result: {} })
+    }
+    if (message.method === 'emit/server-request-raw') {
+      const requests: Record<string, string> = {
+        max: '{"method":"hostile/request","id":9223372036854775807,"params":{}}',
+        min: '{"id":-9223372036854775808,"params":{},"method":"hostile/request"}',
+        maxPlusOne: '{"id":9223372036854775808,"method":"hostile/request"}',
+        minMinusOne: '{"method":"hostile/request","id":-9223372036854775809}',
+        exponent: '{"method":"hostile/request","id":1e3}',
+        duplicateId: '{"id":1,"method":"hostile/request","id":2}',
+        duplicateEscapedId:
+          '{"id":1,"method":"hostile/request","\\u0069d":2}',
+        trickyString:
+          '{ "params": {"id": 999, "text": "escaped \\\"id\\\""}, "trace": null, "method": "hostile/request", "id": "escaped\\\"id\\\\tail\\u0061" }'
+      }
+      this.sendRaw(requests[message.params.case])
       return this.send({ id: message.id, result: {} })
     }
     if (message.method === 'account/read') {
