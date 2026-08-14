@@ -425,6 +425,12 @@ export const modelCapabilitySchema = z.strictObject({
     .array(reasoningEffortSchema)
     .max(REASONING_EFFORTS.length)
     .refine(uniqueValues, { message: 'reasoningEfforts must be unique' }),
+  defaultReasoningEffort: reasoningEffortSchema.optional(),
+  inputModalities: z
+    .array(z.enum(['text', 'image', 'audio']))
+    .max(3)
+    .refine(uniqueValues, { message: 'inputModalities must be unique' })
+    .optional(),
   contextLength: positiveIntegerSchema.max(10_000_000).optional(),
   maxOutputTokens: positiveIntegerSchema.max(10_000_000).optional(),
   thinking: z
@@ -443,6 +449,17 @@ export const modelCapabilitySchema = z.strictObject({
     .array(structuredOutputModeSchema)
     .max(STRUCTURED_OUTPUT_MODES.length)
     .refine(uniqueValues, { message: 'structured output modes must be unique' })
+}).superRefine(({ reasoningEfforts, defaultReasoningEffort }, context) => {
+  if (
+    defaultReasoningEffort !== undefined &&
+    !reasoningEfforts.includes(defaultReasoningEffort)
+  ) {
+    context.addIssue({
+      code: 'custom',
+      path: ['defaultReasoningEffort'],
+      message: 'defaultReasoningEffort must be supported by the model'
+    })
+  }
 })
 
 export const providerCapabilitiesSchema = z
