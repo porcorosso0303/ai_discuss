@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "id": "gpt-test",
+      "model": "gpt-test",
+      "displayName": "GPT Test",
+      "description": "Test model",
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "high",
+          "description": "Careful"
+        }
+      ],
+      "defaultReasoningEffort": "high",
+      "isDefault": true
+    }
+  ]
+}

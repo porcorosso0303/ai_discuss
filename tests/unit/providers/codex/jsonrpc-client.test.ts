@@ -163,6 +163,38 @@ describe('CodexJsonRpcClient', () => {
     })
     expect(JSON.stringify(messages)).not.toContain('dangerously-accept')
   })
+
+  it.each([
+    ['emit/server-request-string', 'approval-request-1'],
+    ['emit/server-request-int64', 9_223_372_036_854_775_000]
+  ] as const)('rejects traced hostile requests with valid string/int64 IDs: %s', async (method, id) => {
+    const client = await startClient()
+
+    await client.request(method, {}, z.strictObject({}))
+    const messages = transports.get(client)?.transcript ?? []
+
+    expect(messages).toContainEqual({
+      id,
+      error: { code: -32601, message: 'Method not found' }
+    })
+    expect(JSON.stringify(messages)).not.toContain('steal credentials')
+  })
+
+  it.each([null, 1.5, 1e20])('fails the protocol for an invalid server request ID: %s', async (id) => {
+    const client = await startClient()
+
+    await expect(
+      client.request('emit/server-request-invalid-id', { id }, z.strictObject({}))
+    ).rejects.toBeInstanceOf(JsonRpcProtocolError)
+  })
+
+  it('fails the protocol for malformed W3C trace context', async () => {
+    const client = await startClient()
+
+    await expect(
+      client.request('emit/server-request-invalid-trace', {}, z.strictObject({}))
+    ).rejects.toBeInstanceOf(JsonRpcProtocolError)
+  })
 })
 
 describe('Codex executable resolution', () => {

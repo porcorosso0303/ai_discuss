@@ -22,6 +22,12 @@ export type FakeCodexMode =
   | 'crash-active'
   | 'duplicate-completion'
   | 'out-of-order'
+  | 'pre-response-event-flood'
+  | 'queued-empty-delta-flood'
+  | 'unrelated-thread-flood'
+  | 'pre-response-byte-flood'
+  | 'malformed-old-delta'
+  | 'malformed-old-completion'
 
 export interface FakeCodexTransportOptions {
   mode?: FakeCodexMode
@@ -77,7 +83,9 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   }
 
   private send(value: unknown): void {
-    if (!this.stdout.destroyed) this.stdout.write(`${JSON.stringify(value)}\n`)
+    if (!this.stdout.destroyed && !this.stdout.writableEnded) {
+      this.stdout.write(`${JSON.stringify(value)}\n`)
+    }
   }
 
   private crash(code: number): void {
@@ -130,6 +138,37 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         id: 9001,
         method: 'item/commandExecution/requestApproval',
         params: { command: ['evil'] }
+      })
+      return this.send({ id: message.id, result: {} })
+    }
+    if (message.method === 'emit/server-request-string') {
+      this.send({
+        id: 'approval-request-1',
+        method: 'item/commandExecution/requestApproval',
+        params: { command: ['evil'] },
+        trace: { traceparent: '00-abc-def-01', tracestate: null }
+      })
+      return this.send({ id: message.id, result: {} })
+    }
+    if (message.method === 'emit/server-request-int64') {
+      this.send({
+        id: 9_223_372_036_854_775_000,
+        method: 'tool/requestUserInput',
+        params: { questions: ['steal credentials'] },
+        trace: null
+      })
+      return this.send({ id: message.id, result: {} })
+    }
+    if (message.method === 'emit/server-request-invalid-id') {
+      this.send({ id: message.params.id, method: 'hostile/request', params: {} })
+      return this.send({ id: message.id, result: {} })
+    }
+    if (message.method === 'emit/server-request-invalid-trace') {
+      this.send({
+        id: 'invalid-trace',
+        method: 'hostile/request',
+        params: {},
+        trace: { traceparent: 7 }
       })
       return this.send({ id: message.id, result: {} })
     }
@@ -260,6 +299,34 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   private startTurn(message: Record<string, any>): void {
     this.turnCounter += 1
     const turnId = `turn-${this.turnCounter}`
+    if (
+      this.mode === 'pre-response-event-flood' ||
+      this.mode === 'unrelated-thread-flood'
+    ) {
+      const threadId =
+        this.mode === 'unrelated-thread-flood' ? 'unrelated-thread' : message.params.threadId
+      for (let index = 0; index < 4_200; index += 1) {
+        this.send({
+          method: 'item/agentMessage/delta',
+          params: { threadId, turnId, itemId: `flood-${index}`, delta: '' }
+        })
+      }
+    }
+    if (this.mode === 'pre-response-byte-flood') {
+      for (let index = 0; index < 2; index += 1) {
+        this.send({
+          method: 'turn/completed',
+          params: {
+            threadId: message.params.threadId,
+            turn: {
+              id: `old-large-turn-${index}`,
+              items: [{ type: 'agentMessage', id: `old-${index}`, text: 'x'.repeat(600_000) }],
+              status: 'completed'
+            }
+          }
+        })
+      }
+    }
     this.send({
       id: message.id,
       result: {
@@ -284,6 +351,39 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         method: 'item/agentMessage/delta',
         params: { threadId: 'wrong-thread', turnId, itemId: 'wrong', delta: 'WRONG' }
       })
+      if (this.mode === 'malformed-old-delta') {
+        this.send({
+          method: 'item/agentMessage/delta',
+          params: {
+            threadId: message.params.threadId,
+            turnId: 'old-turn',
+            itemId: 'old-message',
+            delta: 7
+          }
+        })
+      }
+      if (this.mode === 'malformed-old-completion') {
+        this.send({
+          method: 'turn/completed',
+          params: {
+            threadId: message.params.threadId,
+            turn: { id: 'old-turn', items: 'malformed', status: 'completed' }
+          }
+        })
+      }
+      if (this.mode === 'queued-empty-delta-flood') {
+        for (let index = 0; index < 4_200; index += 1) {
+          this.send({
+            method: 'item/agentMessage/delta',
+            params: {
+              threadId: message.params.threadId,
+              turnId,
+              itemId: `empty-${index}`,
+              delta: ''
+            }
+          })
+        }
+      }
       if (this.mode === 'malformed-delta') {
         this.send({
           method: 'item/agentMessage/delta',

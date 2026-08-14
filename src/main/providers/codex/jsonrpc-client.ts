@@ -58,6 +58,28 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 const hasOnlyKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(value).every((key) => keys.includes(key))
 
+const isJsonRpcRequestId = (value: unknown): value is string | number =>
+  typeof value === 'string' ||
+  (typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= -9_223_372_036_854_776_000 &&
+    value <= 9_223_372_036_854_776_000)
+
+const isW3cTraceContext = (value: unknown): boolean => {
+  if (value === null) return true
+  if (!isObject(value)) return false
+  for (const key of ['traceparent', 'tracestate'] as const) {
+    if (
+      Object.hasOwn(value, key) &&
+      value[key] !== null &&
+      typeof value[key] !== 'string'
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
 const safePositiveInteger = (value: number | undefined, fallback: number): number => {
   const result = value ?? fallback
   if (!Number.isSafeInteger(result) || result <= 0) throw new RangeError('Limit must be positive')
@@ -264,7 +286,11 @@ export class CodexJsonRpcClient {
     const hasId = Object.hasOwn(value, 'id')
     const hasMethod = typeof value.method === 'string'
     if (hasId && hasMethod) {
-      if (!hasOnlyKeys(value, ['id', 'method', 'params'])) {
+      if (
+        !hasOnlyKeys(value, ['id', 'method', 'params', 'trace']) ||
+        !isJsonRpcRequestId(value.id) ||
+        (Object.hasOwn(value, 'trace') && !isW3cTraceContext(value.trace))
+      ) {
         throw new JsonRpcProtocolError('Invalid server request envelope')
       }
       this.writeMessage({

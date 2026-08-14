@@ -47,6 +47,8 @@ const MAX_MODEL_PAGES = 10
 const MODEL_PAGE_SIZE = 100
 const MAX_VISIBLE_CONTENT_CHARS = 201_000
 const MAX_INPUT_CHARS = 800_000
+const MAX_TURN_EVENTS = 4_096
+const MAX_TURN_EVENT_BYTES = 1024 * 1024
 const DEFAULT_TURN_TIMEOUT_MS = 180_000
 
 interface RoleThread {
@@ -91,11 +93,19 @@ export interface CodexProviderDependencies {
 
 class AsyncEventQueue<Event> {
   private values: Event[] = []
+  private valueBytes = 0
   private waiter:
     | { resolve: (value: IteratorResult<Event>) => void; reject: (error: Error) => void }
     | undefined
   private closed = false
   private failure: Error | undefined
+
+  constructor(
+    private readonly maxValues: number,
+    private readonly maxBytes: number,
+    private readonly sizeOf: (value: Event) => number,
+    private readonly overflowError: () => Error
+  ) {}
 
   push(value: Event): void {
     if (this.closed || this.failure !== undefined) return
@@ -104,7 +114,18 @@ class AsyncEventQueue<Event> {
       this.waiter = undefined
       waiter.resolve({ value, done: false })
     } else {
+      const valueBytes = this.sizeOf(value)
+      if (
+        !Number.isSafeInteger(valueBytes) ||
+        valueBytes < 0 ||
+        this.values.length >= this.maxValues ||
+        this.valueBytes + valueBytes > this.maxBytes
+      ) {
+        this.fail(this.overflowError())
+        return
+      }
       this.values.push(value)
+      this.valueBytes += valueBytes
     }
   }
 
@@ -122,6 +143,7 @@ class AsyncEventQueue<Event> {
     if (this.closed || this.failure !== undefined) return
     this.failure = error
     this.values = []
+    this.valueBytes = 0
     if (this.waiter !== undefined) {
       const waiter = this.waiter
       this.waiter = undefined
@@ -132,7 +154,10 @@ class AsyncEventQueue<Event> {
   next(): Promise<IteratorResult<Event>> {
     if (this.failure !== undefined) return Promise.reject(this.failure)
     const value = this.values.shift()
-    if (value !== undefined) return Promise.resolve({ value, done: false })
+    if (value !== undefined) {
+      this.valueBytes -= this.sizeOf(value)
+      return Promise.resolve({ value, done: false })
+    }
     if (this.closed) return Promise.resolve({ value: undefined, done: true })
     return new Promise((resolve, reject) => {
       this.waiter = { resolve, reject }
@@ -143,6 +168,11 @@ class AsyncEventQueue<Event> {
 type TurnEvent =
   | { type: 'delta'; value: AgentMessageDelta }
   | { type: 'completed'; value: TurnCompleted }
+
+const turnEventBytes = (event: TurnEvent): number =>
+  event.type === 'delta'
+    ? Buffer.byteLength(event.value.delta, 'utf8') + 128
+    : Buffer.byteLength(JSON.stringify(event.value), 'utf8') + 128
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -472,26 +502,47 @@ export class CodexProvider implements Provider {
       this.reservedRoles.delete(config.roleId)
       throw normalizeError(error, signal)
     }
-    const queue = new AsyncEventQueue<TurnEvent>()
+    const eventLimitError = (): ProviderNonRetryableError =>
+      new ProviderNonRetryableError('Codex turn event stream exceeds the safe limit')
+    const queue = new AsyncEventQueue<TurnEvent>(
+      MAX_TURN_EVENTS,
+      MAX_TURN_EVENT_BYTES,
+      turnEventBytes,
+      eventLimitError
+    )
     const buffered: TurnEvent[] = []
+    const bufferedMalformed: Array<{ turnId: string; error: Error }> = []
+    let bufferedBytes = 0
+    let observedEvents = 0
+    let observedBytes = 0
+    let acceptingEvents = true
     let turnId: string | undefined
     let visibleChars = 0
     let completed = false
     let timeout: ReturnType<typeof setTimeout> | undefined
 
-    const receive = (event: TurnEvent): void => {
+    const failTurn = (error: Error): void => {
+      acceptingEvents = false
+      buffered.length = 0
+      bufferedMalformed.length = 0
+      bufferedBytes = 0
+      queue.fail(error)
+    }
+
+    const dispatch = (event: TurnEvent): void => {
       if (turnId === undefined) {
-        buffered.push(event)
         return
       }
       const eventThreadId = event.value.threadId
       const eventTurnId =
         event.type === 'delta' ? event.value.turnId : event.value.turn.id
       if (eventThreadId !== thread.threadId || eventTurnId !== turnId) return
-      if (completed) return
+      if (completed || !acceptingEvents) return
       if (event.type === 'delta') {
         if (visibleChars + event.value.delta.length > MAX_VISIBLE_CONTENT_CHARS) {
-          queue.fail(new ProviderNonRetryableError('Codex visible response exceeds the safe limit'))
+          failTurn(
+            new ProviderNonRetryableError('Codex visible response exceeds the safe limit')
+          )
           return
         }
         visibleChars += event.value.delta.length
@@ -500,29 +551,81 @@ export class CodexProvider implements Provider {
       }
       completed = true
       if (event.value.turn.status !== 'completed') {
-        queue.fail(new ProviderNonRetryableError('Codex turn did not complete successfully'))
+        failTurn(new ProviderNonRetryableError('Codex turn did not complete successfully'))
       } else if (visibleChars === 0) {
-        queue.fail(new ProviderNonRetryableError('Codex completed without a visible response'))
+        failTurn(new ProviderNonRetryableError('Codex completed without a visible response'))
       } else {
         queue.push(event)
         queue.close()
       }
     }
 
+    const reserveEvent = (eventBytes: number): boolean => {
+      if (!acceptingEvents || completed) return false
+      observedEvents += 1
+      observedBytes += eventBytes
+      if (observedEvents > MAX_TURN_EVENTS || observedBytes > MAX_TURN_EVENT_BYTES) {
+        failTurn(eventLimitError())
+        return false
+      }
+      return true
+    }
+
+    const receive = (event: TurnEvent): void => {
+      const eventBytes = turnEventBytes(event)
+      if (!reserveEvent(eventBytes)) return
+      if (turnId === undefined) {
+        if (
+          buffered.length >= MAX_TURN_EVENTS ||
+          bufferedBytes + eventBytes > MAX_TURN_EVENT_BYTES
+        ) {
+          failTurn(eventLimitError())
+          return
+        }
+        buffered.push(event)
+        bufferedBytes += eventBytes
+        return
+      }
+      dispatch(event)
+    }
+
+    const receiveMalformed = (rawTurnId: unknown, error: Error): void => {
+      if (typeof rawTurnId !== 'string') return
+      if (turnId !== undefined) {
+        if (rawTurnId === turnId) failTurn(error)
+        return
+      }
+      const eventBytes = Buffer.byteLength(rawTurnId, 'utf8') + 128
+      if (!reserveEvent(eventBytes)) return
+      bufferedMalformed.push({ turnId: rawTurnId, error })
+      bufferedBytes += eventBytes
+    }
+
     const handleDelta = (params: unknown): void => {
+      if (!isRecord(params) || params.threadId !== thread.threadId) return
+      if (turnId !== undefined && params.turnId !== turnId) return
       const parsed = agentMessageDeltaSchema.safeParse(params)
       if (parsed.success) {
         receive({ type: 'delta', value: parsed.data })
-      } else if (isRecord(params) && params.threadId === thread.threadId) {
-        queue.fail(new ProviderNonRetryableError('Codex emitted an invalid message delta'))
+      } else {
+        receiveMalformed(
+          params.turnId,
+          new ProviderNonRetryableError('Codex emitted an invalid message delta')
+        )
       }
     }
     const handleCompleted = (params: unknown): void => {
+      if (!isRecord(params) || params.threadId !== thread.threadId) return
+      const rawTurnId = isRecord(params.turn) ? params.turn.id : undefined
+      if (turnId !== undefined && rawTurnId !== turnId) return
       const parsed = turnCompletedSchema.safeParse(params)
       if (parsed.success) {
         receive({ type: 'completed', value: parsed.data })
-      } else if (isRecord(params) && params.threadId === thread.threadId) {
-        queue.fail(new ProviderNonRetryableError('Codex emitted an invalid turn completion'))
+      } else {
+        receiveMalformed(
+          rawTurnId,
+          new ProviderNonRetryableError('Codex emitted an invalid turn completion')
+        )
       }
     }
     const removeDelta = this.dependencies.client.onNotification(
@@ -582,7 +685,11 @@ export class CodexProvider implements Provider {
         interrupt()
         queue.fail(new ProviderRetryableError('Codex turn timed out'))
       }, this.turnTimeoutMs)
-      for (const event of buffered.splice(0)) receive(event)
+      const malformedCurrent = bufferedMalformed.find((event) => event.turnId === turnId)
+      bufferedMalformed.length = 0
+      if (malformedCurrent !== undefined) failTurn(malformedCurrent.error)
+      for (const event of buffered.splice(0)) dispatch(event)
+      bufferedBytes = 0
       if (signal.aborted) handleAbort()
 
       while (true) {
@@ -714,7 +821,7 @@ export class CodexProvider implements Provider {
 
   private handleLoginCompleted(params: unknown): void {
     const parsed = loginCompletedSchema.safeParse(params)
-    if (!parsed.success || parsed.data.loginId === null) return
+    if (!parsed.success || typeof parsed.data.loginId !== 'string') return
     if (this.loginWaiters.has(parsed.data.loginId)) {
       this.settleLogin(parsed.data.loginId, parsed.data)
     } else if (this.completedLogins.size < 8) {

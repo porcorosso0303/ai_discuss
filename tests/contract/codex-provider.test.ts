@@ -284,6 +284,48 @@ describe('CodexProvider discovery and debate streaming', () => {
     ).rejects.toBeInstanceOf(Error)
   })
 
+  it.each([
+    'pre-response-event-flood',
+    'queued-empty-delta-flood',
+    'pre-response-byte-flood'
+  ] as const)('rejects bounded matching event floods: %s', async (mode) => {
+    const { provider } = await createProvider(mode)
+    await provider.discover(role())
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
+  it('filters unrelated-thread floods before consuming the active turn event budget', async () => {
+    const { provider } = await createProvider('unrelated-thread-flood')
+    await provider.discover(role())
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).resolves.toEqual([
+      { type: 'content', content: '{"speech":"回应",' },
+      { type: 'content', content: '"status":"continue"}' },
+      { type: 'final', finishReason: 'stop' }
+    ])
+  })
+
+  it.each([
+    'malformed-old-delta',
+    'malformed-old-completion'
+  ] as const)('ignores malformed late events for an older turn: %s', async (mode) => {
+    const { provider } = await createProvider(mode)
+    await provider.discover(role())
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).resolves.toEqual([
+      { type: 'content', content: '{"speech":"回应",' },
+      { type: 'content', content: '"status":"continue"}' },
+      { type: 'final', finishReason: 'stop' }
+    ])
+  })
+
   it('rejects an active turn immediately when the App Server process crashes', async () => {
     const { provider, client } = await createProvider('crash-active')
     const failures: Error[] = []
