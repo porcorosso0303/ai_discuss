@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,13 +12,21 @@ import {
   JsonRpcTransportError
 } from '../../../../src/main/providers/codex/jsonrpc-client'
 import { resolveCodexBinaryPath } from '../../../../src/main/providers/codex/codex-path'
-import { codexSpawnSpec } from '../../../../src/main/providers/codex/codex-process'
+import {
+  AI_DEBATES_CODEX_CONFIG,
+  prepareCodexHome
+} from '../../../../src/main/providers/codex/codex-config'
+import {
+  codexSpawnSpec,
+  startCodexAppServer
+} from '../../../../src/main/providers/codex/codex-process'
 import {
   FakeCodexTransport,
   type FakeCodexMode
 } from '../../../helpers/fake-codex-transport'
 
 const clients: CodexJsonRpcClient[] = []
+const temporaryPaths: string[] = []
 const transports = new WeakMap<CodexJsonRpcClient, FakeCodexTransport>()
 
 const startClient = async (
@@ -40,6 +48,7 @@ const startClient = async (
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.dispose()))
+  await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
 describe('CodexJsonRpcClient', () => {
@@ -150,6 +159,116 @@ describe('CodexJsonRpcClient', () => {
     expect(client.pendingCount).toBe(0)
   })
 
+  it('atomically fails the whole connection on timeout and ignores late bytes', async () => {
+    const client = await startClient('normal', { maxPending: 2, requestTimeoutMs: 30 })
+    const child = transports.get(client) as FakeCodexTransport
+    const failures: Error[] = []
+    client.onFailure((error) => failures.push(error))
+
+    const first = client.request('never/respond', { request: 1 }, z.unknown())
+    const second = client.request('never/respond', { request: 2 }, z.unknown())
+
+    await expect(first).rejects.toBeInstanceOf(JsonRpcTransportError)
+    await expect(second).rejects.toBeInstanceOf(JsonRpcTransportError)
+    expect(failures).toHaveLength(1)
+    expect(client.pendingCount).toBe(0)
+    expect(child.exitCode).toBe(0)
+
+    child.stdout.emit(
+      'data',
+      Buffer.from('{"id":2,"result":{"late":"must-be-ignored"}}\n')
+    )
+    await expect(client.request('fast', {}, z.unknown())).rejects.toBe(
+      failures[0]
+    )
+    expect(failures).toHaveLength(1)
+  })
+
+  it('rejects initialize with an Error when dispose wins the startup race', async () => {
+    const child = new FakeCodexTransport()
+    child.stdin.removeAllListeners('data')
+    const client = new CodexJsonRpcClient(child)
+    clients.push(client)
+
+    const initializing = client.initialize({
+      name: 'ai_debates',
+      title: 'AI Debates',
+      version: '0.1.0'
+    })
+    await client.dispose()
+
+    await expect(initializing).rejects.toBeInstanceOf(Error)
+  })
+
+  it('checks an oversized stdout remainder after every processed newline', async () => {
+    const client = await startClient('normal', { maxLineBytes: 256 })
+    const child = transports.get(client) as FakeCodexTransport
+    const failed = new Promise<Error>((resolve) => client.onFailure(resolve))
+
+    child.stdout.write(
+      `${JSON.stringify({ method: 'unknown/notification', params: {} })}\n${'x'.repeat(257)}`
+    )
+
+    await expect(failed).resolves.toBeInstanceOf(JsonRpcProtocolError)
+  })
+
+  it('serializes writes behind drain without reordering messages', async () => {
+    const client = await startClient('normal', {
+      maxQueuedWrites: 3,
+      maxQueuedWriteBytes: 2_048
+    })
+    const child = transports.get(client) as FakeCodexTransport
+    const originalWrite = child.stdin.write.bind(child.stdin)
+    let blocked = false
+    let calls = 0
+    Object.assign(child.stdin, {
+      write: (chunk: Uint8Array | string) => {
+        calls += 1
+        const result = originalWrite(chunk)
+        if (calls === 1) {
+          blocked = true
+          return false
+        }
+        expect(blocked).toBe(false)
+        return result
+      }
+    })
+
+    client.notify('test/one')
+    client.notify('test/two')
+    client.notify('test/three')
+    expect(calls).toBe(1)
+
+    blocked = false
+    child.stdin.emit('drain')
+    expect(calls).toBe(3)
+    expect(child.transcript.slice(-3).map(({ method }) => method)).toEqual([
+      'test/one',
+      'test/two',
+      'test/three'
+    ])
+  })
+
+  it('fails closed when the bounded stdin queue fills during backpressure', async () => {
+    const client = await startClient('normal', {
+      maxQueuedWrites: 1,
+      maxQueuedWriteBytes: 2_048
+    })
+    const child = transports.get(client) as FakeCodexTransport
+    const originalWrite = child.stdin.write.bind(child.stdin)
+    Object.assign(child.stdin, {
+      write: (chunk: Uint8Array | string) => {
+        originalWrite(chunk)
+        return false
+      }
+    })
+
+    client.notify('test/blocked')
+    client.notify('test/queued')
+    expect(() => client.notify('test/overflow')).toThrow(JsonRpcProtocolError)
+    expect(child.exitCode).toBe(0)
+  })
+
   it('rejects every server-initiated request with Method not found', async () => {
     const client = await startClient()
 
@@ -255,6 +374,7 @@ describe('CodexJsonRpcClient', () => {
 describe('Codex executable resolution', () => {
   it('uses only the packaged resources binary in production', async () => {
     const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-resources-'))
+    temporaryPaths.push(resourcesPath)
     await mkdir(join(resourcesPath, 'bin'))
     const packaged = join(resourcesPath, 'bin', 'codex.exe')
     await writeFile(packaged, 'fake')
@@ -270,6 +390,7 @@ describe('Codex executable resolution', () => {
 
   it('allows only an absolute existing file override in development', async () => {
     const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-resources-'))
+    temporaryPaths.push(resourcesPath)
     const binary = join(resourcesPath, 'codex-dev')
     await writeFile(binary, 'fake')
 
@@ -289,25 +410,165 @@ describe('Codex executable resolution', () => {
 
   it('spawns the validated executable directly with only the stable app-server argument', async () => {
     const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-resources-'))
+    temporaryPaths.push(resourcesPath)
     await mkdir(join(resourcesPath, 'bin'))
     const packaged = join(resourcesPath, 'bin', 'codex.exe')
     await writeFile(packaged, 'fake')
+    const codexHome = join(resourcesPath, 'codex-home')
 
     expect(
       codexSpawnSpec({
         isPackaged: true,
         resourcesPath,
         env: { PATH: '/attacker', CODEX_BIN: '/attacker/codex.exe' },
+        codexHome,
+        hostEnv: {
+          SystemRoot: 'C:\\Windows',
+          TEMP: 'C:\\safe-temp',
+          OPENAI_API_KEY: 'must-not-leak',
+          HTTPS_PROXY: 'http://proxy-with-credentials'
+        },
         clientVersion: '0.1.0'
       })
     ).toMatchObject({
       command: packaged,
-      args: ['app-server'],
+      args: ['app-server', '--strict-config'],
       options: {
         shell: false,
         windowsHide: true,
+        env: {
+          CODEX_HOME: codexHome,
+          SystemRoot: 'C:\\Windows',
+          TEMP: 'C:\\safe-temp'
+        },
         stdio: ['pipe', 'pipe', 'pipe']
       }
     })
   })
+
+  it('atomically installs the exact app-owned configuration without overwriting auth', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-home-test-'))
+    temporaryPaths.push(root)
+    const codexHome = join(root, 'home')
+    await mkdir(codexHome)
+    await writeFile(join(codexHome, 'auth.json'), '{"preserve":"chatgpt"}')
+    await writeFile(join(codexHome, 'config.toml'), 'sandbox_mode = "danger-full-access"\n')
+
+    await prepareCodexHome(codexHome)
+
+    expect(await readFile(join(codexHome, 'config.toml'), 'utf8')).toBe(
+      AI_DEBATES_CODEX_CONFIG
+    )
+    expect(await readFile(join(codexHome, 'auth.json'), 'utf8')).toBe(
+      '{"preserve":"chatgpt"}'
+    )
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('default_permissions = "ai-debates"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('forced_login_method = "chatgpt"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('persistence = "none"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('web_search = "disabled"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('inherit = "none"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('ignore_default_excludes = false')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('":root" = "deny"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('":minimal" = "read"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('"." = "read"')
+    expect(AI_DEBATES_CODEX_CONFIG).toContain('enabled = false')
+    for (const feature of [
+      'shell_tool',
+      'unified_exec',
+      'apps',
+      'multi_agent',
+      'hooks',
+      'goals',
+      'skill_mcp_dependency_install',
+      'shell_snapshot'
+    ]) {
+      expect(AI_DEBATES_CODEX_CONFIG).toContain(`${feature} = false`)
+    }
+    expect(AI_DEBATES_CODEX_CONFIG).not.toContain('[tools]')
+    expect(AI_DEBATES_CODEX_CONFIG).not.toContain('view_image')
+    expect(AI_DEBATES_CODEX_CONFIG).not.toContain('sandbox_mode')
+  })
+
+  it('rejects relative and symlinked app Codex homes or config files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codex-home-boundary-'))
+    temporaryPaths.push(root)
+    const realHome = join(root, 'real-home')
+    const linkedHome = join(root, 'linked-home')
+    await mkdir(realHome)
+    await symlink(realHome, linkedHome, 'dir')
+
+    await expect(prepareCodexHome('relative-home')).rejects.toThrow()
+    await expect(prepareCodexHome(linkedHome)).rejects.toThrow()
+
+    const configLinkHome = join(root, 'config-link-home')
+    await mkdir(configLinkHome)
+    const outside = join(root, 'outside.toml')
+    await writeFile(outside, 'do-not-overwrite')
+    await symlink(outside, join(configLinkHome, 'config.toml'))
+    await expect(prepareCodexHome(configLinkHome)).rejects.toThrow()
+    expect(await readFile(outside, 'utf8')).toBe('do-not-overwrite')
+  })
+
+  it('prepares the isolated home before spawning and completes the stable handshake', async () => {
+    const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-start-boundary-'))
+    temporaryPaths.push(resourcesPath)
+    await mkdir(join(resourcesPath, 'bin'))
+    await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
+    const codexHome = join(resourcesPath, 'codex-home')
+    const child = new FakeCodexTransport()
+    let observed:
+      | { command: string; args: readonly string[]; options: { env?: NodeJS.ProcessEnv } }
+      | undefined
+
+    const client = await startCodexAppServer({
+      isPackaged: true,
+      resourcesPath,
+      codexHome,
+      clientVersion: '0.1.0',
+      hostEnv: { SystemRoot: 'C:\\Windows', OPENAI_API_KEY: 'never-forward' },
+      spawnProcess: (command, args, options) => {
+        observed = { command, args, options }
+        return child
+      }
+    })
+    clients.push(client)
+
+    expect(observed?.args).toEqual(['app-server', '--strict-config'])
+    expect(observed?.options.env).toEqual({
+      CODEX_HOME: codexHome,
+      SystemRoot: 'C:\\Windows'
+    })
+    expect(await readFile(join(codexHome, 'config.toml'), 'utf8')).toBe(
+      AI_DEBATES_CODEX_CONFIG
+    )
+    expect(child.transcript.slice(0, 2).map(({ method }) => method)).toEqual([
+      'initialize',
+      'initialized'
+    ])
+    expect(AI_DEBATES_CODEX_CONFIG).not.toContain('[tools]')
+    expect(AI_DEBATES_CODEX_CONFIG).not.toContain('experimental')
+  })
+
+  it.skipIf(!process.env.CODEX_LIVE_0147_BIN)(
+    'initializes a real Codex 0.147 app server with the isolated strict configuration',
+    async () => {
+      const binary = process.env.CODEX_LIVE_0147_BIN
+      if (!binary) throw new Error('CODEX_LIVE_0147_BIN must name the native Codex binary')
+      const root = await mkdtemp(join(tmpdir(), 'codex-live-0147-'))
+      temporaryPaths.push(root)
+      const client = await startCodexAppServer({
+        isPackaged: false,
+        resourcesPath: root,
+        env: { CODEX_BIN: binary },
+        codexHome: join(root, 'codex-home'),
+        clientVersion: '0.1.0',
+        hostEnv: { TMPDIR: tmpdir(), LANG: 'C.UTF-8' }
+      })
+      clients.push(client)
+
+      expect(await readFile(join(root, 'codex-home', 'config.toml'), 'utf8')).toBe(
+        AI_DEBATES_CODEX_CONFIG
+      )
+    }
+  )
 })

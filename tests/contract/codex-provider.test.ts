@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises'
+import { access, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -6,7 +6,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { CodexJsonRpcClient } from '../../src/main/providers/codex/jsonrpc-client'
 import { CodexProvider } from '../../src/main/providers/codex/codex-provider'
-import { ProviderNonRetryableError } from '../../src/main/providers/provider'
+import {
+  ProviderNonRetryableError,
+  ProviderRetryableError
+} from '../../src/main/providers/provider'
 import type { OpenAIRoleConfig } from '../../src/shared/domain'
 import type { ProviderChunk, ProviderReplyRequest } from '../../src/main/providers/provider'
 import {
@@ -40,12 +43,19 @@ const request = (config = role()): ProviderReplyRequest => ({
 const createProvider = async (
   mode: FakeCodexMode = 'normal',
   extraEnv: Record<string, string> = {},
-  openExternal = vi.fn(async () => undefined)
+  openExternal = vi.fn(async () => undefined),
+  overrides: Partial<
+    Pick<
+      ConstructorParameters<typeof CodexProvider>[0],
+      'createEmptyCwd' | 'removeEmptyCwd' | 'turnTimeoutMs'
+    >
+  > = {}
 ): Promise<{
   provider: CodexProvider
   client: CodexJsonRpcClient
   transcript: Array<Record<string, any>>
   openExternal: typeof openExternal
+  cwdPaths: string[]
 }> => {
   const child = new FakeCodexTransport({
     mode,
@@ -54,20 +64,85 @@ const createProvider = async (
   })
   const client = new CodexJsonRpcClient(child)
   await client.initialize({ name: 'ai_debates', title: 'AI Debates', version: '0.1.0' })
+  const cwdPaths: string[] = []
   const provider = new CodexProvider({
-    client,
+    createClient: async () => client,
     openExternal,
-    createEmptyCwd: async (roleId) => mkdtemp(join(tmpdir(), `ai-debates-${roleId}-`)),
-    removeEmptyCwd: async () => undefined
+    createEmptyCwd:
+      overrides.createEmptyCwd ??
+      (async (roleId) => {
+        const cwd = await mkdtemp(join(tmpdir(), `ai-debates-${roleId}-`))
+        cwdPaths.push(cwd)
+        return cwd
+      }),
+    removeEmptyCwd:
+      overrides.removeEmptyCwd ??
+      (async (path) => rm(path, { recursive: true, force: true })),
+    turnTimeoutMs: overrides.turnTimeoutMs
   })
   providers.push(provider)
-  return { provider, client, transcript: child.transcript, openExternal }
+  return { provider, client, transcript: child.transcript, openExternal, cwdPaths }
 }
 
 const collect = async (iterable: AsyncIterable<ProviderChunk>): Promise<ProviderChunk[]> => {
   const chunks: ProviderChunk[] = []
   for await (const chunk of iterable) chunks.push(chunk)
   return chunks
+}
+
+const SUCCESSFUL_REPLY: ProviderChunk[] = [
+  { type: 'content', content: '{"speech":"回应",' },
+  { type: 'content', content: '"status":"continue"}' },
+  {
+    type: 'usage',
+    usage: {
+      inputTokens: 11,
+      outputTokens: 5,
+      totalTokens: 18,
+      reasoningTokens: 2,
+      cacheReadTokens: 3
+    }
+  },
+  { type: 'final', finishReason: 'stop' }
+]
+
+const waitUntil = async (predicate: () => boolean): Promise<void> => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  throw new Error('Timed out waiting for fake Codex protocol state')
+}
+
+const createProviderFactorySequence = (
+  modes: readonly FakeCodexMode[],
+  rpc: ConstructorParameters<typeof CodexJsonRpcClient>[1] = {}
+): {
+  provider: CodexProvider
+  createClient: ReturnType<typeof vi.fn<() => Promise<CodexJsonRpcClient>>>
+  clients: CodexJsonRpcClient[]
+  children: FakeCodexTransport[]
+} => {
+  const clients: CodexJsonRpcClient[] = []
+  const children: FakeCodexTransport[] = []
+  let index = 0
+  const createClient = vi.fn(async () => {
+    const mode = modes[Math.min(index, modes.length - 1)] as FakeCodexMode
+    index += 1
+    const child = new FakeCodexTransport({ mode })
+    const client = new CodexJsonRpcClient(child, rpc)
+    children.push(child)
+    clients.push(client)
+    await client.initialize({ name: 'ai_debates', title: 'AI Debates', version: '0.1.0' })
+    return client
+  })
+  const provider = new CodexProvider({
+    createClient,
+    openExternal: async () => undefined,
+    removeEmptyCwd: async (path) => rm(path, { recursive: true, force: true })
+  })
+  providers.push(provider)
+  return { provider, createClient, clients, children }
 }
 
 afterEach(async () => {
@@ -114,6 +189,19 @@ describe('CodexProvider authentication', () => {
     const text = JSON.stringify(transcript)
     expect(text).toContain('"method":"account/login/cancel"')
     expect(text).toContain('"loginId":"login-1"')
+  })
+
+  it('settles local login state when cancel succeeds without a completion notification', async () => {
+    const { provider } = await createProvider('login-no-completion')
+    const first = await provider.startChatGptLogin()
+
+    await provider.cancelChatGptLogin(first.loginId)
+    await expect(first.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+
+    const second = await provider.startChatGptLogin()
+    expect(second.loginId).toBe('login-2')
+    await provider.cancelChatGptLogin(second.loginId)
+    await expect(second.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
   })
 
   it('allows only one in-flight browser login attempt', async () => {
@@ -210,7 +298,7 @@ describe('CodexProvider discovery and debate streaming', () => {
   })
 
   it('creates isolated safe threads and yields only matching agent-message content', async () => {
-    const { provider, transcript } = await createProvider()
+    const { provider, transcript, cwdPaths } = await createProvider()
     await provider.discover(role())
     await provider.discover(role({ roleId: 'role-b' }))
 
@@ -219,11 +307,7 @@ describe('CodexProvider discovery and debate streaming', () => {
       provider.streamReply(request(role({ roleId: 'role-b' })), new AbortController().signal)
     )
 
-    expect(chunksA).toEqual([
-      { type: 'content', content: '{"speech":"回应",' },
-      { type: 'content', content: '"status":"continue"}' },
-      { type: 'final', finishReason: 'stop' }
-    ])
+    expect(chunksA).toEqual(SUCCESSFUL_REPLY)
     expect(chunksB).toEqual(chunksA)
     expect(JSON.stringify(chunksA)).not.toMatch(/SECRET_REASONING|WRONG|private/i)
 
@@ -235,19 +319,21 @@ describe('CodexProvider discovery and debate streaming', () => {
       expect(params).toMatchObject({
         model: 'gpt-test',
         approvalPolicy: 'never',
-        sandbox: 'read-only',
         ephemeral: true,
         serviceName: 'ai_debates'
       })
+      expect(params).not.toHaveProperty('sandbox')
+      expect(params).not.toHaveProperty('runtimeWorkspaceRoots')
     }
     const turns = messages.filter(({ method }) => method === 'turn/start')
     for (const { params } of turns) {
       expect(params).toMatchObject({
         approvalPolicy: 'never',
-        sandboxPolicy: { type: 'readOnly', networkAccess: false },
         model: 'gpt-test',
         effort: 'high'
       })
+      expect(params).not.toHaveProperty('sandboxPolicy')
+      expect(params).not.toHaveProperty('runtimeWorkspaceRoots')
       expect(params.outputSchema).toEqual({
         type: 'object',
         properties: {
@@ -259,6 +345,50 @@ describe('CodexProvider discovery and debate streaming', () => {
       })
       expect(params.input[0]).toMatchObject({ type: 'text', text_elements: [] })
     }
+    await Promise.all(cwdPaths.map((cwd) => expect(access(cwd)).rejects.toThrow()))
+  })
+
+  it('uses a fresh ephemeral thread for every reply and renders each supplied view once', async () => {
+    const { provider, transcript, cwdPaths } = await createProvider()
+    await provider.discover(role())
+    const firstRequest = request()
+    firstRequest.view = {
+      system: 'FIRST_SYSTEM_SENTINEL',
+      messages: [{ role: 'user', content: 'FIRST_MESSAGE_SENTINEL' }],
+      waiting: false
+    }
+    const secondRequest = request()
+    secondRequest.turn = 4
+    secondRequest.view = {
+      system: 'SECOND_SYSTEM_SENTINEL',
+      messages: [
+        { role: 'assistant', content: 'LOCAL_HISTORY_SENTINEL' },
+        { role: 'user', content: 'SECOND_MESSAGE_SENTINEL' }
+      ],
+      waiting: false
+    }
+
+    await collect(provider.streamReply(firstRequest, new AbortController().signal))
+    await collect(provider.streamReply(secondRequest, new AbortController().signal))
+
+    const starts = transcript.filter(({ method }) => method === 'thread/start')
+    const turns = transcript.filter(({ method }) => method === 'turn/start')
+    expect(starts).toHaveLength(2)
+    expect(starts.map(({ params }) => params.cwd)).toEqual([
+      expect.any(String),
+      expect.any(String)
+    ])
+    expect(starts[0].params.cwd).not.toBe(starts[1].params.cwd)
+    expect(turns.map(({ params }) => params.threadId)).toEqual(['thread-1', 'thread-2'])
+    const firstInput = turns[0].params.input[0].text as string
+    const secondInput = turns[1].params.input[0].text as string
+    expect(firstInput.match(/FIRST_SYSTEM_SENTINEL/g)).toHaveLength(1)
+    expect(firstInput.match(/FIRST_MESSAGE_SENTINEL/g)).toHaveLength(1)
+    expect(secondInput.match(/SECOND_SYSTEM_SENTINEL/g)).toHaveLength(1)
+    expect(secondInput.match(/LOCAL_HISTORY_SENTINEL/g)).toHaveLength(1)
+    expect(secondInput.match(/SECOND_MESSAGE_SENTINEL/g)).toHaveLength(1)
+    expect(secondInput).not.toContain('FIRST_MESSAGE_SENTINEL')
+    await Promise.all(cwdPaths.map((cwd) => expect(access(cwd)).rejects.toThrow()))
   })
 
   it.each(['turn-failed', 'turn-interrupted'] as const)(
@@ -285,6 +415,95 @@ describe('CodexProvider discovery and debate streaming', () => {
   })
 
   it.each([
+    'commentary-then-final',
+    'commentary-delta-before-start',
+    'legacy-null-phase',
+    'usage-updates',
+    'old-malformed-usage'
+  ] as const)('streams only final answer text with correlated latest usage: %s', async (mode) => {
+    const { provider } = await createProvider(mode)
+    await provider.discover(role())
+
+    const chunks = await collect(provider.streamReply(request(), new AbortController().signal))
+    expect(chunks).toEqual(SUCCESSFUL_REPLY)
+    expect(JSON.stringify(chunks)).not.toContain('PRIVATE_COMMENTARY')
+  })
+
+  it.each(['hostile-item', 'malformed-item'] as const)(
+    'fails and interrupts before exposing a hostile current-turn event: %s',
+    async (mode) => {
+      const { provider, transcript } = await createProvider(mode)
+      await provider.discover(role())
+      const iterator = provider
+        .streamReply(request(), new AbortController().signal)
+        [Symbol.asyncIterator]()
+
+      await expect(iterator.next()).rejects.toBeInstanceOf(ProviderNonRetryableError)
+      await waitUntil(() => transcript.some(({ method }) => method === 'turn/interrupt'))
+      expect(transcript.filter(({ method }) => method === 'turn/interrupt')).toEqual([
+        expect.objectContaining({ params: { threadId: 'thread-1', turnId: 'turn-1' } })
+      ])
+    }
+  )
+
+  it('rejects malformed matching usage without accepting the completion', async () => {
+    const { provider, transcript } = await createProvider('malformed-usage')
+    await provider.discover(role())
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/interrupt'))
+  })
+
+  it.each(['hostile-completion-item', 'unknown-completion-item'] as const)(
+    'fails closed before visibility when completion reveals a forbidden item: %s',
+    async (mode) => {
+      const { provider } = await createProvider(mode)
+      await provider.discover(role())
+      const iterator = provider
+        .streamReply(request(), new AbortController().signal)
+        [Symbol.asyncIterator]()
+
+      await expect(iterator.next()).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    }
+  )
+
+  it.each(['turn-server-overloaded', 'turn-rate-limited'] as const)(
+    'maps official transient turn failures to retryable provider errors: %s',
+    async (mode) => {
+      const { provider } = await createProvider(mode)
+      await provider.discover(role())
+      const error = await collect(
+        provider.streamReply(request(), new AbortController().signal)
+      ).catch((caught) => caught)
+
+      expect(error).toBeInstanceOf(ProviderRetryableError)
+      expect((error as Error).message).not.toMatch(/private|429|serverOverloaded/i)
+    }
+  )
+
+  it('maps official authentication turn failures to a nonretryable safe error', async () => {
+    const { provider } = await createProvider('turn-unauthorized')
+    await provider.discover(role())
+    const error = await collect(
+      provider.streamReply(request(), new AbortController().signal)
+    ).catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(ProviderNonRetryableError)
+    expect(error).not.toBeInstanceOf(ProviderRetryableError)
+    expect((error as Error).message).not.toMatch(/private|unauthorized/i)
+  })
+
+  it('maps the official JSON-RPC overload code to a retryable safe error', async () => {
+    const { provider } = await createProvider('rpc-overloaded-account')
+    const error = await provider.readAccount().catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(ProviderRetryableError)
+    expect((error as Error).message).not.toContain('private overload detail')
+  })
+
+  it.each([
     'pre-response-event-flood',
     'queued-empty-delta-flood',
     'pre-response-byte-flood'
@@ -303,11 +522,7 @@ describe('CodexProvider discovery and debate streaming', () => {
 
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([
-      { type: 'content', content: '{"speech":"回应",' },
-      { type: 'content', content: '"status":"continue"}' },
-      { type: 'final', finishReason: 'stop' }
-    ])
+    ).resolves.toEqual(SUCCESSFUL_REPLY)
   })
 
   it.each([
@@ -319,11 +534,7 @@ describe('CodexProvider discovery and debate streaming', () => {
 
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([
-      { type: 'content', content: '{"speech":"回应",' },
-      { type: 'content', content: '"status":"continue"}' },
-      { type: 'final', finishReason: 'stop' }
-    ])
+    ).resolves.toEqual(SUCCESSFUL_REPLY)
   })
 
   it('rejects an active turn immediately when the App Server process crashes', async () => {
@@ -344,16 +555,86 @@ describe('CodexProvider discovery and debate streaming', () => {
     expect(outcome).toBe('rejected')
   })
 
+  it('retries on a newly initialized connection after timeout and ignores the old late response', async () => {
+    const { provider, createClient, children } = createProviderFactorySequence(
+      ['timeout-account', 'normal'],
+      { requestTimeoutMs: 25 }
+    )
+
+    await expect(provider.readAccount()).rejects.toBeInstanceOf(ProviderRetryableError)
+    children[0].stdout.emit(
+      'data',
+      Buffer.from('{"id":2,"result":{"requiresOpenaiAuth":false,"account":null}}\n')
+    )
+    await expect(provider.readAccount()).resolves.toMatchObject({ signedIn: true })
+    expect(createClient).toHaveBeenCalledTimes(2)
+    expect(children.map((child) => child.transcript[0]?.method)).toEqual([
+      'initialize',
+      'initialize'
+    ])
+  })
+
+  it('shares one clean reconnect across concurrent callers', async () => {
+    const { provider, createClient } = createProviderFactorySequence(
+      ['timeout-account', 'normal'],
+      { requestTimeoutMs: 25 }
+    )
+    await expect(provider.readAccount()).rejects.toBeInstanceOf(ProviderRetryableError)
+
+    await expect(Promise.all([provider.readAccount(), provider.readAccount()])).resolves.toHaveLength(2)
+    expect(createClient).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retain a crashed reply thread when the next retry reconnects', async () => {
+    const { provider, createClient } = createProviderFactorySequence([
+      'crash-active',
+      'normal'
+    ])
+    await provider.discover(role())
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).rejects.toBeInstanceOf(ProviderRetryableError)
+
+    await expect(
+      collect(provider.streamReply(request(), new AbortController().signal))
+    ).resolves.toEqual(SUCCESSFUL_REPLY)
+    expect(createClient).toHaveBeenCalledTimes(2)
+  })
+
+  it('closes a connection that finishes starting after provider disposal', async () => {
+    const child = new FakeCodexTransport()
+    const client = new CodexJsonRpcClient(child)
+    await client.initialize({ name: 'ai_debates', title: 'AI Debates', version: '0.1.0' })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const createClient = vi.fn(async () => {
+      await gate
+      return client
+    })
+    const provider = new CodexProvider({
+      createClient,
+      openExternal: async () => undefined
+    })
+    providers.push(provider)
+
+    const account = provider.readAccount()
+    await waitUntil(() => createClient.mock.calls.length === 1)
+    const disposing = provider.dispose()
+    release()
+
+    await expect(account).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    await disposing
+    expect(child.exitCode).toBe(0)
+  })
+
   it('handles a duplicate matching completion idempotently', async () => {
     const { provider } = await createProvider('duplicate-completion')
     await provider.discover(role())
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([
-      { type: 'content', content: '{"speech":"回应",' },
-      { type: 'content', content: '"status":"continue"}' },
-      { type: 'final', finishReason: 'stop' }
-    ])
+    ).resolves.toEqual(SUCCESSFUL_REPLY)
   })
 
   it('ignores out-of-order completion for another turn', async () => {
@@ -361,11 +642,7 @@ describe('CodexProvider discovery and debate streaming', () => {
     await provider.discover(role())
     await expect(
       collect(provider.streamReply(request(), new AbortController().signal))
-    ).resolves.toEqual([
-      { type: 'content', content: '{"speech":"回应",' },
-      { type: 'content', content: '"status":"continue"}' },
-      { type: 'final', finishReason: 'stop' }
-    ])
+    ).resolves.toEqual(SUCCESSFUL_REPLY)
   })
 
   it('interrupts the exact active thread and turn once when aborted', async () => {
@@ -373,11 +650,11 @@ describe('CodexProvider discovery and debate streaming', () => {
     await provider.discover(role())
     const controller = new AbortController()
     const iterator = provider.streamReply(request(), controller.signal)[Symbol.asyncIterator]()
-    const first = await iterator.next()
-    expect(first.value).toEqual({ type: 'content', content: '{"speech":"回应",' })
+    const pending = iterator.next()
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/start'))
     controller.abort(new DOMException('Stopped', 'AbortError'))
-    await iterator.return?.()
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/interrupt'))
 
     const messages = transcript
     expect(messages.filter(({ method }) => method === 'turn/interrupt')).toEqual([
@@ -385,7 +662,7 @@ describe('CodexProvider discovery and debate streaming', () => {
     ])
   })
 
-  it('interrupts a turn when its stream consumer stops early', async () => {
+  it('does not interrupt a turn that passed safety completion before the consumer stops', async () => {
     const { provider, transcript } = await createProvider()
     await provider.discover(role())
     const iterator = provider
@@ -395,22 +672,21 @@ describe('CodexProvider discovery and debate streaming', () => {
     await iterator.return?.()
     await new Promise((resolve) => setTimeout(resolve, 10))
 
-    expect(transcript.filter(({ method }) => method === 'turn/interrupt')).toEqual([
-      expect.objectContaining({ params: { threadId: 'thread-1', turnId: 'turn-1' } })
-    ])
+    expect(transcript.filter(({ method }) => method === 'turn/interrupt')).toEqual([])
   })
 
   it('rejects every active stream while disposing process resources', async () => {
-    const { provider } = await createProvider()
+    const { provider, transcript } = await createProvider()
     await provider.discover(role())
     const iterator = provider
       .streamReply(request(), new AbortController().signal)
       [Symbol.asyncIterator]()
-    await iterator.next()
+    const pending = iterator.next()
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/start'))
 
     await provider.dispose()
     const outcome = await Promise.race([
-      iterator.next().then(
+      pending.then(
         () => 'resolved',
         () => 'rejected'
       ),
@@ -436,5 +712,101 @@ describe('CodexProvider discovery and debate streaming', () => {
     await expect(firstChunk).resolves.toMatchObject({ done: false })
     firstController.abort(new DOMException('Stopped', 'AbortError'))
     await first.return?.()
+  })
+
+  it('does not create a cwd when already aborted', async () => {
+    const createEmptyCwd = vi.fn(async () => '/must-not-be-created')
+    const { provider } = await createProvider(
+      'normal',
+      {},
+      vi.fn(async () => undefined),
+      { createEmptyCwd }
+    )
+    await provider.discover(role())
+    const controller = new AbortController()
+    controller.abort(new DOMException('Stopped', 'AbortError'))
+
+    await expect(collect(provider.streamReply(request(), controller.signal))).rejects.toMatchObject({
+      name: 'AbortError'
+    })
+    expect(createEmptyCwd).not.toHaveBeenCalled()
+  })
+
+  it('stops after an aborted cwd preparation and cleans the newly created directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'ai-debates-abort-cwd-'))
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const removeEmptyCwd = vi.fn(async (path: string) =>
+      rm(path, { recursive: true, force: true })
+    )
+    const { provider, transcript } = await createProvider(
+      'normal',
+      {},
+      vi.fn(async () => undefined),
+      {
+        createEmptyCwd: async () => {
+          await gate
+          return cwd
+        },
+        removeEmptyCwd
+      }
+    )
+    await provider.discover(role())
+    const controller = new AbortController()
+    const outcome = collect(provider.streamReply(request(), controller.signal))
+    await Promise.resolve()
+    controller.abort(new DOMException('Stopped', 'AbortError'))
+    release()
+
+    await expect(outcome).rejects.toMatchObject({ name: 'AbortError' })
+    expect(transcript.some(({ method }) => method === 'thread/start')).toBe(false)
+    expect(removeEmptyCwd).toHaveBeenCalledWith(cwd)
+    await expect(access(cwd)).rejects.toThrow()
+  })
+
+  it('stops between thread preparation and turn/start when aborted', async () => {
+    const { provider, transcript } = await createProvider('delayed-thread-start')
+    await provider.discover(role())
+    const controller = new AbortController()
+    const outcome = collect(provider.streamReply(request(), controller.signal))
+    await waitUntil(() => transcript.some(({ method }) => method === 'thread/start'))
+    controller.abort(new DOMException('Stopped', 'AbortError'))
+
+    await expect(outcome).rejects.toMatchObject({ name: 'AbortError' })
+    expect(transcript.some(({ method }) => method === 'turn/start')).toBe(false)
+  })
+
+  it('interrupts an exact turn accepted after abort and yields no content', async () => {
+    const { provider, transcript } = await createProvider('delayed-turn-start')
+    await provider.discover(role())
+    const controller = new AbortController()
+    const outcome = collect(provider.streamReply(request(), controller.signal))
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/start'))
+    controller.abort(new DOMException('Stopped', 'AbortError'))
+
+    await expect(outcome).rejects.toMatchObject({ name: 'AbortError' })
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/interrupt'))
+    expect(transcript.filter(({ method }) => method === 'turn/interrupt')).toEqual([
+      expect.objectContaining({ params: { threadId: 'thread-1', turnId: 'turn-1' } })
+    ])
+  })
+
+  it('cancelActive covers a turn whose turn/start response is still pending', async () => {
+    const { provider, transcript } = await createProvider('delayed-turn-start')
+    await provider.discover(role())
+    const iterator = provider
+      .streamReply(request(), new AbortController().signal)
+      [Symbol.asyncIterator]()
+    const outcome = iterator.next()
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/start'))
+    await provider.cancelActive()
+
+    await expect(outcome).rejects.toBeInstanceOf(Error)
+    await waitUntil(() => transcript.some(({ method }) => method === 'turn/interrupt'))
+    expect(transcript.filter(({ method }) => method === 'turn/interrupt')).toEqual([
+      expect.objectContaining({ params: { threadId: 'thread-1', turnId: 'turn-1' } })
+    ])
   })
 })

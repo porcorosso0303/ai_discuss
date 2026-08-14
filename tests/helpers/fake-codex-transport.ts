@@ -28,6 +28,24 @@ export type FakeCodexMode =
   | 'pre-response-byte-flood'
   | 'malformed-old-delta'
   | 'malformed-old-completion'
+  | 'delayed-thread-start'
+  | 'delayed-turn-start'
+  | 'timeout-account'
+  | 'commentary-then-final'
+  | 'commentary-delta-before-start'
+  | 'legacy-null-phase'
+  | 'hostile-item'
+  | 'hostile-completion-item'
+  | 'unknown-completion-item'
+  | 'malformed-item'
+  | 'malformed-usage'
+  | 'old-malformed-usage'
+  | 'usage-updates'
+  | 'turn-server-overloaded'
+  | 'turn-rate-limited'
+  | 'turn-unauthorized'
+  | 'rpc-overloaded-account'
+  | 'login-no-completion'
 
 export interface FakeCodexTransportOptions {
   mode?: FakeCodexMode
@@ -47,6 +65,7 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   private initialized = false
   private threadCounter = 0
   private turnCounter = 0
+  private loginCounter = 0
   private inputBuffer = ''
 
   constructor(private readonly options: FakeCodexTransportOptions = {}) {
@@ -199,6 +218,13 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
       return this.send({ id: message.id, result: {} })
     }
     if (message.method === 'account/read') {
+      if (this.mode === 'timeout-account') return
+      if (this.mode === 'rpc-overloaded-account') {
+        return this.send({
+          id: message.id,
+          error: { code: -32001, message: 'private overload detail' }
+        })
+      }
       return this.send({
         id: message.id,
         result: {
@@ -211,7 +237,8 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
       })
     }
     if (message.method === 'account/login/start') {
-      const loginId = 'login-1'
+      this.loginCounter += 1
+      const loginId = `login-${this.loginCounter}`
       this.send({
         id: message.id,
         result: {
@@ -221,19 +248,21 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
             this.options.authUrl ?? 'https://auth.openai.com/oauth/authorize?private=yes'
         }
       })
-      setTimeout(
-        () =>
-          this.send({
-            method: 'account/login/completed',
-            params: {
-              loginId,
-              success: this.mode !== 'login-failed',
-              error: this.mode === 'login-failed' ? 'private upstream login detail' : null,
-              onboardingEntrypoint: null
-            }
-          }),
-        5
-      )
+      if (this.mode !== 'login-no-completion') {
+        setTimeout(
+          () =>
+            this.send({
+              method: 'account/login/completed',
+              params: {
+                loginId,
+                success: this.mode !== 'login-failed',
+                error: this.mode === 'login-failed' ? 'private upstream login detail' : null,
+                onboardingEntrypoint: null
+              }
+            }),
+          5
+        )
+      }
       return
     }
     if (message.method === 'account/login/cancel') {
@@ -269,7 +298,7 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         turns: []
       }
       if (this.mode === 'malformed-thread') thread.unknown = true
-      return this.send({
+      const response = {
         id: message.id,
         result: {
           thread,
@@ -283,9 +312,20 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
           sandbox: { type: 'readOnly', networkAccess: false },
           reasoningEffort: null
         }
-      })
+      }
+      if (this.mode === 'delayed-thread-start') {
+        setTimeout(() => this.send(response), 25)
+        return
+      }
+      return this.send(response)
     }
-    if (message.method === 'turn/start') return this.startTurn(message)
+    if (message.method === 'turn/start') {
+      if (this.mode === 'delayed-turn-start') {
+        setTimeout(() => this.startTurn(message), 25)
+        return
+      }
+      return this.startTurn(message)
+    }
     if (message.method === 'turn/interrupt') return this.send({ id: message.id, result: {} })
     if (message.id !== undefined && message.method !== undefined) {
       this.send({ id: message.id, error: { code: -32601, message: 'Method not found' } })
@@ -377,6 +417,85 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         method: 'item/agentMessage/delta',
         params: { threadId: 'wrong-thread', turnId, itemId: 'wrong', delta: 'WRONG' }
       })
+      if (this.mode === 'hostile-item') {
+        this.send({
+          method: 'item/started',
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            startedAtMs: 1,
+            item: { type: 'commandExecution', id: 'hostile-command' }
+          }
+        })
+      } else if (this.mode === 'malformed-item') {
+        this.send({
+          method: 'item/started',
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            startedAtMs: 1,
+            item: { type: 'agentMessage', id: 'msg', text: '', phase: 7 }
+          }
+        })
+      } else {
+        if (
+          this.mode === 'commentary-then-final' ||
+          this.mode === 'commentary-delta-before-start'
+        ) {
+          if (this.mode === 'commentary-delta-before-start') {
+            this.send({
+              method: 'item/agentMessage/delta',
+              params: {
+                threadId: message.params.threadId,
+                turnId,
+                itemId: 'commentary',
+                delta: 'PRIVATE_COMMENTARY'
+              }
+            })
+          }
+          this.send({
+            method: 'item/started',
+            params: {
+              threadId: message.params.threadId,
+              turnId,
+              startedAtMs: 1,
+              item: {
+                type: 'agentMessage',
+                id: 'commentary',
+                text: '',
+                phase: 'commentary',
+                memoryCitation: null
+              }
+            }
+          })
+          if (this.mode !== 'commentary-delta-before-start') {
+            this.send({
+              method: 'item/agentMessage/delta',
+              params: {
+                threadId: message.params.threadId,
+                turnId,
+                itemId: 'commentary',
+                delta: 'PRIVATE_COMMENTARY'
+              }
+            })
+          }
+        }
+        this.send({
+          method: 'item/started',
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            startedAtMs: 1,
+            item: {
+              type: 'agentMessage',
+              id: 'msg',
+              text: '',
+              phase: this.mode === 'legacy-null-phase' ? null : 'final_answer',
+              memoryCitation: null
+            }
+          }
+        })
+      }
       if (this.mode === 'malformed-old-delta') {
         this.send({
           method: 'item/agentMessage/delta',
@@ -453,8 +572,73 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         }
       })
     }
+    this.send({
+      method: 'item/completed',
+      params: {
+        threadId: message.params.threadId,
+        turnId,
+        completedAtMs: 2,
+        item: {
+          type: 'agentMessage',
+          id: 'msg',
+          text: '{"speech":"回应","status":"continue"}',
+          phase: this.mode === 'legacy-null-phase' ? null : 'final_answer',
+          memoryCitation: null
+        }
+      }
+    })
+    this.send({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'wrong-thread',
+        turnId,
+        tokenUsage: { last: 'malformed', total: {} }
+      }
+    })
+    if (this.mode === 'old-malformed-usage') {
+      this.send({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: message.params.threadId,
+          turnId: 'old-turn',
+          tokenUsage: { last: 'malformed', total: {} }
+        }
+      })
+    }
+    if (this.mode === 'usage-updates') {
+      this.sendTokenUsage(message.params.threadId, turnId, {
+        totalTokens: 9,
+        inputTokens: 4,
+        cachedInputTokens: 1,
+        cacheWriteInputTokens: 0,
+        outputTokens: 3,
+        reasoningOutputTokens: 1
+      })
+    }
+    if (this.mode === 'malformed-usage') {
+      this.send({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: message.params.threadId,
+          turnId,
+          tokenUsage: { last: { outputTokens: 'private' }, total: {} }
+        }
+      })
+    } else {
+      this.sendTokenUsage(message.params.threadId, turnId, {
+        totalTokens: 18,
+        inputTokens: 11,
+        cachedInputTokens: 3,
+        cacheWriteInputTokens: 0,
+        outputTokens: 5,
+        reasoningOutputTokens: 2
+      })
+    }
     const status =
-      this.mode === 'turn-failed'
+      this.mode === 'turn-failed' ||
+      this.mode === 'turn-server-overloaded' ||
+      this.mode === 'turn-rate-limited' ||
+      this.mode === 'turn-unauthorized'
         ? 'failed'
         : this.mode === 'turn-interrupted'
           ? 'interrupted'
@@ -483,12 +667,28 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         threadId: message.params.threadId,
         turn: {
           id: turnId,
-          items: [],
+          items:
+            this.mode === 'hostile-completion-item'
+              ? [{ type: 'fileChange', id: 'hostile-file' }]
+              : this.mode === 'unknown-completion-item'
+                ? [{ type: 'futureTool', id: 'unknown-tool' }]
+              : [],
           itemsView: 'full',
           status,
           error:
             status === 'failed'
-              ? { message: 'private error', codexErrorInfo: null, additionalDetails: null }
+              ? {
+                  message: 'private error',
+                  codexErrorInfo:
+                    this.mode === 'turn-server-overloaded'
+                      ? 'serverOverloaded'
+                      : this.mode === 'turn-rate-limited'
+                        ? { responseStreamConnectionFailed: { httpStatusCode: 429 } }
+                        : this.mode === 'turn-unauthorized'
+                          ? 'unauthorized'
+                          : null,
+                  additionalDetails: null
+                }
               : null,
           startedAt: 1,
           completedAt: 2,
@@ -498,5 +698,20 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
     }
     this.send(completion)
     if (this.mode === 'duplicate-completion') this.send(completion)
+  }
+
+  private sendTokenUsage(
+    threadId: string,
+    turnId: string,
+    last: Record<string, number>
+  ): void {
+    this.send({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId,
+        turnId,
+        tokenUsage: { total: last, last, modelContextWindow: 200_000 }
+      }
+    })
   }
 }

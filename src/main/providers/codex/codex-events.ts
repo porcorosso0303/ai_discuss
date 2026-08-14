@@ -4,6 +4,7 @@ import { reasoningEffortSchema } from '../../../shared/schemas'
 
 const boundedId = z.string().trim().min(1).max(200)
 const boundedText = z.string().max(200_000)
+const safeInt64 = z.number().int().safe()
 
 export const initializeResponseSchema = z.strictObject({
   userAgent: z.string().max(1_024),
@@ -185,6 +186,31 @@ export const threadStartResponseSchema = z.strictObject({
 })
 
 const turnStatusSchema = z.enum(['completed', 'interrupted', 'failed', 'inProgress'])
+const httpStatusSchema = z.strictObject({
+  httpStatusCode: z.number().int().min(0).max(65_535).nullable().default(null)
+})
+export const codexErrorInfoSchema = z.union([
+  z.enum([
+    'contextWindowExceeded',
+    'sessionBudgetExceeded',
+    'usageLimitExceeded',
+    'serverOverloaded',
+    'cyberPolicy',
+    'internalServerError',
+    'unauthorized',
+    'badRequest',
+    'threadRollbackFailed',
+    'sandboxError',
+    'other'
+  ]),
+  z.strictObject({ httpConnectionFailed: httpStatusSchema }),
+  z.strictObject({ responseStreamConnectionFailed: httpStatusSchema }),
+  z.strictObject({ responseStreamDisconnected: httpStatusSchema }),
+  z.strictObject({ responseTooManyFailedAttempts: httpStatusSchema }),
+  z.strictObject({
+    activeTurnNotSteerable: z.strictObject({ turnKind: z.enum(['review', 'compact']) })
+  })
+])
 const turnSchema = z.strictObject({
   id: boundedId,
   items: z.array(jsonObjectSchema).max(1_000),
@@ -193,7 +219,7 @@ const turnSchema = z.strictObject({
   error: z
     .strictObject({
       message: z.string().max(4_096),
-      codexErrorInfo: z.union([z.string(), jsonObjectSchema]).nullable().optional(),
+      codexErrorInfo: codexErrorInfoSchema.nullable().optional(),
       additionalDetails: z.string().max(4_096).nullable().default(null)
     })
     .nullable()
@@ -212,6 +238,76 @@ export const agentMessageDeltaSchema = z.strictObject({
   delta: boundedText
 })
 
+const agentMessageItemSchema = z.strictObject({
+  type: z.literal('agentMessage'),
+  id: boundedId,
+  text: boundedText,
+  phase: z.enum(['commentary', 'final_answer']).nullable().default(null),
+  memoryCitation: z.json().nullable().default(null)
+})
+
+const nonAgentItemSchema = z
+  .object({
+    type: z.enum([
+      'userMessage',
+      'hookPrompt',
+      'plan',
+      'reasoning',
+      'commandExecution',
+      'fileChange',
+      'mcpToolCall',
+      'dynamicToolCall',
+      'collabAgentToolCall',
+      'subAgentActivity',
+      'webSearch',
+      'imageView',
+      'sleep',
+      'imageGeneration',
+      'enteredReviewMode',
+      'exitedReviewMode',
+      'contextCompaction'
+    ]),
+    id: boundedId
+  })
+  .passthrough()
+
+const threadItemSchema = z.union([agentMessageItemSchema, nonAgentItemSchema])
+
+const itemLifecycleBase = {
+  threadId: boundedId,
+  turnId: boundedId,
+  item: threadItemSchema
+}
+
+export const itemStartedSchema = z.strictObject({
+  ...itemLifecycleBase,
+  startedAtMs: safeInt64
+})
+
+export const itemCompletedSchema = z.strictObject({
+  ...itemLifecycleBase,
+  completedAtMs: safeInt64
+})
+
+const tokenUsageBreakdownSchema = z.strictObject({
+  totalTokens: safeInt64.nonnegative(),
+  inputTokens: safeInt64.nonnegative(),
+  cachedInputTokens: safeInt64.nonnegative(),
+  cacheWriteInputTokens: safeInt64.nonnegative().default(0),
+  outputTokens: safeInt64.nonnegative(),
+  reasoningOutputTokens: safeInt64.nonnegative()
+})
+
+export const threadTokenUsageUpdatedSchema = z.strictObject({
+  threadId: boundedId,
+  turnId: boundedId,
+  tokenUsage: z.strictObject({
+    total: tokenUsageBreakdownSchema,
+    last: tokenUsageBreakdownSchema,
+    modelContextWindow: safeInt64.nonnegative().nullable().default(null)
+  })
+})
+
 export const turnCompletedSchema = z.strictObject({
   threadId: boundedId,
   turn: turnSchema
@@ -221,6 +317,10 @@ export type CodexModel = z.output<typeof codexModelSchema>
 export type LoginCompleted = z.output<typeof loginCompletedSchema>
 export type AgentMessageDelta = z.output<typeof agentMessageDeltaSchema>
 export type TurnCompleted = z.output<typeof turnCompletedSchema>
+export type ItemStarted = z.output<typeof itemStartedSchema>
+export type ItemCompleted = z.output<typeof itemCompletedSchema>
+export type ThreadTokenUsageUpdated = z.output<typeof threadTokenUsageUpdatedSchema>
+export type CodexErrorInfo = z.output<typeof codexErrorInfoSchema>
 
 export const DEBATE_OUTPUT_SCHEMA = {
   type: 'object',

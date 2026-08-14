@@ -8,7 +8,8 @@ import type {
   ProviderCapabilities,
   ReasoningEffort,
   RoleConfig,
-  RoleId
+  RoleId,
+  Usage
 } from '../../../shared/domain'
 import { openAIRoleConfigSchema, providerCapabilitiesSchema } from '../../../shared/schemas'
 import {
@@ -24,15 +25,22 @@ import {
   agentMessageDeltaSchema,
   cancelLoginResponseSchema,
   emptyResponseSchema,
+  itemCompletedSchema,
+  itemStartedSchema,
   loginCompletedSchema,
   loginStartResponseSchema,
   modelListResponseSchema,
   threadStartResponseSchema,
+  threadTokenUsageUpdatedSchema,
   turnCompletedSchema,
   turnStartResponseSchema,
   type AgentMessageDelta,
   type CodexModel,
+  type CodexErrorInfo,
+  type ItemCompleted,
+  type ItemStarted,
   type LoginCompleted,
+  type ThreadTokenUsageUpdated,
   type TurnCompleted
 } from './codex-events'
 import {
@@ -52,19 +60,28 @@ const MAX_TURN_EVENT_BYTES = 1024 * 1024
 const DEFAULT_TURN_TIMEOUT_MS = 180_000
 
 interface RoleThread {
-  roleId: RoleId
-  sessionId: string
   threadId: string
   cwd: string
-  model: string
-  effort: ReasoningEffort
 }
 
 interface ActiveTurn {
+  client: CodexJsonRpcClient
   threadId: string
   turnId: string
   interruptSent: boolean
   fail: (error: Error) => void
+}
+
+interface ProviderConnection {
+  client: CodexJsonRpcClient
+  removeLoginListener: () => void
+  removeFailureListener: () => void
+}
+
+interface TurnState {
+  cancelled: boolean
+  cancellationError?: Error
+  active?: ActiveTurn
 }
 
 interface LoginWaiter {
@@ -84,7 +101,7 @@ export interface CodexLoginAttempt {
 }
 
 export interface CodexProviderDependencies {
-  client: CodexJsonRpcClient
+  createClient: () => Promise<CodexJsonRpcClient>
   openExternal: (url: string) => Promise<unknown>
   createEmptyCwd?: (roleId: RoleId) => Promise<string>
   removeEmptyCwd?: (path: string) => Promise<void>
@@ -167,9 +184,21 @@ class AsyncEventQueue<Event> {
 
 type TurnEvent =
   | { type: 'delta'; value: AgentMessageDelta }
+  | { type: 'item'; value: ItemStarted | ItemCompleted }
+  | { type: 'usage'; value: ThreadTokenUsageUpdated }
+  | { type: 'completed'; value: TurnCompleted }
+
+type VisibleTurnEvent =
+  | { type: 'delta'; value: AgentMessageDelta }
+  | { type: 'usage'; value: Usage }
   | { type: 'completed'; value: TurnCompleted }
 
 const turnEventBytes = (event: TurnEvent): number =>
+  event.type === 'delta'
+    ? Buffer.byteLength(event.value.delta, 'utf8') + 128
+    : Buffer.byteLength(JSON.stringify(event.value), 'utf8') + 128
+
+const visibleEventBytes = (event: VisibleTurnEvent): number =>
   event.type === 'delta'
     ? Buffer.byteLength(event.value.delta, 'utf8') + 128
     : Buffer.byteLength(JSON.stringify(event.value), 'utf8') + 128
@@ -191,11 +220,60 @@ const normalizeError = (error: unknown, signal?: AbortSignal): Error => {
   if (error instanceof JsonRpcTransportError) {
     return new ProviderRetryableError('Codex App Server became unavailable')
   }
+  if (error instanceof JsonRpcServerError && error.code === -32001) {
+    return new ProviderRetryableError('Codex App Server is temporarily overloaded')
+  }
   if (error instanceof JsonRpcProtocolError || error instanceof JsonRpcServerError) {
     return new ProviderNonRetryableError('Codex App Server rejected an invalid operation')
   }
   return new ProviderNonRetryableError('Codex App Server response was invalid')
 }
+
+const transientHttpStatus = (status: number | null): boolean =>
+  status === 429 || (status !== null && status >= 500 && status <= 599)
+
+const isRetryableCodexError = (info: CodexErrorInfo | null | undefined): boolean => {
+  if (info === 'serverOverloaded' || info === 'internalServerError') return true
+  if (typeof info !== 'object' || info === null) return false
+  if ('responseStreamConnectionFailed' in info) return true
+  if ('responseStreamDisconnected' in info) return true
+  if ('responseTooManyFailedAttempts' in info) return true
+  if ('httpConnectionFailed' in info) {
+    return transientHttpStatus(info.httpConnectionFailed.httpStatusCode)
+  }
+  return false
+}
+
+const turnFailureError = (turn: TurnCompleted['turn']): Error =>
+  isRetryableCodexError(turn.error?.codexErrorInfo)
+    ? new ProviderRetryableError('Codex turn failed temporarily')
+    : new ProviderNonRetryableError('Codex turn did not complete successfully')
+
+const HOSTILE_ITEM_TYPES = new Set([
+  'hookPrompt',
+  'plan',
+  'commandExecution',
+  'fileChange',
+  'mcpToolCall',
+  'dynamicToolCall',
+  'collabAgentToolCall',
+  'subAgentActivity',
+  'webSearch',
+  'imageView',
+  'sleep',
+  'imageGeneration',
+  'enteredReviewMode',
+  'exitedReviewMode',
+  'contextCompaction'
+])
+
+const SAFE_COMPLETION_ITEM_TYPES = new Set(['agentMessage', 'userMessage', 'reasoning'])
+
+const containsHostileItem = (items: ReadonlyArray<Record<string, unknown>>): boolean =>
+  items.some(
+    (item) =>
+      typeof item.type !== 'string' || !SAFE_COMPLETION_ITEM_TYPES.has(item.type)
+  )
 
 const isAllowedLoginUrl = (raw: string): boolean => {
   try {
@@ -263,15 +341,15 @@ export class CodexProvider implements Provider {
   private readonly removeEmptyCwd: (path: string) => Promise<void>
   private readonly turnTimeoutMs: number
   private readonly capabilitiesByRole = new Map<RoleId, ReadonlyMap<string, ModelCapability>>()
-  private readonly threads = new Map<RoleId, RoleThread>()
   private readonly activeTurns = new Map<RoleId, ActiveTurn>()
-  private readonly reservedRoles = new Set<RoleId>()
+  private readonly turnStates = new Map<RoleId, TurnState>()
   private readonly loginWaiters = new Map<string, LoginWaiter>()
   private readonly completedLogins = new Map<string, LoginCompleted>()
-  private readonly removeLoginListener: () => void
-  private readonly removeFailureListener: () => void
+  private readonly ignoredLoginIds = new Set<string>()
+  private connection: ProviderConnection | undefined
+  private connectionPromise: Promise<CodexJsonRpcClient> | undefined
+  private readonly failedClients = new WeakMap<CodexJsonRpcClient, Error>()
   private disposed = false
-  private connectionFailure: Error | undefined
   private loginAttemptActive = false
 
   constructor(private readonly dependencies: CodexProviderDependencies) {
@@ -285,28 +363,18 @@ export class CodexProvider implements Provider {
     if (!Number.isSafeInteger(this.turnTimeoutMs) || this.turnTimeoutMs <= 0) {
       throw new RangeError('turnTimeoutMs must be a positive safe integer')
     }
-    this.removeLoginListener = dependencies.client.onNotification(
-      'account/login/completed',
-      (params) => this.handleLoginCompleted(params)
-    )
-    this.removeFailureListener = dependencies.client.onFailure((error) => {
-      const safe = normalizeError(error)
-      this.connectionFailure = safe
-      for (const active of this.activeTurns.values()) active.fail(safe)
-      for (const waiter of this.loginWaiters.values()) waiter.reject(safe)
-      this.loginWaiters.clear()
-      this.loginAttemptActive = false
-    })
   }
 
   async readAccount(): Promise<CodexAccountStatus> {
     this.ensureUsable()
     try {
-      const response = await this.dependencies.client.request(
+      const client = await this.getClient()
+      const response = await client.request(
         'account/read',
         { refreshToken: false },
         accountReadResponseSchema
       )
+      this.throwIfClientFailed(client)
       if (response.account?.type !== 'chatgpt') {
         return { signedIn: false, requiresOpenaiAuth: response.requiresOpenaiAuth }
       }
@@ -327,13 +395,16 @@ export class CodexProvider implements Provider {
     }
     this.loginAttemptActive = true
     try {
-      const response = await this.dependencies.client.request(
+      const client = await this.getClient()
+      const response = await client.request(
         'account/login/start',
         { type: 'chatgpt', useHostedLoginSuccessPage: true, appBrand: 'chatgpt' },
         loginStartResponseSchema
       )
+      this.throwIfClientFailed(client)
       if (!isAllowedLoginUrl(response.authUrl)) {
-        void this.dependencies.client
+        this.ignoreLoginCompletion(response.loginId)
+        void client
           .request(
             'account/login/cancel',
             { loginId: response.loginId },
@@ -363,8 +434,11 @@ export class CodexProvider implements Provider {
       try {
         await this.dependencies.openExternal(response.authUrl)
       } catch {
+        const waiter = this.loginWaiters.get(response.loginId)
         this.loginWaiters.delete(response.loginId)
-        void this.dependencies.client
+        this.ignoreLoginCompletion(response.loginId)
+        waiter?.reject(new ProviderNonRetryableError('Unable to open the secure ChatGPT login page'))
+        void client
           .request(
             'account/login/cancel',
             { loginId: response.loginId },
@@ -383,11 +457,18 @@ export class CodexProvider implements Provider {
   async cancelChatGptLogin(loginId: string): Promise<void> {
     this.ensureUsable()
     try {
-      await this.dependencies.client.request(
+      const client = await this.getClient()
+      await client.request(
         'account/login/cancel',
         { loginId },
         cancelLoginResponseSchema
       )
+      this.throwIfClientFailed(client)
+      const waiter = this.loginWaiters.get(loginId)
+      this.loginWaiters.delete(loginId)
+      this.loginAttemptActive = false
+      this.ignoreLoginCompletion(loginId)
+      waiter?.reject(new ProviderNonRetryableError('ChatGPT login was canceled'))
     } catch (error) {
       throw normalizeError(error)
     }
@@ -396,7 +477,9 @@ export class CodexProvider implements Provider {
   async logout(): Promise<void> {
     this.ensureUsable()
     try {
-      await this.dependencies.client.request('account/logout', undefined, emptyResponseSchema)
+      const client = await this.getClient()
+      await client.request('account/logout', undefined, emptyResponseSchema)
+      this.throwIfClientFailed(client)
     } catch (error) {
       throw normalizeError(error)
     }
@@ -414,6 +497,7 @@ export class CodexProvider implements Provider {
     const cursors = new Set<string>()
     let cursor: string | null = null
     try {
+      const client = await this.getClient()
       const account = await this.readAccount()
       if (!account.signedIn) {
         throw new ProviderNonRetryableError('ChatGPT sign-in is required for OpenAI debates')
@@ -424,11 +508,12 @@ export class CodexProvider implements Provider {
           includeHidden: false
         }
         if (cursor !== null) params.cursor = cursor
-        const response = await this.dependencies.client.request(
+        const response = await client.request(
           'model/list',
           params,
           modelListResponseSchema
         )
+        this.throwIfClientFailed(client)
         models.push(...response.data)
         if (models.length > MAX_MODELS) {
           throw new ProviderNonRetryableError('Codex returned too many models')
@@ -480,6 +565,7 @@ export class CodexProvider implements Provider {
   ): AsyncIterable<ProviderChunk> {
     this.ensureUsable()
     let config: OpenAIRoleConfig
+    let state: TurnState
     try {
       config = openAIRoleConfigSchema.parse(request.role)
       const capability = this.capabilitiesByRole.get(config.roleId)?.get(config.model)
@@ -487,27 +573,31 @@ export class CodexProvider implements Provider {
         throw new ProviderNonRetryableError('Codex model capabilities must be validated first')
       }
       if (signal.aborted) throw safeAbortError(signal)
-      if (this.activeTurns.has(config.roleId) || this.reservedRoles.has(config.roleId)) {
+      if (this.turnStates.has(config.roleId)) {
         throw new ProviderNonRetryableError('This Codex role already has an active turn')
       }
-      this.reservedRoles.add(config.roleId)
+      state = { cancelled: false }
+      this.turnStates.set(config.roleId, state)
     } catch (error) {
       throw normalizeError(error, signal)
     }
 
+    let client: CodexJsonRpcClient
     let thread: RoleThread
     try {
-      thread = await this.ensureThread(config, request)
+      client = await this.getClient()
+      this.throwIfStopped(signal, state)
+      thread = await this.prepareThread(client, config, request, signal, state)
     } catch (error) {
-      this.reservedRoles.delete(config.roleId)
+      if (this.turnStates.get(config.roleId) === state) this.turnStates.delete(config.roleId)
       throw normalizeError(error, signal)
     }
     const eventLimitError = (): ProviderNonRetryableError =>
       new ProviderNonRetryableError('Codex turn event stream exceeds the safe limit')
-    const queue = new AsyncEventQueue<TurnEvent>(
+    const queue = new AsyncEventQueue<VisibleTurnEvent>(
       MAX_TURN_EVENTS,
       MAX_TURN_EVENT_BYTES,
-      turnEventBytes,
+      visibleEventBytes,
       eventLimitError
     )
     const buffered: TurnEvent[] = []
@@ -518,6 +608,10 @@ export class CodexProvider implements Provider {
     let acceptingEvents = true
     let turnId: string | undefined
     let visibleChars = 0
+    const itemPhases = new Map<string, 'commentary' | 'final_answer' | null>()
+    const pendingDeltas = new Map<string, AgentMessageDelta[]>()
+    const visibleDeltas: AgentMessageDelta[] = []
+    let latestUsage: Usage | undefined
     let completed = false
     let timeout: ReturnType<typeof setTimeout> | undefined
 
@@ -526,7 +620,21 @@ export class CodexProvider implements Provider {
       buffered.length = 0
       bufferedMalformed.length = 0
       bufferedBytes = 0
+      pendingDeltas.clear()
+      visibleDeltas.length = 0
       queue.fail(error)
+    }
+
+    const emitVisibleDelta = (event: Extract<TurnEvent, { type: 'delta' }>): void => {
+      if (!acceptingEvents || completed) return
+      if (visibleChars + event.value.delta.length > MAX_VISIBLE_CONTENT_CHARS) {
+        failTurn(
+          new ProviderNonRetryableError('Codex visible response exceeds the safe limit')
+        )
+        return
+      }
+      visibleChars += event.value.delta.length
+      visibleDeltas.push(event.value)
     }
 
     const dispatch = (event: TurnEvent): void => {
@@ -535,26 +643,58 @@ export class CodexProvider implements Provider {
       }
       const eventThreadId = event.value.threadId
       const eventTurnId =
-        event.type === 'delta' ? event.value.turnId : event.value.turn.id
+        event.type === 'completed' ? event.value.turn.id : event.value.turnId
       if (eventThreadId !== thread.threadId || eventTurnId !== turnId) return
       if (completed || !acceptingEvents) return
       if (event.type === 'delta') {
-        if (visibleChars + event.value.delta.length > MAX_VISIBLE_CONTENT_CHARS) {
-          failTurn(
-            new ProviderNonRetryableError('Codex visible response exceeds the safe limit')
-          )
+        if (!itemPhases.has(event.value.itemId)) {
+          const pending = pendingDeltas.get(event.value.itemId) ?? []
+          pending.push(event.value)
+          pendingDeltas.set(event.value.itemId, pending)
           return
         }
-        visibleChars += event.value.delta.length
-        queue.push(event)
+        if (itemPhases.get(event.value.itemId) !== 'commentary') emitVisibleDelta(event)
+        return
+      }
+      if (event.type === 'item') {
+        if (event.value.item.type === 'agentMessage') {
+          itemPhases.set(event.value.item.id, event.value.item.phase)
+          const pending = pendingDeltas.get(event.value.item.id) ?? []
+          pendingDeltas.delete(event.value.item.id)
+          if (event.value.item.phase !== 'commentary') {
+            for (const delta of pending) emitVisibleDelta({ type: 'delta', value: delta })
+          }
+        } else if (HOSTILE_ITEM_TYPES.has(event.value.item.type)) {
+          failTurn(new ProviderNonRetryableError('Codex attempted a forbidden debate action'))
+        }
+        return
+      }
+      if (event.type === 'usage') {
+        const usage = event.value.tokenUsage.last
+        latestUsage = {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          reasoningTokens: usage.reasoningOutputTokens,
+          cacheReadTokens: usage.cachedInputTokens
+        }
         return
       }
       completed = true
-      if (event.value.turn.status !== 'completed') {
-        failTurn(new ProviderNonRetryableError('Codex turn did not complete successfully'))
+      if (containsHostileItem(event.value.turn.items)) {
+        failTurn(new ProviderNonRetryableError('Codex attempted a forbidden debate action'))
+      } else if (event.value.turn.status !== 'completed') {
+        failTurn(turnFailureError(event.value.turn))
+      } else if (pendingDeltas.size > 0) {
+        failTurn(new ProviderNonRetryableError('Codex emitted text without an item lifecycle'))
       } else if (visibleChars === 0) {
         failTurn(new ProviderNonRetryableError('Codex completed without a visible response'))
+      } else if (latestUsage === undefined) {
+        failTurn(new ProviderNonRetryableError('Codex completed without valid usage data'))
       } else {
+        for (const delta of visibleDeltas) queue.push({ type: 'delta', value: delta })
+        visibleDeltas.length = 0
+        queue.push({ type: 'usage', value: latestUsage })
         queue.push(event)
         queue.close()
       }
@@ -628,20 +768,56 @@ export class CodexProvider implements Provider {
         )
       }
     }
-    const removeDelta = this.dependencies.client.onNotification(
+    const handleItem = (
+      params: unknown,
+      schema: typeof itemStartedSchema | typeof itemCompletedSchema
+    ): void => {
+      if (!isRecord(params) || params.threadId !== thread.threadId) return
+      if (turnId !== undefined && params.turnId !== turnId) return
+      const parsed = schema.safeParse(params)
+      if (parsed.success) {
+        receive({ type: 'item', value: parsed.data })
+      } else {
+        receiveMalformed(
+          params.turnId,
+          new ProviderNonRetryableError('Codex emitted an invalid item lifecycle event')
+        )
+      }
+    }
+    const handleUsage = (params: unknown): void => {
+      if (!isRecord(params) || params.threadId !== thread.threadId) return
+      if (turnId !== undefined && params.turnId !== turnId) return
+      const parsed = threadTokenUsageUpdatedSchema.safeParse(params)
+      if (parsed.success) {
+        receive({ type: 'usage', value: parsed.data })
+      } else {
+        receiveMalformed(
+          params.turnId,
+          new ProviderNonRetryableError('Codex emitted invalid usage data')
+        )
+      }
+    }
+    const removeDelta = client.onNotification(
       'item/agentMessage/delta',
       handleDelta
     )
-    const removeCompleted = this.dependencies.client.onNotification(
+    const removeCompleted = client.onNotification(
       'turn/completed',
       handleCompleted
     )
+    const removeItemStarted = client.onNotification('item/started', (params) =>
+      handleItem(params, itemStartedSchema)
+    )
+    const removeItemCompleted = client.onNotification('item/completed', (params) =>
+      handleItem(params, itemCompletedSchema)
+    )
+    const removeUsage = client.onNotification('thread/tokenUsage/updated', handleUsage)
 
     let active: ActiveTurn | undefined
     const interrupt = (): void => {
       if (active === undefined || active.interruptSent) return
       active.interruptSent = true
-      void this.dependencies.client
+      void active.client
         .request(
           'turn/interrupt',
           { threadId: active.threadId, turnId: active.turnId },
@@ -656,30 +832,31 @@ export class CodexProvider implements Provider {
     }
 
     try {
-      const response = await this.dependencies.client.request(
+      this.throwIfStopped(signal, state)
+      const response = await client.request(
         'turn/start',
         {
           threadId: thread.threadId,
           input: [{ type: 'text', text: renderInput(request), text_elements: [] }],
           cwd: thread.cwd,
           approvalPolicy: 'never',
-          sandboxPolicy: { type: 'readOnly', networkAccess: false },
           model: config.model,
           effort: config.effort,
           outputSchema: DEBATE_OUTPUT_SCHEMA
         },
         turnStartResponseSchema
       )
-      if (this.connectionFailure !== undefined) throw this.connectionFailure
+      this.throwIfClientFailed(client)
       turnId = response.turn.id
       active = {
+        client,
         threadId: thread.threadId,
         turnId,
         interruptSent: false,
         fail: (error) => queue.fail(error)
       }
+      state.active = active
       this.activeTurns.set(config.roleId, active)
-      this.reservedRoles.delete(config.roleId)
       signal.addEventListener('abort', handleAbort, { once: true })
       timeout = setTimeout(() => {
         interrupt()
@@ -690,13 +867,18 @@ export class CodexProvider implements Provider {
       if (malformedCurrent !== undefined) failTurn(malformedCurrent.error)
       for (const event of buffered.splice(0)) dispatch(event)
       bufferedBytes = 0
-      if (signal.aborted) handleAbort()
+      if (signal.aborted || state.cancelled) {
+        interrupt()
+        queue.fail(signal.aborted ? safeAbortError(signal) : (state.cancellationError as Error))
+      }
 
       while (true) {
         const next = await queue.next()
         if (next.done) break
         if (next.value.type === 'delta') {
           yield { type: 'content', content: next.value.value.delta }
+        } else if (next.value.type === 'usage') {
+          yield { type: 'usage', usage: next.value.value }
         } else {
           yield { type: 'final', finishReason: 'stop' }
         }
@@ -710,18 +892,28 @@ export class CodexProvider implements Provider {
       signal.removeEventListener('abort', handleAbort)
       removeDelta()
       removeCompleted()
-      this.reservedRoles.delete(config.roleId)
+      removeItemStarted()
+      removeItemCompleted()
+      removeUsage()
+      if (this.turnStates.get(config.roleId) === state) this.turnStates.delete(config.roleId)
       if (this.activeTurns.get(config.roleId) === active) this.activeTurns.delete(config.roleId)
+      await this.removeEmptyCwd(thread.cwd).catch(() => undefined)
     }
   }
 
   async cancelActive(): Promise<void> {
+    const cancellationError = new DOMException('Stopped', 'AbortError')
+    for (const state of this.turnStates.values()) {
+      state.cancelled = true
+      state.cancellationError ??= cancellationError
+      state.active?.fail(state.cancellationError)
+    }
     await Promise.all(
       [...this.activeTurns.values()].map(async (active) => {
         if (active.interruptSent) return
         active.interruptSent = true
         try {
-          await this.dependencies.client.request(
+          await active.client.request(
             'turn/interrupt',
             { threadId: active.threadId, turnId: active.turnId },
             emptyResponseSchema
@@ -739,53 +931,39 @@ export class CodexProvider implements Provider {
     const closingError = new ProviderNonRetryableError('Codex provider was closed')
     for (const active of this.activeTurns.values()) active.fail(closingError)
     const cancellation = this.cancelActive()
-    this.removeLoginListener()
-    this.removeFailureListener()
     for (const waiter of this.loginWaiters.values()) {
       waiter.reject(closingError)
     }
     this.loginWaiters.clear()
+    this.completedLogins.clear()
+    this.ignoredLoginIds.clear()
     this.loginAttemptActive = false
-    await this.dependencies.client.dispose()
     await cancellation
-    await Promise.all(
-      [...this.threads.values()].map(({ cwd }) =>
-        this.removeEmptyCwd(cwd).catch(() => undefined)
-      )
-    )
-    this.threads.clear()
+    const connection = this.connection
+    this.connection = undefined
+    connection?.removeLoginListener()
+    connection?.removeFailureListener()
+    await connection?.client.dispose()
+    await this.connectionPromise?.catch(() => undefined)
   }
 
-  private async ensureThread(
+  private async prepareThread(
+    client: CodexJsonRpcClient,
     config: OpenAIRoleConfig,
-    request: ProviderReplyRequest
+    request: ProviderReplyRequest,
+    signal: AbortSignal,
+    state: TurnState
   ): Promise<RoleThread> {
-    const existing = this.threads.get(config.roleId)
-    if (existing !== undefined) {
-      if (
-        existing.sessionId !== request.sessionId ||
-        existing.model !== config.model ||
-        existing.effort !== config.effort
-      ) {
-        throw new ProviderNonRetryableError(
-          'Codex role configuration cannot change while its debate thread is active'
-        )
-      }
-      return existing
-    }
-    if (this.threads.size >= 2) {
-      throw new ProviderNonRetryableError('Codex role thread limit exceeded')
-    }
     let cwd: string | undefined
     try {
       cwd = await this.createEmptyCwd(config.roleId)
-      const response = await this.dependencies.client.request(
+      this.throwIfStopped(signal, state)
+      const response = await client.request(
         'thread/start',
         {
           model: config.model,
           cwd,
           approvalPolicy: 'never',
-          sandbox: 'read-only',
           baseInstructions: request.view.system,
           developerInstructions:
             'Debate-only text role. Never use tools, shell, files, commands, approvals, skills, MCP, apps, or network access. Return only the required JSON object.',
@@ -794,6 +972,8 @@ export class CodexProvider implements Provider {
         },
         threadStartResponseSchema
       )
+      this.throwIfClientFailed(client)
+      this.throwIfStopped(signal, state)
       if (
         response.model !== config.model ||
         response.cwd !== cwd ||
@@ -804,24 +984,27 @@ export class CodexProvider implements Provider {
         throw new ProviderNonRetryableError('Codex did not apply the required safety policy')
       }
       const thread: RoleThread = {
-        roleId: config.roleId,
-        sessionId: request.sessionId,
         threadId: response.thread.id,
-        cwd,
-        model: config.model,
-        effort: config.effort
+        cwd
       }
-      this.threads.set(config.roleId, thread)
       return thread
     } catch (error) {
       if (cwd !== undefined) await this.removeEmptyCwd(cwd).catch(() => undefined)
-      throw normalizeError(error)
+      throw normalizeError(error, signal)
+    }
+  }
+
+  private throwIfStopped(signal: AbortSignal, state: TurnState): void {
+    if (signal.aborted) throw safeAbortError(signal)
+    if (state.cancelled) {
+      throw state.cancellationError ?? new DOMException('Stopped', 'AbortError')
     }
   }
 
   private handleLoginCompleted(params: unknown): void {
     const parsed = loginCompletedSchema.safeParse(params)
     if (!parsed.success || typeof parsed.data.loginId !== 'string') return
+    if (this.ignoredLoginIds.delete(parsed.data.loginId)) return
     if (this.loginWaiters.has(parsed.data.loginId)) {
       this.settleLogin(parsed.data.loginId, parsed.data)
     } else if (this.completedLogins.size < 8) {
@@ -838,8 +1021,71 @@ export class CodexProvider implements Provider {
     else waiter.reject(new ProviderNonRetryableError('ChatGPT login did not complete'))
   }
 
+  private ignoreLoginCompletion(loginId: string): void {
+    if (this.ignoredLoginIds.size < 8) this.ignoredLoginIds.add(loginId)
+  }
+
+  private async getClient(): Promise<CodexJsonRpcClient> {
+    this.ensureUsable()
+    if (this.connection !== undefined) return this.connection.client
+    if (this.connectionPromise !== undefined) return this.connectionPromise
+
+    const connecting = (async (): Promise<CodexJsonRpcClient> => {
+      const client = await this.dependencies.createClient()
+      if (this.disposed) {
+        await client.dispose()
+        throw new ProviderNonRetryableError('Codex provider is closed')
+      }
+      let connection!: ProviderConnection
+      const removeLoginListener = client.onNotification(
+        'account/login/completed',
+        (params) => this.handleLoginCompleted(params)
+      )
+      const removeFailureListener = client.onFailure((error) => {
+        this.handleConnectionFailure(connection, error)
+      })
+      connection = { client, removeLoginListener, removeFailureListener }
+      if (this.disposed) {
+        removeLoginListener()
+        removeFailureListener()
+        await client.dispose()
+        throw new ProviderNonRetryableError('Codex provider is closed')
+      }
+      this.connection = connection
+      return client
+    })()
+    this.connectionPromise = connecting
+    try {
+      return await connecting
+    } finally {
+      if (this.connectionPromise === connecting) this.connectionPromise = undefined
+    }
+  }
+
+  private handleConnectionFailure(connection: ProviderConnection, error: Error): void {
+    const safe = normalizeError(error)
+    this.failedClients.set(connection.client, safe)
+    if (this.connection !== connection) return
+    this.connection = undefined
+    connection.removeLoginListener()
+    connection.removeFailureListener()
+    for (const active of this.activeTurns.values()) {
+      if (active.client === connection.client) active.fail(safe)
+    }
+    for (const waiter of this.loginWaiters.values()) waiter.reject(safe)
+    this.loginWaiters.clear()
+    this.completedLogins.clear()
+    this.ignoredLoginIds.clear()
+    this.loginAttemptActive = false
+    void connection.client.dispose()
+  }
+
+  private throwIfClientFailed(client: CodexJsonRpcClient): void {
+    const failure = this.failedClients.get(client)
+    if (failure !== undefined) throw failure
+  }
+
   private ensureUsable(): void {
     if (this.disposed) throw new ProviderNonRetryableError('Codex provider is closed')
-    if (this.connectionFailure !== undefined) throw this.connectionFailure
   }
 }

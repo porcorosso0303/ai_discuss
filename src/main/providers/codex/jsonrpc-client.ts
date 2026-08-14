@@ -17,6 +17,8 @@ export interface CodexJsonRpcClientOptions {
   maxLineBytes?: number
   maxStderrBytes?: number
   maxPending?: number
+  maxQueuedWrites?: number
+  maxQueuedWriteBytes?: number
   requestTimeoutMs?: number
 }
 
@@ -35,6 +37,11 @@ interface PendingRequest {
   resolve: (value: unknown) => void
   reject: (error: Error) => void
   timer: ReturnType<typeof setTimeout>
+}
+
+interface QueuedWrite {
+  encoded: string
+  bytes: number
 }
 
 type NotificationHandler = (params: unknown) => void
@@ -196,6 +203,8 @@ export class CodexJsonRpcClient {
   private readonly maxLineBytes: number
   private readonly maxStderrBytes: number
   private readonly maxPending: number
+  private readonly maxQueuedWrites: number
+  private readonly maxQueuedWriteBytes: number
   private readonly requestTimeoutMs: number
   private readonly pending = new Map<number, PendingRequest>()
   private readonly notificationHandlers = new Map<string, Set<NotificationHandler>>()
@@ -204,6 +213,10 @@ export class CodexJsonRpcClient {
   private nextId = 1
   private stdoutBuffer = ''
   private stderrBuffer = ''
+  private queuedWrites: QueuedWrite[] = []
+  private queuedWriteBytes = 0
+  private writeBlocked = false
+  private writeInProgress = false
   private state: 'new' | 'initializing' | 'ready' | 'failed' | 'disposed' = 'new'
   private failure: Error | undefined
 
@@ -214,6 +227,11 @@ export class CodexJsonRpcClient {
     this.maxLineBytes = safePositiveInteger(options.maxLineBytes, 1024 * 1024)
     this.maxStderrBytes = safePositiveInteger(options.maxStderrBytes, 4_096)
     this.maxPending = safePositiveInteger(options.maxPending, 64)
+    this.maxQueuedWrites = safePositiveInteger(options.maxQueuedWrites, 64)
+    this.maxQueuedWriteBytes = safePositiveInteger(
+      options.maxQueuedWriteBytes,
+      Math.min(Number.MAX_SAFE_INTEGER, this.maxLineBytes * 4)
+    )
     this.requestTimeoutMs = safePositiveInteger(options.requestTimeoutMs, 30_000)
 
     child.stdout.on('data', this.handleStdout)
@@ -221,6 +239,7 @@ export class CodexJsonRpcClient {
     child.stdin.on('error', this.handleProcessError)
     child.stdout.on('error', this.handleProcessError)
     child.stderr.on('error', this.handleProcessError)
+    child.stdin.on('drain', this.handleDrain)
     child.once('error', this.handleProcessError)
     child.once('exit', this.handleExit)
   }
@@ -247,8 +266,10 @@ export class CodexJsonRpcClient {
       this.writeMessage({ method: 'initialized' })
       this.state = 'ready'
     } catch (error) {
-      this.fail(error instanceof Error ? error : new JsonRpcProtocolError('Initialization failed'))
-      throw this.failure
+      const failure =
+        error instanceof Error ? error : new JsonRpcProtocolError('Initialization failed')
+      this.fail(failure)
+      throw this.failure ?? failure
     }
   }
 
@@ -306,8 +327,10 @@ export class CodexJsonRpcClient {
     this.child.stdin.off('error', this.handleProcessError)
     this.child.stdout.off('error', this.handleProcessError)
     this.child.stderr.off('error', this.handleProcessError)
+    this.child.stdin.off('drain', this.handleDrain)
     this.child.off('error', this.handleProcessError)
     this.child.off('exit', this.handleExit)
+    this.clearQueuedWrites()
     this.child.stdin.end()
     if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill()
   }
@@ -320,8 +343,8 @@ export class CodexJsonRpcClient {
     this.nextId += 1
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new JsonRpcTransportError(`Codex request timed out: ${method}`))
+        if (!this.pending.has(id)) return
+        this.fail(new JsonRpcTransportError(`Codex request timed out: ${method}`))
       }, this.requestTimeoutMs)
       this.pending.set(id, { method, schema, resolve, reject, timer })
       try {
@@ -346,16 +369,23 @@ export class CodexJsonRpcClient {
     if (Buffer.byteLength(encoded) > this.maxLineBytes) {
       throw new JsonRpcProtocolError('Outbound Codex message exceeds the line limit')
     }
-    this.child.stdin.write(encoded)
+    const bytes = Buffer.byteLength(encoded)
+    if (
+      this.queuedWrites.length >= this.maxQueuedWrites ||
+      this.queuedWriteBytes + bytes > this.maxQueuedWriteBytes
+    ) {
+      const error = new JsonRpcProtocolError('Codex stdin queue exceeds the configured limit')
+      this.fail(error)
+      throw error
+    }
+    this.queuedWrites.push({ encoded, bytes })
+    this.queuedWriteBytes += bytes
+    this.flushQueuedWrites()
   }
 
   private readonly handleStdout = (chunk: Buffer): void => {
     if (this.state === 'failed' || this.state === 'disposed') return
     this.stdoutBuffer += this.decoder.write(chunk)
-    if (Buffer.byteLength(this.stdoutBuffer) > this.maxLineBytes && !this.stdoutBuffer.includes('\n')) {
-      this.fail(new JsonRpcProtocolError('Codex stdout line exceeds the configured limit'))
-      return
-    }
     let newline = this.stdoutBuffer.indexOf('\n')
     while (newline !== -1) {
       const line = this.stdoutBuffer.slice(0, newline).replace(/\r$/, '')
@@ -377,6 +407,39 @@ export class CodexJsonRpcClient {
         }
       }
       newline = this.stdoutBuffer.indexOf('\n')
+    }
+    if (Buffer.byteLength(this.stdoutBuffer) > this.maxLineBytes) {
+      this.fail(new JsonRpcProtocolError('Codex stdout line exceeds the configured limit'))
+    }
+  }
+
+  private flushQueuedWrites(): void {
+    if (this.writeBlocked || this.writeInProgress) return
+    try {
+      while (!this.writeBlocked && this.queuedWrites.length > 0) {
+        const next = this.queuedWrites.shift() as QueuedWrite
+        this.queuedWriteBytes -= next.bytes
+        this.writeInProgress = true
+        const accepted = this.child.stdin.write(next.encoded)
+        this.writeInProgress = false
+        if (!accepted) this.writeBlocked = true
+      }
+    } catch (error) {
+      this.writeInProgress = false
+      const failure =
+        error instanceof Error ? error : new JsonRpcTransportError('Codex write failed')
+      this.fail(failure)
+      throw failure
+    }
+  }
+
+  private readonly handleDrain = (): void => {
+    if (this.state === 'failed' || this.state === 'disposed') return
+    this.writeBlocked = false
+    try {
+      this.flushQueuedWrites()
+    } catch {
+      // flushQueuedWrites already failed the transport.
     }
   }
 
@@ -478,6 +541,7 @@ export class CodexJsonRpcClient {
     if (this.state === 'failed' || this.state === 'disposed') return
     this.state = 'failed'
     this.failure = error
+    this.clearQueuedWrites()
     this.rejectPending(error)
     this.notificationHandlers.clear()
     for (const handler of this.failureHandlers) {
@@ -497,5 +561,12 @@ export class CodexJsonRpcClient {
       pending.reject(error)
     }
     this.pending.clear()
+  }
+
+  private clearQueuedWrites(): void {
+    this.queuedWrites = []
+    this.queuedWriteBytes = 0
+    this.writeBlocked = false
+    this.writeInProgress = false
   }
 }
