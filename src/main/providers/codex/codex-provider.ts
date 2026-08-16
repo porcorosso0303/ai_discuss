@@ -184,7 +184,11 @@ class AsyncEventQueue<Event> {
 
 type TurnEvent =
   | { type: 'delta'; value: AgentMessageDelta }
-  | { type: 'item'; value: ItemStarted | ItemCompleted }
+  | {
+      type: 'item'
+      lifecycle: 'started' | 'completed'
+      value: ItemStarted | ItemCompleted
+    }
   | { type: 'usage'; value: ThreadTokenUsageUpdated }
   | { type: 'completed'; value: TurnCompleted }
 
@@ -607,10 +611,11 @@ export class CodexProvider implements Provider {
     let observedBytes = 0
     let acceptingEvents = true
     let turnId: string | undefined
-    let visibleChars = 0
-    const itemPhases = new Map<string, 'commentary' | 'final_answer' | null>()
-    const pendingDeltas = new Map<string, AgentMessageDelta[]>()
-    const visibleDeltas: AgentMessageDelta[] = []
+    const deltaItemIds = new Set<string>()
+    const completedAgentMessages = new Map<
+      string,
+      { phase: 'commentary' | 'final_answer' | null; text: string }
+    >()
     let latestUsage: Usage | undefined
     let completed = false
     let timeout: ReturnType<typeof setTimeout> | undefined
@@ -620,21 +625,9 @@ export class CodexProvider implements Provider {
       buffered.length = 0
       bufferedMalformed.length = 0
       bufferedBytes = 0
-      pendingDeltas.clear()
-      visibleDeltas.length = 0
+      deltaItemIds.clear()
+      completedAgentMessages.clear()
       queue.fail(error)
-    }
-
-    const emitVisibleDelta = (event: Extract<TurnEvent, { type: 'delta' }>): void => {
-      if (!acceptingEvents || completed) return
-      if (visibleChars + event.value.delta.length > MAX_VISIBLE_CONTENT_CHARS) {
-        failTurn(
-          new ProviderNonRetryableError('Codex visible response exceeds the safe limit')
-        )
-        return
-      }
-      visibleChars += event.value.delta.length
-      visibleDeltas.push(event.value)
     }
 
     const dispatch = (event: TurnEvent): void => {
@@ -647,22 +640,16 @@ export class CodexProvider implements Provider {
       if (eventThreadId !== thread.threadId || eventTurnId !== turnId) return
       if (completed || !acceptingEvents) return
       if (event.type === 'delta') {
-        if (!itemPhases.has(event.value.itemId)) {
-          const pending = pendingDeltas.get(event.value.itemId) ?? []
-          pending.push(event.value)
-          pendingDeltas.set(event.value.itemId, pending)
-          return
-        }
-        if (itemPhases.get(event.value.itemId) !== 'commentary') emitVisibleDelta(event)
+        deltaItemIds.add(event.value.itemId)
         return
       }
       if (event.type === 'item') {
         if (event.value.item.type === 'agentMessage') {
-          itemPhases.set(event.value.item.id, event.value.item.phase)
-          const pending = pendingDeltas.get(event.value.item.id) ?? []
-          pendingDeltas.delete(event.value.item.id)
-          if (event.value.item.phase !== 'commentary') {
-            for (const delta of pending) emitVisibleDelta({ type: 'delta', value: delta })
+          if (event.lifecycle === 'completed') {
+            completedAgentMessages.set(event.value.item.id, {
+              phase: event.value.item.phase,
+              text: event.value.item.text
+            })
           }
         } else if (HOSTILE_ITEM_TYPES.has(event.value.item.type)) {
           failTurn(new ProviderNonRetryableError('Codex attempted a forbidden debate action'))
@@ -685,18 +672,42 @@ export class CodexProvider implements Provider {
         failTurn(new ProviderNonRetryableError('Codex attempted a forbidden debate action'))
       } else if (event.value.turn.status !== 'completed') {
         failTurn(turnFailureError(event.value.turn))
-      } else if (pendingDeltas.size > 0) {
+      } else if (
+        [...deltaItemIds].some((itemId) => !completedAgentMessages.has(itemId))
+      ) {
         failTurn(new ProviderNonRetryableError('Codex emitted text without an item lifecycle'))
-      } else if (visibleChars === 0) {
-        failTurn(new ProviderNonRetryableError('Codex completed without a visible response'))
       } else if (latestUsage === undefined) {
         failTurn(new ProviderNonRetryableError('Codex completed without valid usage data'))
       } else {
-        for (const delta of visibleDeltas) queue.push({ type: 'delta', value: delta })
-        visibleDeltas.length = 0
-        queue.push({ type: 'usage', value: latestUsage })
-        queue.push(event)
-        queue.close()
+        const messages = [...completedAgentMessages.entries()]
+        const explicitFinal = messages.filter(([, message]) => message.phase === 'final_answer')
+        const candidates =
+          explicitFinal.length > 0
+            ? explicitFinal
+            : messages.filter(([, message]) => message.phase === null)
+        const candidate = candidates[0]
+        if (
+          candidates.length !== 1 ||
+          candidate === undefined ||
+          candidate[1].text.length === 0
+        ) {
+          failTurn(new ProviderNonRetryableError('Codex completed without a visible response'))
+        } else if (candidate[1].text.length > MAX_VISIBLE_CONTENT_CHARS) {
+          failTurn(new ProviderNonRetryableError('Codex visible response exceeds the safe limit'))
+        } else {
+          queue.push({
+            type: 'delta',
+            value: {
+              threadId: thread.threadId,
+              turnId,
+              itemId: candidate[0],
+              delta: candidate[1].text
+            }
+          })
+          queue.push({ type: 'usage', value: latestUsage })
+          queue.push(event)
+          queue.close()
+        }
       }
     }
 
@@ -776,7 +787,11 @@ export class CodexProvider implements Provider {
       if (turnId !== undefined && params.turnId !== turnId) return
       const parsed = schema.safeParse(params)
       if (parsed.success) {
-        receive({ type: 'item', value: parsed.data })
+        receive({
+          type: 'item',
+          lifecycle: schema === itemCompletedSchema ? 'completed' : 'started',
+          value: parsed.data
+        })
       } else {
         receiveMalformed(
           params.turnId,

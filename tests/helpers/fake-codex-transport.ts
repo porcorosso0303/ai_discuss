@@ -33,6 +33,9 @@ export type FakeCodexMode =
   | 'timeout-account'
   | 'commentary-then-final'
   | 'commentary-delta-before-start'
+  | 'null-start-commentary-completed'
+  | 'final-delta-before-start'
+  | 'final-authoritative-mismatch'
   | 'legacy-null-phase'
   | 'hostile-item'
   | 'hostile-completion-item'
@@ -440,7 +443,8 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
       } else {
         if (
           this.mode === 'commentary-then-final' ||
-          this.mode === 'commentary-delta-before-start'
+          this.mode === 'commentary-delta-before-start' ||
+          this.mode === 'null-start-commentary-completed'
         ) {
           if (this.mode === 'commentary-delta-before-start') {
             this.send({
@@ -463,7 +467,7 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
                 type: 'agentMessage',
                 id: 'commentary',
                 text: '',
-                phase: 'commentary',
+                phase: this.mode === 'null-start-commentary-completed' ? null : 'commentary',
                 memoryCitation: null
               }
             }
@@ -479,6 +483,32 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
               }
             })
           }
+          this.send({
+            method: 'item/completed',
+            params: {
+              threadId: message.params.threadId,
+              turnId,
+              completedAtMs: 2,
+              item: {
+                type: 'agentMessage',
+                id: 'commentary',
+                text: 'PRIVATE_COMMENTARY',
+                phase: 'commentary',
+                memoryCitation: null
+              }
+            }
+          })
+        }
+        if (this.mode === 'final-delta-before-start') {
+          this.send({
+            method: 'item/agentMessage/delta',
+            params: {
+              threadId: message.params.threadId,
+              turnId,
+              itemId: 'msg',
+              delta: '{"speech":"回应",'
+            }
+          })
         }
         this.send({
           method: 'item/started',
@@ -544,7 +574,17 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
             delta: 'x'.repeat(200_001)
           }
         })
-      } else if (this.mode !== 'empty-turn') {
+      } else if (this.mode === 'final-authoritative-mismatch') {
+        this.send({
+          method: 'item/agentMessage/delta',
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            itemId: 'msg',
+            delta: 'PRIVATE_COMMENTARY_NOT_JSON'
+          }
+        })
+      } else if (this.mode !== 'empty-turn' && this.mode !== 'final-delta-before-start') {
         this.send({
           method: 'item/agentMessage/delta',
           params: {
@@ -561,7 +601,14 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
   }
 
   private completeTurn(message: Record<string, any>, turnId: string): void {
-    if (!['empty-turn', 'malformed-delta', 'oversized-delta'].includes(this.mode)) {
+    if (
+      ![
+        'empty-turn',
+        'malformed-delta',
+        'oversized-delta',
+        'final-authoritative-mismatch'
+      ].includes(this.mode)
+    ) {
       this.send({
         method: 'item/agentMessage/delta',
         params: {
@@ -581,7 +628,10 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
         item: {
           type: 'agentMessage',
           id: 'msg',
-          text: '{"speech":"回应","status":"continue"}',
+          text:
+            this.mode === 'empty-turn'
+              ? ''
+              : '{"speech":"回应","status":"continue"}',
           phase: this.mode === 'legacy-null-phase' ? null : 'final_answer',
           memoryCitation: null
         }

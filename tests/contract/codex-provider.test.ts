@@ -91,8 +91,7 @@ const collect = async (iterable: AsyncIterable<ProviderChunk>): Promise<Provider
 }
 
 const SUCCESSFUL_REPLY: ProviderChunk[] = [
-  { type: 'content', content: '{"speech":"回应",' },
-  { type: 'content', content: '"status":"continue"}' },
+  { type: 'content', content: '{"speech":"回应","status":"continue"}' },
   {
     type: 'usage',
     usage: {
@@ -417,6 +416,9 @@ describe('CodexProvider discovery and debate streaming', () => {
   it.each([
     'commentary-then-final',
     'commentary-delta-before-start',
+    'null-start-commentary-completed',
+    'final-delta-before-start',
+    'final-authoritative-mismatch',
     'legacy-null-phase',
     'usage-updates',
     'old-malformed-usage'
@@ -426,7 +428,7 @@ describe('CodexProvider discovery and debate streaming', () => {
 
     const chunks = await collect(provider.streamReply(request(), new AbortController().signal))
     expect(chunks).toEqual(SUCCESSFUL_REPLY)
-    expect(JSON.stringify(chunks)).not.toContain('PRIVATE_COMMENTARY')
+    expect(JSON.stringify(chunks)).not.toMatch(/PRIVATE_COMMENTARY|NOT_JSON/)
   })
 
   it.each(['hostile-item', 'malformed-item'] as const)(
