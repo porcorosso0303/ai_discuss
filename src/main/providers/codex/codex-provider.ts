@@ -355,6 +355,7 @@ export class CodexProvider implements Provider {
   private readonly failedClients = new WeakMap<CodexJsonRpcClient, Error>()
   private disposed = false
   private loginAttemptActive = false
+  private activeLoginId: string | undefined
 
   constructor(private readonly dependencies: CodexProviderDependencies) {
     this.createEmptyCwd =
@@ -398,6 +399,7 @@ export class CodexProvider implements Provider {
       throw new ProviderNonRetryableError('A ChatGPT login attempt is already active')
     }
     this.loginAttemptActive = true
+    this.completedLogins.clear()
     try {
       const client = await this.getClient()
       const response = await client.request(
@@ -406,6 +408,7 @@ export class CodexProvider implements Provider {
         loginStartResponseSchema
       )
       this.throwIfClientFailed(client)
+      this.activeLoginId = response.loginId
       if (!isAllowedLoginUrl(response.authUrl)) {
         this.ignoreLoginCompletion(response.loginId)
         void client
@@ -431,10 +434,8 @@ export class CodexProvider implements Provider {
         reject: rejectCompletion
       })
       const completed = this.completedLogins.get(response.loginId)
-      if (completed !== undefined) {
-        this.completedLogins.delete(response.loginId)
-        this.settleLogin(response.loginId, completed)
-      }
+      this.completedLogins.clear()
+      if (completed !== undefined) this.settleLogin(response.loginId, completed)
       try {
         await this.dependencies.openExternal(response.authUrl)
       } catch {
@@ -454,6 +455,8 @@ export class CodexProvider implements Provider {
       return { loginId: response.loginId, completion }
     } catch (error) {
       this.loginAttemptActive = false
+      this.activeLoginId = undefined
+      this.completedLogins.clear()
       throw normalizeError(error)
     }
   }
@@ -462,17 +465,27 @@ export class CodexProvider implements Provider {
     this.ensureUsable()
     try {
       const client = await this.getClient()
-      await client.request(
+      const response = await client.request(
         'account/login/cancel',
         { loginId },
         cancelLoginResponseSchema
       )
       this.throwIfClientFailed(client)
+      if (response.status !== 'canceled') {
+        this.completedLogins.delete(loginId)
+        return
+      }
       const waiter = this.loginWaiters.get(loginId)
+      if (this.activeLoginId !== loginId || waiter === undefined) {
+        this.completedLogins.delete(loginId)
+        return
+      }
       this.loginWaiters.delete(loginId)
       this.loginAttemptActive = false
+      this.activeLoginId = undefined
+      this.completedLogins.delete(loginId)
       this.ignoreLoginCompletion(loginId)
-      waiter?.reject(new ProviderNonRetryableError('ChatGPT login was canceled'))
+      waiter.reject(new ProviderNonRetryableError('ChatGPT login was canceled'))
     } catch (error) {
       throw normalizeError(error)
     }
@@ -953,6 +966,7 @@ export class CodexProvider implements Provider {
     this.completedLogins.clear()
     this.ignoredLoginIds.clear()
     this.loginAttemptActive = false
+    this.activeLoginId = undefined
     await cancellation
     const connection = this.connection
     this.connection = undefined
@@ -1020,9 +1034,19 @@ export class CodexProvider implements Provider {
     const parsed = loginCompletedSchema.safeParse(params)
     if (!parsed.success || typeof parsed.data.loginId !== 'string') return
     if (this.ignoredLoginIds.delete(parsed.data.loginId)) return
+    if (
+      this.activeLoginId !== undefined &&
+      parsed.data.loginId !== this.activeLoginId
+    ) {
+      return
+    }
     if (this.loginWaiters.has(parsed.data.loginId)) {
       this.settleLogin(parsed.data.loginId, parsed.data)
-    } else if (this.completedLogins.size < 8) {
+    } else if (
+      this.loginAttemptActive &&
+      (this.activeLoginId === undefined || this.activeLoginId === parsed.data.loginId) &&
+      this.completedLogins.size < 8
+    ) {
       this.completedLogins.set(parsed.data.loginId, parsed.data)
     }
   }
@@ -1031,7 +1055,11 @@ export class CodexProvider implements Provider {
     const waiter = this.loginWaiters.get(loginId)
     if (waiter === undefined) return
     this.loginWaiters.delete(loginId)
-    this.loginAttemptActive = false
+    this.completedLogins.delete(loginId)
+    if (this.activeLoginId === loginId) {
+      this.loginAttemptActive = false
+      this.activeLoginId = undefined
+    }
     if (completed.success) waiter.resolve()
     else waiter.reject(new ProviderNonRetryableError('ChatGPT login did not complete'))
   }
@@ -1092,6 +1120,7 @@ export class CodexProvider implements Provider {
     this.completedLogins.clear()
     this.ignoredLoginIds.clear()
     this.loginAttemptActive = false
+    this.activeLoginId = undefined
     void connection.client.dispose()
   }
 

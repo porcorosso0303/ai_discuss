@@ -203,6 +203,50 @@ describe('CodexProvider authentication', () => {
     await expect(second.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
   })
 
+  it('does not release the active login when a stale cancel returns notFound', async () => {
+    const { provider } = await createProvider('login-no-completion')
+    const active = await provider.startChatGptLogin()
+
+    await expect(provider.cancelChatGptLogin('stale-login')).resolves.toBeUndefined()
+    await expect(provider.startChatGptLogin()).rejects.toBeInstanceOf(
+      ProviderNonRetryableError
+    )
+
+    await provider.cancelChatGptLogin(active.loginId)
+    await expect(active.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
+  it('does not release a newer login when canceling an already completed login ID', async () => {
+    const { provider } = await createProvider('login-first-completes')
+    const completed = await provider.startChatGptLogin()
+    await completed.completion
+    const active = await provider.startChatGptLogin()
+
+    await provider.cancelChatGptLogin(completed.loginId)
+    await expect(provider.startChatGptLogin()).rejects.toBeInstanceOf(
+      ProviderNonRetryableError
+    )
+
+    await provider.cancelChatGptLogin(active.loginId)
+    await expect(active.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
+  it('ignores a late completion for a canceled login without settling the next login', async () => {
+    const { provider } = await createProvider('login-late-completion')
+    const canceled = await provider.startChatGptLogin()
+    await provider.cancelChatGptLogin(canceled.loginId)
+    await expect(canceled.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    const active = await provider.startChatGptLogin()
+
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    await expect(provider.startChatGptLogin()).rejects.toBeInstanceOf(
+      ProviderNonRetryableError
+    )
+
+    await provider.cancelChatGptLogin(active.loginId)
+    await expect(active.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
   it('allows only one in-flight browser login attempt', async () => {
     const { provider } = await createProvider()
     const first = await provider.startChatGptLogin()

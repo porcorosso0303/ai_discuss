@@ -49,6 +49,8 @@ export type FakeCodexMode =
   | 'turn-unauthorized'
   | 'rpc-overloaded-account'
   | 'login-no-completion'
+  | 'login-first-completes'
+  | 'login-late-completion'
 
 export interface FakeCodexTransportOptions {
   mode?: FakeCodexMode
@@ -251,7 +253,11 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
             this.options.authUrl ?? 'https://auth.openai.com/oauth/authorize?private=yes'
         }
       })
-      if (this.mode !== 'login-no-completion') {
+      if (
+        this.mode !== 'login-no-completion' &&
+        this.mode !== 'login-late-completion' &&
+        !(this.mode === 'login-first-completes' && this.loginCounter > 1)
+      ) {
         setTimeout(
           () =>
             this.send({
@@ -269,7 +275,25 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
       return
     }
     if (message.method === 'account/login/cancel') {
-      return this.send({ id: message.id, result: { status: 'canceled' } })
+      const currentLoginId = `login-${this.loginCounter}`
+      const status = message.params.loginId === currentLoginId ? 'canceled' : 'notFound'
+      this.send({ id: message.id, result: { status } })
+      if (this.mode === 'login-late-completion' && status === 'canceled') {
+        setTimeout(
+          () =>
+            this.send({
+              method: 'account/login/completed',
+              params: {
+                loginId: message.params.loginId,
+                success: false,
+                error: 'late canceled login',
+                onboardingEntrypoint: null
+              }
+            }),
+          5
+        )
+      }
+      return
     }
     if (message.method === 'account/logout') return this.send({ id: message.id, result: {} })
     if (message.method === 'model/list') return this.listModels(message)
