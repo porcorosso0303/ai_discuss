@@ -31,14 +31,25 @@ const transports = new WeakMap<CodexJsonRpcClient, FakeCodexTransport>()
 
 const exitedCodexTransport = (
   stdout: string,
-  exitCode = 0
+  exitCode = 0,
+  order: 'output-before-exit' | 'exit-before-output' = 'output-before-exit'
 ): FakeCodexTransport => {
   const child = new FakeCodexTransport()
   queueMicrotask(() => {
     child.exitCode = exitCode
-    child.stdout.end(stdout)
-    child.stderr.end()
-    child.emit('exit', exitCode, null)
+    if (order === 'output-before-exit') {
+      child.stdout.end(stdout)
+      child.stderr.end()
+      child.emit('exit', exitCode, null)
+      child.emit('close', exitCode, null)
+    } else {
+      child.emit('exit', exitCode, null)
+      queueMicrotask(() => {
+        child.stdout.end(stdout)
+        child.stderr.end()
+        child.emit('close', exitCode, null)
+      })
+    }
   })
   return child
 }
@@ -599,6 +610,107 @@ describe('Codex executable resolution', () => {
       })
     ).rejects.toThrow(/version/i)
     expect(server.transcript).toEqual([])
+  })
+
+  it('waits for process close so stdout emitted after exit can prove version 0.147.0', async () => {
+    const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-version-close-'))
+    temporaryPaths.push(resourcesPath)
+    await mkdir(join(resourcesPath, 'bin'))
+    await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
+    const server = new FakeCodexTransport()
+
+    const client = await startCodexAppServer({
+      isPackaged: true,
+      resourcesPath,
+      codexHome: join(resourcesPath, 'codex-home'),
+      clientVersion: '0.1.0',
+      spawnProcess: (_command, args) =>
+        args[0] === '--version'
+          ? exitedCodexTransport('codex-cli 0.147.0\n', 0, 'exit-before-output')
+          : server
+    })
+    clients.push(client)
+
+    expect(server.transcript.slice(0, 2).map(({ method }) => method)).toEqual([
+      'initialize',
+      'initialized'
+    ])
+  })
+
+  it.each([
+    {
+      name: 'overflow',
+      createVersion: () => exitedCodexTransport('x'.repeat(1_025))
+    },
+    {
+      name: 'nonzero exit',
+      createVersion: () => exitedCodexTransport('codex-cli 0.147.0\n', 1)
+    },
+    {
+      name: 'process error',
+      createVersion: () => {
+        const child = new FakeCodexTransport()
+        queueMicrotask(() => child.emit('error', new Error('private spawn error')))
+        return child
+      }
+    }
+  ])('rejects version $name without starting app-server', async ({ createVersion }) => {
+    const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-version-failure-'))
+    temporaryPaths.push(resourcesPath)
+    await mkdir(join(resourcesPath, 'bin'))
+    await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
+    const server = new FakeCodexTransport()
+
+    await expect(
+      startCodexAppServer({
+        isPackaged: true,
+        resourcesPath,
+        codexHome: join(resourcesPath, 'codex-home'),
+        clientVersion: '0.1.0',
+        spawnProcess: (_command, args) =>
+          args[0] === '--version' ? createVersion() : server
+      })
+    ).rejects.toThrow(/version/i)
+    expect(server.transcript).toEqual([])
+  })
+
+  it('times out after exit when the version process never closes', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    try {
+      const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-version-timeout-'))
+      temporaryPaths.push(resourcesPath)
+      await mkdir(join(resourcesPath, 'bin'))
+      await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
+      const server = new FakeCodexTransport()
+      let versionSpawned = false
+      const starting = startCodexAppServer({
+        isPackaged: true,
+        resourcesPath,
+        codexHome: join(resourcesPath, 'codex-home'),
+        clientVersion: '0.1.0',
+        spawnProcess: (_command, args) => {
+          if (args[0] !== '--version') return server
+          versionSpawned = true
+          const child = new FakeCodexTransport()
+          queueMicrotask(() => {
+            child.exitCode = 0
+            child.stdout.end('codex-cli 0.147.0\n')
+            child.emit('exit', 0, null)
+          })
+          return child
+        }
+      })
+      while (!versionSpawned) {
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+
+      const rejection = expect(starting).rejects.toThrow(/version/i)
+      await vi.advanceTimersByTimeAsync(5_001)
+      await rejection
+      expect(server.transcript).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it.skipIf(!process.env.CODEX_LIVE_0147_BIN)(

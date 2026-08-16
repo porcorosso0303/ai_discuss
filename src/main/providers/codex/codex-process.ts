@@ -53,7 +53,7 @@ const verifyCodexVersion = async (
       child.stderr.off('data', handleStderr)
       child.stderr.off('error', fail)
       child.off('error', fail)
-      child.off('exit', handleExit)
+      child.off('close', handleClose)
     }
     const finish = (error?: Error): void => {
       if (settled) return
@@ -80,7 +80,7 @@ const verifyCodexVersion = async (
     const handleStderr = (chunk: Buffer | string): void => {
       reserveOutput(chunk)
     }
-    const handleExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const handleClose = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (
         code === 0 &&
         signal === null &&
@@ -97,7 +97,7 @@ const verifyCodexVersion = async (
     child.stderr.on('data', handleStderr)
     child.stderr.once('error', fail)
     child.once('error', fail)
-    child.once('exit', handleExit)
+    child.once('close', handleClose)
     try {
       child.stdin.end()
     } catch {
