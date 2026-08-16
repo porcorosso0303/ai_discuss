@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 
 import {
@@ -28,6 +28,20 @@ import {
 const clients: CodexJsonRpcClient[] = []
 const temporaryPaths: string[] = []
 const transports = new WeakMap<CodexJsonRpcClient, FakeCodexTransport>()
+
+const exitedCodexTransport = (
+  stdout: string,
+  exitCode = 0
+): FakeCodexTransport => {
+  const child = new FakeCodexTransport()
+  queueMicrotask(() => {
+    child.exitCode = exitCode
+    child.stdout.end(stdout)
+    child.stderr.end()
+    child.emit('exit', exitCode, null)
+  })
+  return child
+}
 
 const startClient = async (
   mode: FakeCodexMode = 'normal',
@@ -516,6 +530,7 @@ describe('Codex executable resolution', () => {
     await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
     const codexHome = join(resourcesPath, 'codex-home')
     const child = new FakeCodexTransport()
+    const spawnedArgs: (readonly string[])[] = []
     let observed:
       | { command: string; args: readonly string[]; options: { env?: NodeJS.ProcessEnv } }
       | undefined
@@ -527,12 +542,20 @@ describe('Codex executable resolution', () => {
       clientVersion: '0.1.0',
       hostEnv: { SystemRoot: 'C:\\Windows', OPENAI_API_KEY: 'never-forward' },
       spawnProcess: (command, args, options) => {
+        spawnedArgs.push(args)
+        if (args[0] === '--version') {
+          return exitedCodexTransport('codex-cli 0.147.0\r\n')
+        }
         observed = { command, args, options }
         return child
       }
     })
     clients.push(client)
 
+    expect(spawnedArgs).toEqual([
+      ['--version'],
+      ['app-server', '--strict-config']
+    ])
     expect(observed?.args).toEqual(['app-server', '--strict-config'])
     expect(observed?.options.env).toEqual({
       CODEX_HOME: codexHome,
@@ -547,6 +570,35 @@ describe('Codex executable resolution', () => {
     ])
     expect(AI_DEBATES_CODEX_CONFIG).not.toContain('[tools]')
     expect(AI_DEBATES_CODEX_CONFIG).not.toContain('experimental')
+  })
+
+  it.each([
+    'codex-cli 0.146.0\n',
+    'codex-cli 0.147.1\n',
+    'codex-cli 0.147.0 extra\n',
+    'not-codex\n',
+    ''
+  ])('rejects a Codex binary that is not exactly stable 0.147.0: %j', async (output) => {
+    const resourcesPath = await mkdtemp(join(tmpdir(), 'codex-version-boundary-'))
+    temporaryPaths.push(resourcesPath)
+    await mkdir(join(resourcesPath, 'bin'))
+    await writeFile(join(resourcesPath, 'bin', 'codex.exe'), 'fake')
+    const server = new FakeCodexTransport()
+    const spawnProcess = vi.fn((
+      _command: string,
+      args: readonly string[]
+    ) => args[0] === '--version' ? exitedCodexTransport(output) : server)
+
+    await expect(
+      startCodexAppServer({
+        isPackaged: true,
+        resourcesPath,
+        codexHome: join(resourcesPath, 'codex-home'),
+        clientVersion: '0.1.0',
+        spawnProcess
+      })
+    ).rejects.toThrow(/version/i)
+    expect(server.transcript).toEqual([])
   })
 
   it.skipIf(!process.env.CODEX_LIVE_0147_BIN)(
