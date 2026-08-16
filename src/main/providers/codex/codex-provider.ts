@@ -604,7 +604,7 @@ export class CodexProvider implements Provider {
     try {
       client = await this.getClient()
       this.throwIfStopped(signal, state)
-      thread = await this.prepareThread(client, config, request, signal, state)
+      thread = await this.prepareThread(client, config, signal, state)
     } catch (error) {
       if (this.turnStates.get(config.roleId) === state) this.turnStates.delete(config.roleId)
       throw normalizeError(error, signal)
@@ -979,7 +979,6 @@ export class CodexProvider implements Provider {
   private async prepareThread(
     client: CodexJsonRpcClient,
     config: OpenAIRoleConfig,
-    request: ProviderReplyRequest,
     signal: AbortSignal,
     state: TurnState
   ): Promise<RoleThread> {
@@ -993,7 +992,6 @@ export class CodexProvider implements Provider {
           model: config.model,
           cwd,
           approvalPolicy: 'never',
-          baseInstructions: request.view.system,
           developerInstructions:
             'Debate-only text role. Never use tools, shell, files, commands, approvals, skills, MCP, apps, or network access. Return only the required JSON object.',
           ephemeral: true,

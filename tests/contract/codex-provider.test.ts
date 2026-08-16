@@ -396,7 +396,8 @@ describe('CodexProvider discovery and debate streaming', () => {
     await provider.discover(role())
     const firstRequest = request()
     firstRequest.view = {
-      system: 'FIRST_SYSTEM_SENTINEL',
+      system:
+        'FIRST_SYSTEM_SENTINEL TOPIC_SENTINEL ROLE_A_STANCE_SENTINEL ROLE_B_STANCE_SENTINEL',
       messages: [{ role: 'user', content: 'FIRST_MESSAGE_SENTINEL' }],
       waiting: false
     }
@@ -431,6 +432,17 @@ describe('CodexProvider discovery and debate streaming', () => {
     expect(secondInput.match(/LOCAL_HISTORY_SENTINEL/g)).toHaveLength(1)
     expect(secondInput.match(/SECOND_MESSAGE_SENTINEL/g)).toHaveLength(1)
     expect(secondInput).not.toContain('FIRST_MESSAGE_SENTINEL')
+    const firstWire = JSON.stringify([starts[0], turns[0]])
+    for (const sentinel of [
+      'FIRST_SYSTEM_SENTINEL',
+      'TOPIC_SENTINEL',
+      'ROLE_A_STANCE_SENTINEL',
+      'ROLE_B_STANCE_SENTINEL',
+      'FIRST_MESSAGE_SENTINEL'
+    ]) {
+      expect(firstWire.match(new RegExp(sentinel, 'g'))).toHaveLength(1)
+    }
+    expect(starts[0].params).not.toHaveProperty('baseInstructions')
     await Promise.all(cwdPaths.map((cwd) => expect(access(cwd)).rejects.toThrow()))
   })
 
