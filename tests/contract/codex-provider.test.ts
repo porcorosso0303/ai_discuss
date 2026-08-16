@@ -216,6 +216,22 @@ describe('CodexProvider authentication', () => {
     await expect(active.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
   })
 
+  it('locally closes the current login when cancel returns notFound and ignores late completion', async () => {
+    const { provider } = await createProvider('login-current-not-found')
+    const missing = await provider.startChatGptLogin()
+
+    await provider.cancelChatGptLogin(missing.loginId)
+    const active = await provider.startChatGptLogin()
+    await expect(missing.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    await expect(provider.startChatGptLogin()).rejects.toBeInstanceOf(
+      ProviderNonRetryableError
+    )
+
+    await provider.cancelChatGptLogin(active.loginId)
+    await expect(active.completion).rejects.toBeInstanceOf(ProviderNonRetryableError)
+  })
+
   it('does not release a newer login when canceling an already completed login ID', async () => {
     const { provider } = await createProvider('login-first-completes')
     const completed = await provider.startChatGptLogin()

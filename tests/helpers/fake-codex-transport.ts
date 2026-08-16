@@ -51,6 +51,7 @@ export type FakeCodexMode =
   | 'login-no-completion'
   | 'login-first-completes'
   | 'login-late-completion'
+  | 'login-current-not-found'
 
 export interface FakeCodexTransportOptions {
   mode?: FakeCodexMode
@@ -256,6 +257,7 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
       if (
         this.mode !== 'login-no-completion' &&
         this.mode !== 'login-late-completion' &&
+        this.mode !== 'login-current-not-found' &&
         !(this.mode === 'login-first-completes' && this.loginCounter > 1)
       ) {
         setTimeout(
@@ -276,9 +278,16 @@ export class FakeCodexTransport extends EventEmitter implements CodexProcessTran
     }
     if (message.method === 'account/login/cancel') {
       const currentLoginId = `login-${this.loginCounter}`
-      const status = message.params.loginId === currentLoginId ? 'canceled' : 'notFound'
+      const status =
+        this.mode === 'login-current-not-found' || message.params.loginId !== currentLoginId
+          ? 'notFound'
+          : 'canceled'
       this.send({ id: message.id, result: { status } })
-      if (this.mode === 'login-late-completion' && status === 'canceled') {
+      if (
+        (this.mode === 'login-late-completion' ||
+          this.mode === 'login-current-not-found') &&
+        message.params.loginId === currentLoginId
+      ) {
         setTimeout(
           () =>
             this.send({

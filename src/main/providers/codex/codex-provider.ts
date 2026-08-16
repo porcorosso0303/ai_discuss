@@ -465,16 +465,12 @@ export class CodexProvider implements Provider {
     this.ensureUsable()
     try {
       const client = await this.getClient()
-      const response = await client.request(
+      await client.request(
         'account/login/cancel',
         { loginId },
         cancelLoginResponseSchema
       )
       this.throwIfClientFailed(client)
-      if (response.status !== 'canceled') {
-        this.completedLogins.delete(loginId)
-        return
-      }
       const waiter = this.loginWaiters.get(loginId)
       if (this.activeLoginId !== loginId || waiter === undefined) {
         this.completedLogins.delete(loginId)
