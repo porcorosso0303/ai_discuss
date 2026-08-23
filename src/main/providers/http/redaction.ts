@@ -11,18 +11,18 @@ export interface RedactLoggingOptions {
 }
 
 const SENSITIVE_KEY_SOURCE =
-  'authorization|x-api-key|api-key|api_key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|login[_-]?token|loginToken|codex[_-]?login[_-]?token|codexLoginToken|id[_-]?token|idToken|session[_-]?token|sessionToken|token'
+  'authorization|x-api-key|api-key|api_key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|login[_-]?token|loginToken|codex[_-]?login[_-]?token|codexLoginToken|id[_-]?token|idToken|session[_-]?token|sessionToken|client[_-]?secret|private[_-]?key|access[_-]?key|password|passphrase|credential|secret|token'
 
 const JSON_CREDENTIAL = new RegExp(
   `(["'])(${SENSITIVE_KEY_SOURCE})\\1(\\s*:\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`,
   'gi'
 )
 const AUTHORIZATION_VALUE = new RegExp(
-  '\\bauthorization\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|\'[^\'\\r\\n]*\'|[^\\r\\n,;&]+)',
+  '\\bauthorization\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|\'[^\'\\r\\n]*\'|[^\\r\\n,;&"\'\\\\}\\]]+)',
   'gi'
 )
 const OTHER_CREDENTIAL = new RegExp(
-  `\\b(?:${SENSITIVE_KEY_SOURCE.replace('authorization|', '')})\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|[^\\s,;&]+)`,
+  `\\b(?:${SENSITIVE_KEY_SOURCE.replace('authorization|', '')})\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|[^\\s,;&"'\\\\}\\]]+)`,
   'gi'
 )
 const BEARER_VALUE = /\bbearer\s+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi
@@ -42,7 +42,19 @@ const SENSITIVE_KEYS = new Set([
   'sessiontoken'
 ])
 
-const isSensitiveKey = (key: string): boolean => SENSITIVE_KEYS.has(normalizeKey(key))
+const isSensitiveKey = (key: string): boolean => {
+  const normalized = normalizeKey(key)
+  return (
+    SENSITIVE_KEYS.has(normalized) ||
+    normalized.includes('secret') ||
+    normalized.includes('credential') ||
+    normalized.includes('password') ||
+    normalized.includes('passphrase') ||
+    normalized.includes('privatekey') ||
+    normalized.includes('accesskey') ||
+    normalized.endsWith('token')
+  )
+}
 
 const maxLength = (value: number | undefined, fallback: number): number => {
   const resolved = value ?? fallback
@@ -69,10 +81,13 @@ export const redactString = (
       const valueQuote = quotedValue[0]
       return `${quote}${key}${quote}${separator}${valueQuote}${REDACTED}${valueQuote}`
     })
-    .replace(AUTHORIZATION_VALUE, (_match, separator) =>
-      `authorization${separator}${REDACTED}`
+    .replace(AUTHORIZATION_VALUE, (match, separator) =>
+      match.toUpperCase().includes('[REDACTED')
+        ? match
+        : `authorization${separator}${REDACTED}`
     )
     .replace(OTHER_CREDENTIAL, (match, separator) => {
+      if (match.toUpperCase().includes('[REDACTED')) return match
       const keyLength = match.indexOf(separator)
       return `${match.slice(0, keyLength)}${separator}${REDACTED}`
     })

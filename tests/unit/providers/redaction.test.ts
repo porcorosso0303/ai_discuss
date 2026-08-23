@@ -55,6 +55,16 @@ describe('redactString', () => {
     expect(redactString(input)).toBe(input)
   })
 
+  it('preserves surrounding JSON punctuation when redacting generic secrets', () => {
+    expect(redactString('{"message":"client_secret=raw-secret"}')).toBe(
+      '{"message":"client_secret=[REDACTED]"}'
+    )
+  })
+
+  it('is idempotent for an already-redacted unquoted value', () => {
+    expect(redactString('client_secret=[REDACTED]')).toBe('client_secret=[REDACTED]')
+  })
+
   it('bounds visible log strings after redacting secrets', () => {
     const secret = 'never-visible'
     const result = redactString(`${'x'.repeat(200)}\nAuthorization: Bearer ${secret}`, {
