@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { statSync } from 'node:fs'
 import { isAbsolute, join, win32 } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
+import { TextDecoder } from 'node:util'
 
 import { z } from 'zod'
 
@@ -13,6 +14,20 @@ const MAX_RESPONSE_BYTES = 8 * 1024
 const MAX_SECRET_UTF16_BYTES = 2560
 const MAX_ORIGIN_UTF16_UNITS = 513
 const DEFAULT_TIMEOUT_MS = 10_000
+
+const isWellFormedUTF16 = (value: string): boolean => {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index)
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+      index += 1
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false
+    }
+  }
+  return true
+}
 
 const helperErrorCodeSchema = z.enum(['invalid_request', 'unsupported', 'storage_error'])
 const helperErrorResponseSchema = z.strictObject({
@@ -28,7 +43,11 @@ const helperGetResponseSchema = z.union([
   z.strictObject({
     ok: z.literal(true),
     found: z.literal(true),
-    secret: z.string().min(1).max(MAX_SECRET_UTF16_BYTES / 2)
+    secret: z
+      .string()
+      .min(1)
+      .max(MAX_SECRET_UTF16_BYTES / 2)
+      .refine(isWellFormedUTF16)
   }),
   helperErrorResponseSchema
 ])
@@ -84,6 +103,7 @@ export interface CredentialHelperProcess {
   readonly stdin: Writable
   readonly stdout: Readable
   readonly stderr: Readable
+  on(event: 'error', listener: (error: Error) => void): this
   once(event: 'error', listener: (error: Error) => void): this
   once(
     event: 'close',
@@ -178,27 +198,20 @@ const safeSecret = (secret: string): string => {
   if (
     typeof secret !== 'string' ||
     secret.length === 0 ||
-    secret.length * 2 > MAX_SECRET_UTF16_BYTES
+    secret.length * 2 > MAX_SECRET_UTF16_BYTES ||
+    !isWellFormedUTF16(secret)
   ) {
     throw new CredentialVaultError('invalid_request', 'Credential request is invalid')
-  }
-  for (let index = 0; index < secret.length; index += 1) {
-    const unit = secret.charCodeAt(index)
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = secret.charCodeAt(index + 1)
-      if (!(next >= 0xdc00 && next <= 0xdfff)) {
-        throw new CredentialVaultError('invalid_request', 'Credential request is invalid')
-      }
-      index += 1
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new CredentialVaultError('invalid_request', 'Credential request is invalid')
-    }
   }
   return secret
 }
 
 const abortError = (): DOMException =>
   new DOMException('Credential operation aborted', 'AbortError')
+
+const containLateProcessError = (): void => {
+  // This bounded sink lives only as long as its child or stream and never records sensitive errors.
+}
 
 const helperFailure = (code: z.output<typeof helperErrorCodeSchema>): CredentialVaultError => {
   if (code === 'unsupported') {
@@ -343,6 +356,11 @@ export class CredentialVault {
       )
     }
 
+    child.on('error', containLateProcessError)
+    child.stdin.on('error', containLateProcessError)
+    child.stdout.on('error', containLateProcessError)
+    child.stderr.on('error', containLateProcessError)
+
     return new Promise<unknown>((resolve, reject) => {
       let settled = false
       let stdoutBytes = 0
@@ -419,8 +437,11 @@ export class CredentialVault {
           return
         }
         let decoded: unknown
+        let responseBuffer: Buffer | undefined
         try {
-          decoded = JSON.parse(Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'))
+          responseBuffer = Buffer.concat(stdoutChunks, stdoutBytes)
+          const responseText = new TextDecoder('utf-8', { fatal: true }).decode(responseBuffer)
+          decoded = JSON.parse(responseText)
         } catch {
           fail(
             new CredentialVaultError(
@@ -430,6 +451,8 @@ export class CredentialVault {
             false
           )
           return
+        } finally {
+          responseBuffer?.fill(0)
         }
         succeed(decoded)
       }

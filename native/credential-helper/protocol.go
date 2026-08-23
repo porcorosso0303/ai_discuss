@@ -239,6 +239,21 @@ func validSecret(secret string) bool {
 	return len(utf16.Encode([]rune(secret)))*2 <= maxCredentialBlobBytes
 }
 
+func decodeUTF16(units []uint16) (string, bool) {
+	for index := 0; index < len(units); index++ {
+		unit := units[index]
+		if unit >= 0xd800 && unit <= 0xdbff {
+			if index+1 >= len(units) || units[index+1] < 0xdc00 || units[index+1] > 0xdfff {
+				return "", false
+			}
+			index++
+		} else if unit >= 0xdc00 && unit <= 0xdfff {
+			return "", false
+		}
+	}
+	return string(utf16.Decode(units)), true
+}
+
 func handleRequest(store credentialStore, request protocolRequest) response {
 	switch request.Operation {
 	case "set":

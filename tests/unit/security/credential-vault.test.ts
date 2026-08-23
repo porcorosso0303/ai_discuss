@@ -34,6 +34,26 @@ class FakeHelperProcess extends EventEmitter implements CredentialHelperProcess 
   }
 }
 
+const expectLateProcessErrorsAreContained = (process: FakeHelperProcess): void => {
+  const emitErrors = (): void => {
+    for (const emitter of [process, process.stdin, process.stdout, process.stderr]) {
+      expect(() => emitter.emit('error', new Error('late secret-bearing error'))).not.toThrow()
+    }
+  }
+
+  emitErrors()
+  process.emit('close', 0, null)
+  emitErrors()
+
+  expect(process.listenerCount('close')).toBe(0)
+  expect(process.listenerCount('error')).toBe(1)
+  expect(process.stdin.listenerCount('error')).toBe(1)
+  expect(process.stdout.listenerCount('error')).toBe(1)
+  expect(process.stderr.listenerCount('error')).toBe(1)
+  expect(process.stdout.listenerCount('data')).toBe(0)
+  expect(process.stderr.listenerCount('data')).toBe(0)
+}
+
 const fakeExecutable = async (): Promise<{ resourcesPath: string; executable: string }> => {
   const resourcesPath = await mkdtemp(join(tmpdir(), 'credential-helper-'))
   temporaryPaths.push(resourcesPath)
@@ -229,6 +249,33 @@ describe('CredentialVault', () => {
     await expect(vault.delete(kimiScope)).rejects.toMatchObject({ code: 'protocol_error' })
   })
 
+  it('rejects invalid UTF-8 and unpaired UTF-16 in helper secrets', async () => {
+    const { resourcesPath } = await fakeExecutable()
+
+    for (const invalidSecret of [
+      Buffer.from([
+        ...Buffer.from('{"ok":true,"found":true,"secret":"'),
+        0xc3,
+        0x28,
+        ...Buffer.from('"}')
+      ]),
+      Buffer.from('{"ok":true,"found":true,"secret":"\\ud800"}'),
+      Buffer.from('{"ok":true,"found":true,"secret":"\\udc00"}')
+    ]) {
+      const process = new FakeHelperProcess()
+      const vault = new CredentialVault({
+        isPackaged: true,
+        resourcesPath,
+        spawnProcess: () => process
+      })
+      const pending = vault.get(kimiScope)
+      process.stdout.end(invalidSecret)
+      process.stderr.end()
+      process.emit('close', 0, null)
+      await expect(pending).rejects.toMatchObject({ code: 'protocol_error' })
+    }
+  })
+
   it('never includes requests, child stderr, or secrets in thrown errors', async () => {
     const { resourcesPath } = await fakeExecutable()
     const secret = 'do-not-leak-this'
@@ -300,6 +347,90 @@ describe('CredentialVault', () => {
       code: 'process_error',
       message: 'Credential helper process failed'
     })
+  })
+
+  it('contains late emitter errors after every asynchronous failure lifecycle', async () => {
+    const { resourcesPath } = await fakeExecutable()
+
+    const timeoutProcess = new FakeHelperProcess()
+    const timeoutVault = new CredentialVault({
+      isPackaged: true,
+      resourcesPath,
+      spawnProcess: () => timeoutProcess,
+      timeoutMs: 5
+    })
+    let timeoutSettlements = 0
+    const timedOut = timeoutVault.get(kimiScope).finally(() => {
+      timeoutSettlements += 1
+    })
+    await expect(timedOut).rejects.toMatchObject({ code: 'timeout' })
+    expectLateProcessErrorsAreContained(timeoutProcess)
+    expect(timeoutSettlements).toBe(1)
+
+    const abortProcess = new FakeHelperProcess()
+    const controller = new AbortController()
+    const abortVault = new CredentialVault({
+      isPackaged: true,
+      resourcesPath,
+      spawnProcess: () => abortProcess
+    })
+    let abortSettlements = 0
+    const aborted = abortVault.get(kimiScope, controller.signal).finally(() => {
+      abortSettlements += 1
+    })
+    controller.abort(new Error('unsafe abort reason'))
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' })
+    expectLateProcessErrorsAreContained(abortProcess)
+    expect(abortSettlements).toBe(1)
+
+    const overflowProcess = new FakeHelperProcess()
+    const overflowVault = new CredentialVault({
+      isPackaged: true,
+      resourcesPath,
+      spawnProcess: () => overflowProcess
+    })
+    let overflowSettlements = 0
+    const overflowed = overflowVault.get(kimiScope).finally(() => {
+      overflowSettlements += 1
+    })
+    overflowProcess.stdout.write('x'.repeat(9_000))
+    await expect(overflowed).rejects.toMatchObject({ code: 'protocol_error' })
+    expectLateProcessErrorsAreContained(overflowProcess)
+    expect(overflowSettlements).toBe(1)
+
+    const spawnErrorProcess = new FakeHelperProcess()
+    const spawnErrorVault = new CredentialVault({
+      isPackaged: true,
+      resourcesPath,
+      spawnProcess: () => {
+        queueMicrotask(() => spawnErrorProcess.emit('error', new Error('unsafe spawn error')))
+        return spawnErrorProcess
+      }
+    })
+    let spawnErrorSettlements = 0
+    const spawnErrored = spawnErrorVault.get(kimiScope).finally(() => {
+      spawnErrorSettlements += 1
+    })
+    await expect(spawnErrored).rejects.toMatchObject({ code: 'process_error' })
+    expectLateProcessErrorsAreContained(spawnErrorProcess)
+    expect(spawnErrorSettlements).toBe(1)
+
+    const writeErrorProcess = new FakeHelperProcess()
+    vi.spyOn(writeErrorProcess.stdin, 'end').mockImplementationOnce(() => {
+      throw new Error('unsafe write error')
+    })
+    const writeErrorVault = new CredentialVault({
+      isPackaged: true,
+      resourcesPath,
+      spawnProcess: () => writeErrorProcess
+    })
+    let writeErrorSettlements = 0
+    const writeErrored = writeErrorVault.get(kimiScope).finally(() => {
+      writeErrorSettlements += 1
+    })
+    await expect(writeErrored).rejects.toMatchObject({ code: 'process_error' })
+    expectLateProcessErrorsAreContained(writeErrorProcess)
+    expect(writeErrorSettlements).toBe(1)
   })
 
   it('observes an abort that fires while the helper is being spawned', async () => {

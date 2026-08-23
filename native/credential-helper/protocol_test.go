@@ -169,6 +169,23 @@ func TestProtocolAcceptsPairedSurrogatesUpToTheCredentialBlobLimit(t *testing.T)
 	}
 }
 
+func TestDecodeUTF16RejectsMalformedCredentialBlobs(t *testing.T) {
+	for name, units := range map[string][]uint16{
+		"unpaired high surrogate": {0xd800},
+		"unpaired low surrogate":  {0xdc00},
+		"high followed by text":   {0xd800, 'a'},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if decoded, ok := decodeUTF16(units); ok || decoded != "" {
+				t.Fatalf("malformed UTF-16 decoded as %q", decoded)
+			}
+		})
+	}
+	if decoded, ok := decodeUTF16([]uint16{'a', 0xd83d, 0xde00}); !ok || decoded != "a😀" {
+		t.Fatalf("valid UTF-16 did not decode: %q", decoded)
+	}
+}
+
 func TestProtocolReturnsUnsupportedWithoutWritingPlaintext(t *testing.T) {
 	store := &memoryCredentialStore{entries: make(map[string]memoryCredential), err: errUnsupported}
 	result := request(t, store, `{"operation":"set","target":"AI Debates/role-a/kimi","origin":"https://api.moonshot.cn","secret":"never-write-this"}`)

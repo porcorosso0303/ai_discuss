@@ -120,7 +120,11 @@ func (windowsCredentialStore) get(target string) (secret, origin string, found b
 	if !ok {
 		return "", "", false, errCredentialStore
 	}
-	return string(utf16.Decode(secretUnits)), storedOrigin, true, nil
+	decodedSecret, ok := decodeUTF16(secretUnits)
+	if !ok {
+		return "", "", false, errCredentialStore
+	}
+	return decodedSecret, storedOrigin, true, nil
 }
 
 func (windowsCredentialStore) delete(target string) error {
