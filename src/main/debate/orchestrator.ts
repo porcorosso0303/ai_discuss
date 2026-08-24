@@ -85,7 +85,8 @@ export class DebateOrchestrator {
     this.retryMaxDelayMs = dependencies.retryMaxDelayMs
   }
 
-  async start(input: DebateSetup): Promise<DebateSession> {
+  async start(input: DebateSetup, signal?: AbortSignal): Promise<DebateSession> {
+    this.throwIfStartupAborted(signal)
     if (this.machine !== undefined) {
       throw new Error('A debate session has already been started')
     }
@@ -98,13 +99,16 @@ export class DebateOrchestrator {
 
     for (const role of setup.roles) {
       try {
-        const capabilities = await this.dependencies.registry[role.provider].discover(role)
+        this.throwIfStartupAborted(signal)
+        const capabilities = await this.dependencies.registry[role.provider].discover(role, signal)
+        this.throwIfStartupAborted(signal)
         if (!capabilities.models.some(({ id }) => id === role.model)) {
           throw new ProviderNonRetryableError(
             'The configured model is not available from provider discovery'
           )
         }
       } catch (error) {
+        this.throwIfStartupAborted(signal)
         this.emitProviderDiscoveryError(role, error)
         this.transition({ type: 'validationFailed' })
         await this.enqueueSave()
@@ -112,9 +116,15 @@ export class DebateOrchestrator {
       }
     }
 
+    this.throwIfStartupAborted(signal)
     this.transition({ type: 'validationSucceeded' })
     await this.ensureDrive()
     return this.session()
+  }
+
+  private throwIfStartupAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
   }
 
   getSession(): DebateSession {

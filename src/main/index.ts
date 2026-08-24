@@ -2,22 +2,23 @@ import { join } from 'node:path'
 
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 
-import { createAppWindow, getTrustedDevelopmentUrl } from './create-window'
+import { createAppWindow } from './create-window'
 import { registerDesktopIpc, type DesktopIpcRegistration } from './ipc/register-ipc'
 import { startApplication } from './lifecycle'
+import { resolveDesktopRuntime } from './renderer-runtime'
 import { createProductionDesktopServices, type DesktopServices } from './services'
 
 const preloadPath = join(__dirname, '../preload/index.js')
 const rendererPath = join(__dirname, '../renderer/index.html')
-const developmentRendererUrl = getTrustedDevelopmentUrl(process.env.ELECTRON_RENDERER_URL)
-const windowRuntime = {
-  isDevelopment: !app.isPackaged,
-  rendererUrl: process.env.ELECTRON_RENDERER_URL
-}
+const desktopRuntime = resolveDesktopRuntime({
+  isPackaged: app.isPackaged,
+  env: process.env,
+  rendererPath
+})
 let services: DesktopServices | undefined
 let ipcRegistration: DesktopIpcRegistration | undefined
 
-function registerIpcHandlers(): void {
+async function registerIpcHandlers(): Promise<void> {
   let nextRegistration: DesktopIpcRegistration | undefined
   const production = createProductionDesktopServices({
     app,
@@ -36,14 +37,12 @@ function registerIpcHandlers(): void {
       ipcMain,
       services: production.services,
       log: production.log,
-      runtime: developmentRendererUrl === undefined
-        ? { isDevelopment: false, rendererPath }
-        : { isDevelopment: true, rendererUrl: developmentRendererUrl }
+      runtime: desktopRuntime.ipc
     })
     services = production.services
     ipcRegistration = nextRegistration
   } catch (error) {
-    void production.services.dispose()
+    await production.services.dispose()
     throw error
   }
 }
@@ -58,7 +57,7 @@ async function disposeApplication(): Promise<void> {
 
 void startApplication({
   app,
-  createWindow: () => createAppWindow(preloadPath, BrowserWindow, windowRuntime),
+  createWindow: () => createAppWindow(preloadPath, BrowserWindow, desktopRuntime.window),
   getAllWindows: () => BrowserWindow.getAllWindows(),
   logger: console,
   onActivate: (listener) => app.on('activate', listener),

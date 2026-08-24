@@ -2,38 +2,13 @@ import { join } from 'node:path'
 
 import type { BrowserWindow, BrowserWindowConstructorOptions } from 'electron'
 
+import { getTrustedDevelopmentUrl, type WindowRuntime } from './renderer-runtime'
+
 type BrowserWindowConstructor = new (
   options: BrowserWindowConstructorOptions
 ) => BrowserWindow
 
-export interface WindowRuntime {
-  isDevelopment: boolean
-  rendererUrl?: string
-}
-
-const trustedDevelopmentHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
-const trustedDevelopmentProtocols = new Set(['http:', 'https:'])
-const trustedDevelopmentPorts = new Set(['5173'])
-
-export function getTrustedDevelopmentUrl(rendererUrl: string | undefined): string | undefined {
-  if (!rendererUrl) {
-    return undefined
-  }
-
-  try {
-    const url = new URL(rendererUrl)
-    const isTrusted =
-      trustedDevelopmentProtocols.has(url.protocol) &&
-      trustedDevelopmentHosts.has(url.hostname) &&
-      trustedDevelopmentPorts.has(url.port) &&
-      url.username === '' &&
-      url.password === ''
-
-    return isTrusted ? rendererUrl : undefined
-  } catch {
-    return undefined
-  }
-}
+export { getTrustedDevelopmentUrl, type WindowRuntime } from './renderer-runtime'
 
 export function createWindowOptions(preloadPath: string): BrowserWindowConstructorOptions {
   return {
@@ -72,7 +47,7 @@ export async function createAppWindow(
     if (developmentUrl) {
       await window.loadURL(developmentUrl)
     } else {
-      await window.loadFile(join(__dirname, '../renderer/index.html'))
+      await window.loadFile(runtime.rendererPath ?? join(__dirname, '../renderer/index.html'))
     }
   } catch (error) {
     if (!window.isDestroyed()) {

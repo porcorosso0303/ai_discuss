@@ -42,6 +42,23 @@ function harness(development = false) {
 }
 
 describe('desktop IPC registration', () => {
+  it.each([
+    { isDevelopment: true, rendererUrl: 'http://localhost.evil.test:5173/' },
+    { isDevelopment: true, rendererUrl: 'http://localhost:5174/' },
+    { isDevelopment: true, rendererUrl: 'http://user@localhost:5173/' },
+    { isDevelopment: false, rendererPath: 'relative/index.html' }
+  ])('rejects an invalid runtime before registering handlers', (runtime) => {
+    const ipcMain = { handle: vi.fn(), removeHandler: vi.fn() }
+    expect(() => registerDesktopIpc({
+      ipcMain,
+      services: { invoke: vi.fn() },
+      log: { error: vi.fn() },
+      runtime: runtime as never
+    })).toThrow()
+    expect(ipcMain.handle).not.toHaveBeenCalled()
+    expect(ipcMain.removeHandler).not.toHaveBeenCalled()
+  })
+
   it('registers only declared invoke channels and parses both boundaries', async () => {
     const h = harness()
     expect([...h.handlers.keys()]).toEqual(IPC_INVOKE_CHANNELS)
@@ -91,5 +108,44 @@ describe('desktop IPC registration', () => {
     h.registration.dispose()
     h.registration.dispose()
     expect(h.ipcMain.removeHandler).toHaveBeenCalledTimes(IPC_INVOKE_CHANNELS.length)
+  })
+
+  it('rolls back only handlers installed by a failed registration', () => {
+    const handlers = new Map<string, unknown>()
+    let calls = 0
+    const ipcMain = {
+      handle: vi.fn((channel: string, handler: unknown) => {
+        calls += 1
+        if (calls === 3) throw new Error('simulated Electron conflict')
+        handlers.set(channel, handler)
+      }),
+      removeHandler: vi.fn((channel: string) => handlers.delete(channel))
+    }
+    expect(() => registerDesktopIpc({
+      ipcMain,
+      services: { invoke: vi.fn() },
+      log: { error: vi.fn() },
+      runtime: { isDevelopment: false, rendererPath: '/opt/app/index.html' }
+    })).toThrow('simulated Electron conflict')
+    expect(handlers.size).toBe(0)
+    expect(ipcMain.removeHandler).toHaveBeenCalledTimes(2)
+  })
+
+  it('leaves no handlers when replacing a registration fails', () => {
+    const h = harness()
+    let calls = 0
+    h.ipcMain.handle.mockImplementation((channel: string, handler: unknown) => {
+      calls += 1
+      if (calls === 2) throw new Error('replacement failed')
+      h.handlers.set(channel, handler as never)
+    })
+
+    expect(() => registerDesktopIpc({
+      ipcMain: h.ipcMain,
+      services: h.services,
+      log: h.log,
+      runtime: { isDevelopment: false, rendererPath: '/opt/ai-debates/out/renderer/index.html' }
+    })).toThrow('replacement failed')
+    expect(h.handlers.size).toBe(0)
   })
 })

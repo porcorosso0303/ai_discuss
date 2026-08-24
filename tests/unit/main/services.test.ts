@@ -144,6 +144,41 @@ describe('desktop services', () => {
     expect(deletionSignal?.aborted).toBe(true)
     await expect(services.invoke(IPC_CHANNELS.historyClear, {})).rejects.toThrow('操作失败')
   })
+
+  it('closes Codex promptly when a debate start ignores its aborted validation signal', async () => {
+    const h = harness()
+    let validationSignal: AbortSignal | undefined
+    h.orchestrator.start.mockImplementation((...args: unknown[]) => {
+      validationSignal = args[1] as AbortSignal
+      return new Promise(() => undefined)
+    })
+    const services = new DesktopServices(h.dependencies)
+    const starting = services.invoke(IPC_CHANNELS.debateStart, { setup: createSession().setup })
+    void starting.catch(() => undefined)
+    await vi.waitFor(() => expect(h.orchestrator.start).toHaveBeenCalledOnce())
+
+    await expect(Promise.race([
+      services.dispose().then(() => 'disposed'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 40))
+    ])).resolves.toBe('disposed')
+    expect(validationSignal?.aborted).toBe(true)
+    expect(h.providers.openai.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('contains synchronous event sink failures throughout login completion', async () => {
+    const h = harness()
+    let complete!: () => void
+    const completion = new Promise<void>((resolve) => { complete = resolve })
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({ loginId: 'login-1', completion })
+    h.providers.openai.readAccount.mockResolvedValue({ signedIn: true, requiresOpenaiAuth: true })
+    h.emit.mockImplementation(() => { throw new Error('renderer was destroyed') })
+    const services = new DesktopServices(h.dependencies)
+
+    await expect(services.invoke(IPC_CHANNELS.openAIStartLogin, {})).resolves.toEqual({ started: true })
+    complete()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await expect(services.invoke(IPC_CHANNELS.openAIGetAuthStatus, {})).resolves.toEqual({ status: 'signed-in' })
+  })
 })
 
 describe('OpenAI login URL allowlist', () => {

@@ -10,6 +10,11 @@ import {
   type IpcEventMap,
   type IpcInvokeChannel
 } from '../../shared/ipc'
+import {
+  getTrustedDevelopmentUrl,
+  requireAbsoluteRendererPath,
+  type DesktopIpcRuntime
+} from '../renderer-runtime'
 
 export interface DesktopIpcServicePort {
   invoke(channel: IpcInvokeChannel, request: unknown): Promise<unknown>
@@ -18,10 +23,6 @@ export interface DesktopIpcServicePort {
 export interface DesktopIpcLogPort {
   error(error: unknown, context?: unknown): Promise<void> | void
 }
-
-export type DesktopIpcRuntime =
-  | { isDevelopment: true; rendererUrl: string }
-  | { isDevelopment: false; rendererPath: string }
 
 export interface RegisterDesktopIpcDependencies {
   ipcMain: Pick<IpcMain, 'handle' | 'removeHandler'>
@@ -49,8 +50,12 @@ const activeRegistrations = new WeakMap<object, () => void>()
 
 const expectedRendererUrl = (runtime: DesktopIpcRuntime): string =>
   runtime.isDevelopment
-    ? new URL(runtime.rendererUrl).href
-    : pathToFileURL(runtime.rendererPath).href
+    ? (() => {
+        const trusted = getTrustedDevelopmentUrl(runtime.rendererUrl)
+        if (trusted === undefined) throw new Error('Invalid development renderer URL')
+        return new URL(trusted).href
+      })()
+    : pathToFileURL(requireAbsoluteRendererPath(runtime.rendererPath)).href
 
 const isTrustedWebContents = (
   sender: Pick<TrustedWebContents, 'isDestroyed' | 'mainFrame'>,
@@ -77,8 +82,8 @@ export function registerDesktopIpc({
   runtime
 }: RegisterDesktopIpcDependencies): DesktopIpcRegistration {
   const previous = activeRegistrations.get(ipcMain as object)
-  previous?.()
   const expectedUrl = expectedRendererUrl(runtime)
+  previous?.()
   let disposed = false
 
   const recordFailure = (error: unknown, channel: IpcInvokeChannel): void => {
@@ -89,25 +94,33 @@ export function registerDesktopIpc({
     }
   }
 
-  for (const channel of IPC_INVOKE_CHANNELS) {
-    ipcMain.handle(channel, async (event: IpcMainInvokeEvent, raw: unknown): Promise<unknown> => {
-      try {
-        if (
-          disposed ||
-          event.senderFrame === null ||
-          event.senderFrame !== event.sender.mainFrame ||
-          !isTrustedWebContents(event.sender, expectedUrl)
-        ) {
-          throw new Error('Untrusted renderer')
+  const installed: IpcInvokeChannel[] = []
+  try {
+    for (const channel of IPC_INVOKE_CHANNELS) {
+      ipcMain.handle(channel, async (event: IpcMainInvokeEvent, raw: unknown): Promise<unknown> => {
+        try {
+          if (
+            disposed ||
+            event.senderFrame === null ||
+            event.senderFrame !== event.sender.mainFrame ||
+            !isTrustedWebContents(event.sender, expectedUrl)
+          ) {
+            throw new Error('Untrusted renderer')
+          }
+          const request = ipcInvokeContracts[channel].request.parse(raw)
+          const response = await services.invoke(channel, request)
+          return ipcInvokeContracts[channel].response.parse(response)
+        } catch (error) {
+          recordFailure(error, channel)
+          throw safeFailure()
         }
-        const request = ipcInvokeContracts[channel].request.parse(raw)
-        const response = await services.invoke(channel, request)
-        return ipcInvokeContracts[channel].response.parse(response)
-      } catch (error) {
-        recordFailure(error, channel)
-        throw safeFailure()
-      }
-    })
+      })
+      installed.push(channel)
+    }
+  } catch (error) {
+    disposed = true
+    for (const channel of installed) ipcMain.removeHandler(channel)
+    throw error
   }
 
   const dispose = (): void => {

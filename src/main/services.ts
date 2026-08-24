@@ -61,7 +61,7 @@ interface ExporterPort {
 }
 
 interface OrchestratorPort {
-  start(setup: DebateSetup): Promise<DebateSession>
+  start(setup: DebateSetup, signal?: AbortSignal): Promise<DebateSession>
   getSession(): DebateSession
   pause(): Promise<DebateSession>
   resume(): Promise<DebateSession>
@@ -170,7 +170,7 @@ export class DesktopServices {
         case IPC_CHANNELS.openAILogout:
           await this.dependencies.providers.openai.logout()
           this.loginPending = false
-          this.dependencies.emit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+          this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
           response = { signedOut: true }
           break
         case IPC_CHANNELS.providerDiscoverCapabilities: {
@@ -249,11 +249,11 @@ export class DesktopServices {
       for (const provider of Object.values(this.dependencies.providers)) {
         if (provider.cancelActive !== undefined) operations.push(Promise.resolve().then(() => provider.cancelActive?.()))
       }
+      operations.push(
+        Promise.resolve().then(() => this.dependencies.providers.openai.dispose())
+      )
+      void this.startInFlight?.catch(() => undefined)
       await Promise.allSettled(operations)
-      await this.startInFlight?.catch(() => undefined)
-      await Promise.resolve()
-        .then(() => this.dependencies.providers.openai.dispose())
-        .catch(() => undefined)
     })()
     return this.disposePromise
   }
@@ -306,24 +306,51 @@ export class DesktopServices {
   private async startLogin(): Promise<{ started: true }> {
     const attempt = await this.dependencies.providers.openai.startChatGptLogin()
     this.loginPending = true
-    this.dependencies.emit(IPC_CHANNELS.openAIAuthChanged, { status: 'signing-in' })
-    void attempt.completion.then(
-      async () => {
-        this.loginPending = false
-        if (this.disposed) return
-        try {
-          const account = await this.dependencies.providers.openai.readAccount()
-          if (!this.disposed) this.dependencies.emit(IPC_CHANNELS.openAIAuthChanged, authStatus(account))
-        } catch {
-          if (!this.disposed) this.dependencies.emit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
-        }
-      },
-      () => {
-        this.loginPending = false
-        if (!this.disposed) this.dependencies.emit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
-      }
-    )
+    this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signing-in' })
+    void Promise.resolve(attempt.completion)
+      .then(
+        () => this.finishLogin(),
+        () => this.failLogin()
+      )
+      .catch((error: unknown) => this.recordAsyncFailure(error, 'login-completion'))
     return { started: true }
+  }
+
+  private async finishLogin(): Promise<void> {
+    this.loginPending = false
+    if (this.disposed) return
+    try {
+      const account = await this.dependencies.providers.openai.readAccount()
+      if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, authStatus(account))
+    } catch (error) {
+      if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+      await this.recordAsyncFailure(error, 'login-account-read')
+    }
+  }
+
+  private failLogin(): void {
+    this.loginPending = false
+    if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+  }
+
+  private safeEmit<Channel extends IpcEventChannel>(
+    channel: Channel,
+    payload: IpcEventMap[Channel]
+  ): void {
+    if (this.disposed) return
+    try {
+      this.dependencies.emit(channel, payload)
+    } catch (error) {
+      void this.recordAsyncFailure(error, 'event-sink')
+    }
+  }
+
+  private async recordAsyncFailure(error: unknown, operation: string): Promise<void> {
+    try {
+      await this.dependencies.log?.error(error, { boundary: 'services', operation })
+    } catch {
+      // Background error reporting is terminal and best effort.
+    }
   }
 
   private async startDebate(setup: DebateSetup): Promise<DebateSession> {
@@ -333,13 +360,21 @@ export class DesktopServices {
       if (!terminalStates.has(current.state)) throw new Error('A debate is already active')
     }
     const orchestrator = this.dependencies.createOrchestrator((event) => {
-      if (!this.disposed) this.dependencies.emit(IPC_CHANNELS.debateEvent, event)
+      this.safeEmit(IPC_CHANNELS.debateEvent, event)
     })
     this.active = orchestrator
-    const pending = orchestrator.start(setup)
+    const pending = orchestrator.start(setup, this.shutdown.signal)
     this.startInFlight = pending
     try {
-      return await pending
+      const session = await pending
+      if (this.disposed || this.shutdown.signal.aborted) {
+        if (this.active === orchestrator) this.active = undefined
+        throw new Error('Services are closed')
+      }
+      return session
+    } catch (error) {
+      if (this.active === orchestrator) this.active = undefined
+      throw error
     } finally {
       if (this.startInFlight === pending) this.startInFlight = undefined
     }

@@ -16,7 +16,7 @@ export interface ApplicationLifecycleDependencies {
   onBeforeQuit: (listener: (event: BeforeQuitEvent) => void) => unknown
   onWindowAllClosed: (listener: () => void) => unknown
   platform: NodeJS.Platform
-  registerIpcHandlers: () => void
+  registerIpcHandlers: () => void | Promise<void>
   disposeApplication: () => Promise<void>
 }
 
@@ -32,20 +32,27 @@ export async function startApplication({
   registerIpcHandlers,
   disposeApplication
 }: ApplicationLifecycleDependencies): Promise<void> {
-  let shutdownStarted = false
+  let shutdownRequested = false
   let allowQuit = false
+  let shutdownPromise: Promise<void> | undefined
+  let registrationBarrier: Promise<void> | undefined
 
-  const disposeAndQuit = async (): Promise<void> => {
-    if (shutdownStarted) return
-    shutdownStarted = true
-    try {
-      await disposeApplication()
-    } catch (error) {
-      logger.error('Failed to close application services', error)
-    } finally {
-      allowQuit = true
-      app.quit()
-    }
+  const disposeAndQuit = (): Promise<void> => {
+    shutdownRequested = true
+    if (shutdownPromise !== undefined) return shutdownPromise
+    shutdownPromise = (async () => {
+      const barrier = registrationBarrier
+      if (barrier !== undefined) await barrier.catch(() => undefined)
+      try {
+        await disposeApplication()
+      } catch (error) {
+        logger.error('Failed to close application services', error)
+      } finally {
+        allowQuit = true
+        app.quit()
+      }
+    })()
+    return shutdownPromise
   }
 
   const quitAfterFailure = async (message: string, error: unknown): Promise<void> => {
@@ -53,9 +60,16 @@ export async function startApplication({
     await disposeAndQuit()
   }
 
+  const finishShutdownIfRequested = async (): Promise<boolean> => {
+    if (!shutdownRequested) return false
+    await shutdownPromise
+    return true
+  }
+
   try {
     onBeforeQuit((event) => {
       if (allowQuit) return
+      shutdownRequested = true
       event.preventDefault()
       void disposeAndQuit()
     })
@@ -67,12 +81,26 @@ export async function startApplication({
     })
 
     await app.whenReady()
-    registerIpcHandlers()
+    if (await finishShutdownIfRequested()) return
+    let releaseRegistration!: () => void
+    registrationBarrier = new Promise<void>((resolve) => { releaseRegistration = resolve })
+    try {
+      await registerIpcHandlers()
+    } finally {
+      releaseRegistration()
+      registrationBarrier = undefined
+    }
+    if (await finishShutdownIfRequested()) return
     await createWindow()
+    if (await finishShutdownIfRequested()) return
 
     onActivate(() => {
-      if (getAllWindows().length === 0) {
+      if (shutdownRequested) return
+      const windows = getAllWindows()
+      if (shutdownRequested) return
+      if (windows.length === 0) {
         void createWindow().catch((error: unknown) => {
+          if (shutdownRequested) return
           void quitAfterFailure('Failed to create an application window', error)
         })
       }

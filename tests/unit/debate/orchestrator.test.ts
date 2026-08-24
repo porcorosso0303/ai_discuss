@@ -50,6 +50,31 @@ const jsonReply = (speech: string, status = 'continue'): string =>
 const acceptsProviderContract = (_provider: Provider): void => undefined
 
 describe('DebateOrchestrator turn scheduling', () => {
+  it('passes the startup abort signal through every role validation', async () => {
+    const signals: Array<AbortSignal | undefined> = []
+    const openai = new FakeProvider([])
+    const kimi = new FakeProvider([])
+    const originalOpenAIDiscover = openai.discover.bind(openai)
+    const originalKimiDiscover = kimi.discover.bind(kimi)
+    openai.discover = async (role, signal) => {
+      signals.push(signal)
+      return await originalOpenAIDiscover(role, signal)
+    }
+    kimi.discover = async (role, signal) => {
+      signals.push(signal)
+      return await originalKimiDiscover(role, signal)
+    }
+    const controller = new AbortController()
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai, kimi, deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository()
+    })
+
+    await orchestrator.start(setup(1), controller.signal)
+    expect(signals).toEqual([controller.signal, controller.signal])
+  })
+
   it('calls the configured first speaker and then strictly alternates providers', async () => {
     const calls: string[] = []
     const openai = new FakeProvider([
