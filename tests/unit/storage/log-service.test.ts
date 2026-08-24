@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -126,6 +126,74 @@ describe('LogService', () => {
     for (const line of bytes.toString('utf8').trimEnd().split('\n')) {
       expect(() => JSON.parse(line)).not.toThrow()
     }
+  })
+
+  it.runIf(process.platform === 'win32')(
+    'case-folds Windows log path aliases into the same file-cap queue',
+    async () => {
+      const root = await createTempDirectory('log-service-windows-case-')
+      const options = {
+        clock: () => new Date('2026-08-16T12:34:56.000Z'),
+        maxEntryBytes: 180,
+        maxFileBytes: 360
+      }
+      const first = new LogService(root.toLocaleLowerCase('en-US'), options)
+      const second = new LogService(root.toLocaleUpperCase('en-US'), options)
+
+      await Promise.all(
+        Array.from({ length: 20 }, (_, index) =>
+          (index % 2 === 0 ? first : second).info(`entry-${index}`)
+        )
+      )
+
+      expect((await readFile(join(root, 'logs/app-2026-08-16.log'))).byteLength).toBeLessThanOrEqual(
+        360
+      )
+    }
+  )
+
+  it('creates a missing nested log root safely across service instances', async () => {
+    const base = await createTempDirectory('log-service-missing-root-')
+    const root = join(base, 'nested', 'app-data')
+    const options = { clock: () => new Date('2026-08-16T12:34:56.000Z') }
+
+    await Promise.all([
+      new LogService(root, options).info('first'),
+      new LogService(root, options).info('second')
+    ])
+
+    const text = await readFile(join(root, 'logs/app-2026-08-16.log'), 'utf8')
+    expect(text).toContain('first')
+    expect(text).toContain('second')
+  })
+
+  it('does not create any external directory through a symlinked missing-root ancestor', async () => {
+    const base = await createTempDirectory('log-service-root-ancestor-')
+    const outside = await createTempDirectory('log-service-root-ancestor-outside-')
+    await symlink(outside, join(base, 'redirect'), 'dir')
+    const root = join(base, 'redirect', 'created-outside', 'app-data')
+
+    await expect(new LogService(root).info('must-not-escape')).rejects.toThrow(
+      /canonical|directory|symlink/i
+    )
+    expect(await lstat(join(outside, 'created-outside')).catch(() => null)).toBeNull()
+  })
+
+  it('recovers the shared missing-root initializer after a rejected creation', async () => {
+    const base = await createTempDirectory('log-service-root-recovery-')
+    const root = join(base, 'new-root')
+    let rejected = false
+    const failing = new LogService(root, {
+      filesystemHook: (stage) => {
+        if (stage === 'before-mkdir' && !rejected) {
+          rejected = true
+          throw new Error('injected directory rejection')
+        }
+      }
+    })
+
+    await expect(failing.info('first')).rejects.toThrow(/injected directory rejection/i)
+    await expect(new LogService(root).info('second')).resolves.toBeUndefined()
   })
 
   it('revalidates the logs parent inside the cross-instance write queue', async () => {

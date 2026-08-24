@@ -5,17 +5,28 @@ const transactions = new Map<string, Promise<void>>()
 
 const rootKey = async (root: string): Promise<string> => {
   const resolved = resolve(root)
-  const normalized = await realpath(resolved).catch(async (error: unknown) => {
-    if (
-      typeof error !== 'object' ||
-      error === null ||
-      !('code' in error) ||
-      error.code !== 'ENOENT'
-    ) {
-      throw error
+  const missingSegments: string[] = []
+  let existing = resolved
+  let normalized: string
+  while (true) {
+    try {
+      normalized = resolve(await realpath(existing), ...missingSegments)
+      break
+    } catch (error) {
+      if (
+        typeof error !== 'object' ||
+        error === null ||
+        !('code' in error) ||
+        error.code !== 'ENOENT'
+      ) {
+        throw error
+      }
+      const parent = dirname(existing)
+      if (parent === existing) throw error
+      missingSegments.unshift(basename(existing))
+      existing = parent
     }
-    return resolve(await realpath(dirname(resolved)), basename(resolved))
-  })
+  }
   return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized
 }
 

@@ -1,5 +1,7 @@
-import { lstat, realpath } from 'node:fs/promises'
+import { lstat, mkdir, realpath } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
+
+import { runKeyedTransaction } from './transaction-coordinator'
 
 export type FilesystemMutationStage =
   | 'before-temp-open'
@@ -67,6 +69,58 @@ const sameIdentity = (left: DirectoryIdentity, right: DirectoryIdentity): boolea
   comparablePath(left.canonicalPath) === comparablePath(right.canonicalPath) &&
   left.device === right.device &&
   left.inode === right.inode
+
+const isMissing = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+
+const assertCanonicalDirectory = async (path: string): Promise<void> => {
+  const identity = await inspectDirectory(path)
+  if (comparablePath(identity.canonicalPath) !== comparablePath(path)) {
+    throw new TypeError('Guarded directory must use its canonical non-symlink path')
+  }
+}
+
+export const initializeGuardedDirectory = async (
+  directory: string,
+  options: { hook?: FilesystemMutationHook } = {}
+): Promise<void> => {
+  const target = resolve(directory)
+  await runKeyedTransaction(target, 'guarded-directory-initialization', async () => {
+    const missing: string[] = []
+    let existing = target
+    while (true) {
+      try {
+        await assertCanonicalDirectory(existing)
+        break
+      } catch (error) {
+        if (!isMissing(error)) throw error
+        const parent = dirname(existing)
+        if (parent === existing) throw error
+        missing.unshift(existing)
+        existing = parent
+      }
+    }
+
+    let guard = await DirectoryIdentityGuard.capture(existing, { hook: options.hook })
+    for (const path of missing) {
+      await guard.before('before-mkdir', path)
+      await mkdir(path, { mode: 0o700 }).catch((error) => {
+        if (
+          typeof error !== 'object' ||
+          error === null ||
+          !('code' in error) ||
+          error.code !== 'EEXIST'
+        ) {
+          throw error
+        }
+      })
+      await guard.after()
+      await assertCanonicalDirectory(path)
+      guard = await DirectoryIdentityGuard.capture(path, { hook: options.hook })
+    }
+    await guard.verify()
+  })
+}
 
 export class DirectoryIdentityGuard {
   private constructor(

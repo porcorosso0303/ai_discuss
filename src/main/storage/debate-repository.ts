@@ -15,6 +15,7 @@ import { runKeyedTransaction } from './transaction-coordinator'
 const INDEX_PATH = 'debates/index.json'
 const MAX_RESULTS = 200
 const MAX_SCANNED_SESSIONS = 5_000
+const MAX_CLEARED_SESSIONS = 50_000
 const TERMINAL_STATES = new Set<DebateSession['state']>([
   'completed',
   'stopped',
@@ -22,6 +23,18 @@ const TERMINAL_STATES = new Set<DebateSession['state']>([
   'refused',
   'failed'
 ])
+const STATE_PRIORITY: Record<DebateSession['state'], number> = {
+  idle: 0,
+  validating: 1,
+  running: 2,
+  pausing: 3,
+  paused: 4,
+  failed: 5,
+  refused: 6,
+  unresolved: 7,
+  stopped: 8,
+  completed: 9
+}
 
 const safeSessionIdSchema = z
   .string()
@@ -65,10 +78,39 @@ const summaryOf = (session: DebateSession): DebateSessionSummary => ({
   updatedAt: session.updatedAt
 })
 
+const compareInstants = (left: string, right: string): number => Date.parse(left) - Date.parse(right)
+
+const lexicalCompare = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0
+
 const newestFirst = (left: DebateSession, right: DebateSession): number =>
-  right.updatedAt.localeCompare(left.updatedAt) ||
-  right.createdAt.localeCompare(left.createdAt) ||
-  left.id.localeCompare(right.id)
+  compareInstants(right.updatedAt, left.updatedAt) ||
+  compareInstants(right.createdAt, left.createdAt) ||
+  lexicalCompare(left.id, right.id)
+
+const compareProgress = (left: DebateSession, right: DebateSession): number =>
+  left.currentTurn - right.currentTurn ||
+  left.messages.length - right.messages.length ||
+  left.events.length - right.events.length
+
+const compareCanonical = (left: DebateSession, right: DebateSession): number =>
+  lexicalCompare(JSON.stringify(left), JSON.stringify(right))
+
+const compareSnapshots = (left: DebateSession, right: DebateSession): number => {
+  const leftTerminal = TERMINAL_STATES.has(left.state)
+  const rightTerminal = TERMINAL_STATES.has(right.state)
+  if (leftTerminal !== rightTerminal) return leftTerminal ? 1 : -1
+
+  if (leftTerminal && left.state !== right.state) {
+    return STATE_PRIORITY[left.state] - STATE_PRIORITY[right.state]
+  }
+
+  return (
+    compareInstants(left.updatedAt, right.updatedAt) ||
+    compareProgress(left, right) ||
+    compareCanonical(left, right)
+  )
+}
 
 const normalizedSearchText = (session: DebateSession): string =>
   [
@@ -97,11 +139,7 @@ export class DebateRepository {
     const session = parseSafeJson(persistedSessionSchema, value)
     await this.serialized(async () => {
       const existing = await this.readSession(session.id)
-      if (
-        existing !== null &&
-        ((TERMINAL_STATES.has(existing.state) && !TERMINAL_STATES.has(session.state)) ||
-          existing.updatedAt > session.updatedAt)
-      ) {
+      if (existing !== null && compareSnapshots(existing, session) >= 0) {
         return
       }
       await this.store.write(this.sessionPath(session.id), persistedSessionSchema, session)
@@ -154,13 +192,26 @@ export class DebateRepository {
 
   async clear(): Promise<number> {
     return await this.serialized(async () => {
-      const files = await this.listSessionFileNames()
       let deletedCount = 0
-      for (const file of files) {
-        if (await this.store.delete(`debates/${file}`)) deletedCount += 1
+      try {
+        while (true) {
+          const files = await this.listSessionFileNames()
+          if (files.length === 0) {
+            await this.writeIndex([])
+            return deletedCount
+          }
+          const batch = files.slice(0, MAX_SCANNED_SESSIONS)
+          if (deletedCount + batch.length > MAX_CLEARED_SESSIONS) {
+            throw new RangeError('Too many session files were added while clearing history')
+          }
+          for (const file of batch) {
+            if (await this.store.delete(`debates/${file}`)) deletedCount += 1
+          }
+        }
+      } catch (error) {
+        await this.rebuildIndex().catch(() => undefined)
+        throw error
       }
-      await this.writeIndex([])
-      return deletedCount
     })
   }
 
@@ -192,7 +243,6 @@ export class DebateRepository {
       return entries
         .filter((name) => name !== 'index.json' && name.endsWith('.json'))
         .sort()
-        .slice(0, MAX_SCANNED_SESSIONS)
     } catch (error) {
       if (isMissing(error)) return []
       throw error
@@ -201,7 +251,11 @@ export class DebateRepository {
 
   private async scanSessions(): Promise<DebateSession[]> {
     const sessions: DebateSession[] = []
-    for (const file of await this.listSessionFileNames()) {
+    const files = await this.listSessionFileNames()
+    if (files.length > MAX_SCANNED_SESSIONS) {
+      throw new RangeError(`Too many session files; maximum is ${MAX_SCANNED_SESSIONS}`)
+    }
+    for (const file of files) {
       const id = file.slice(0, -'.json'.length)
       if (!safeSessionIdSchema.safeParse(id).success) continue
       try {

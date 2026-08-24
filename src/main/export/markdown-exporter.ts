@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, resolve } from 'node:path'
 
 import { debateSessionSchema, type DebateSession, type RoleConfig } from '../../shared/schemas'
 import { parseSafeJson } from '../storage/atomic-json'
+import { z } from 'zod'
 import {
   DirectoryIdentityGuard,
   type FilesystemMutationHook
@@ -36,10 +37,18 @@ export interface MarkdownExportResult {
   fileName?: string
 }
 
+const saveDialogResultSchema = z.strictObject({
+  canceled: z.boolean(),
+  filePath: z.string().optional()
+})
+
 const providerLabel = (provider: RoleConfig['provider']): string =>
   ({ openai: 'OpenAI', kimi: 'Kimi', deepseek: 'DeepSeek' })[provider]
 
-const safePublicText = (value: string): string => value
+const safePublicText = (value: string): string =>
+  value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufeff]/gu, (character) =>
+    `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`
+  )
 const safeInlineText = (value: string): string =>
   safePublicText(value)
     .replace(/[\r\n\t]+/g, ' ')
@@ -272,11 +281,14 @@ export class MarkdownExporter {
   async export(value: unknown): Promise<MarkdownExportResult> {
     const session = parseSafeJson(debateSessionSchema, value)
     const markdown = renderDebateMarkdown(session, this.options)
-    const result = await this.dialog.showSaveDialog({
-      title: '导出辩论记录',
-      defaultPath: safeDefaultFileName(session),
-      filters: [{ name: 'Markdown', extensions: ['md'] }]
-    })
+    const result = parseSafeJson(
+      saveDialogResultSchema,
+      await this.dialog.showSaveDialog({
+        title: '导出辩论记录',
+        defaultPath: safeDefaultFileName(session),
+        filters: [{ name: 'Markdown', extensions: ['md'] }]
+      })
+    )
     if (result.canceled) return { cancelled: true }
     if (!result.filePath) throw new TypeError('Save dialog returned no local file path')
     const target = await validateSelectedPath(result.filePath)

@@ -10,23 +10,6 @@ export interface RedactLoggingOptions {
   maxStringLength?: number
 }
 
-const SENSITIVE_KEY_SOURCE =
-  'authorization|x-api-key|api-key|api_key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|login[_-]?token|loginToken|codex[_-]?login[_-]?token|codexLoginToken|id[_-]?token|idToken|session[_-]?token|sessionToken|client[_-]?secret|private[_-]?key|access[_-]?key|password|passphrase|credential|secret|token'
-
-const JSON_CREDENTIAL = new RegExp(
-  `(["'])(${SENSITIVE_KEY_SOURCE})\\1(\\s*:\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*')`,
-  'gi'
-)
-const AUTHORIZATION_VALUE = new RegExp(
-  '\\bauthorization\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|\'[^\'\\r\\n]*\'|[^\\r\\n,;&"\'\\\\}\\]]+)',
-  'gi'
-)
-const OTHER_CREDENTIAL = new RegExp(
-  `\\b(?:${SENSITIVE_KEY_SOURCE.replace('authorization|', '')})\\b(\\s*[:=]\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|[^\\s,;&"'\\\\}\\]]+)`,
-  'gi'
-)
-const BEARER_VALUE = /\bbearer\s+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi
-
 export const normalizeCredentialKey = (key: string): string =>
   key
     .normalize('NFKC')
@@ -82,35 +65,6 @@ export const isSensitiveCredentialKey = (key: string): boolean => {
   )
 }
 
-const FLEXIBLE_SEPARATOR = '[\\p{Separator}\\p{Format}\\p{Punctuation}]*'
-const FLEXIBLE_SENSITIVE_LABELS = [
-  'authorization',
-  'xapikey',
-  'apikey',
-  'accesstoken',
-  'refreshtoken',
-  'logintoken',
-  'codexlogintoken',
-  'idtoken',
-  'sessiontoken',
-  'clientsecret',
-  'privatekey',
-  'accesskey',
-  'password',
-  'passphrase',
-  'credential',
-  'secret',
-  'token'
-]
-  .sort((left, right) => right.length - left.length)
-  .map((label) => [...label].join(FLEXIBLE_SEPARATOR))
-  .join('|')
-
-const FLEXIBLE_CREDENTIAL = new RegExp(
-  `(?<![\\p{L}\\p{N}])(${FLEXIBLE_SENSITIVE_LABELS})(\\s*[:=]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;&"'\\\\}\\]]+)`,
-  'giu'
-)
-
 const maxLength = (value: number | undefined, fallback: number): number => {
   const resolved = value ?? fallback
   if (!Number.isSafeInteger(resolved) || resolved <= 0) {
@@ -126,33 +80,170 @@ const truncate = (value: string, maximum: number): string => {
   return `${value.slice(0, maximum - suffix.length)}${suffix}`
 }
 
+const SCAN_LOOKAHEAD = 1_024
+const MAX_LABEL_LENGTH = 256
+const LABEL_BOUNDARY = /[\p{Control},;&?{}\[\]()"':=]/u
+const WHITESPACE = /\s/u
+const WORD_CHARACTER = /[\p{L}\p{N}_]/u
+
+const labelBefore = (value: string, separatorIndex: number): string => {
+  let start = separatorIndex
+  if (start > 1 && (value[start - 1] === '"' || value[start - 1] === "'")) {
+    const quote = value[start - 1]
+    let quotedStart = start - 2
+    let inspected = 1
+    while (quotedStart >= 0 && inspected <= MAX_LABEL_LENGTH) {
+      if (value[quotedStart] === quote) {
+        return value.slice(quotedStart + 1, start - 1).trim()
+      }
+      quotedStart -= 1
+      inspected += 1
+    }
+  }
+  let inspected = 0
+  while (start > 0 && inspected < MAX_LABEL_LENGTH) {
+    const character = value[start - 1]
+    if (LABEL_BOUNDARY.test(character)) break
+    start -= 1
+    inspected += 1
+  }
+  return value.slice(start, separatorIndex).trim()
+}
+
+const isWordBoundary = (value: string, index: number): boolean =>
+  index < 0 || index >= value.length || !WORD_CHARACTER.test(value[index])
+
+interface ScannedValue {
+  replacement: string
+  nextIndex: number
+}
+
+const scanCredentialValue = (
+  value: string,
+  start: number,
+  consumeSpaces: boolean
+): ScannedValue => {
+  if (start >= value.length) return { replacement: REDACTED, nextIndex: start }
+  if (value.slice(start, start + REDACTED.length).toUpperCase() === REDACTED) {
+    return { replacement: REDACTED, nextIndex: start + REDACTED.length }
+  }
+
+  const quote = value[start]
+  if (quote === '"' || quote === "'") {
+    let index = start + 1
+    let escaped = false
+    while (index < value.length) {
+      const character = value[index]
+      if (!escaped && character === quote) {
+        return {
+          replacement: `${quote}${REDACTED}${quote}`,
+          nextIndex: index + 1
+        }
+      }
+      if (!escaped && (character === '\r' || character === '\n')) break
+      if (character === '\\') {
+        escaped = !escaped
+      } else {
+        escaped = false
+      }
+      index += 1
+    }
+    return { replacement: `${quote}${REDACTED}`, nextIndex: index }
+  }
+
+  let index = start
+  while (index < value.length) {
+    const character = value[index]
+    if (
+      character === '\r' ||
+      character === '\n' ||
+      character === ',' ||
+      character === ';' ||
+      character === '&' ||
+      character === '"' ||
+      character === "'" ||
+      character === '}' ||
+      character === ']' ||
+      (!consumeSpaces && WHITESPACE.test(character))
+    ) {
+      break
+    }
+    index += 1
+  }
+  return { replacement: REDACTED, nextIndex: index }
+}
+
+const appendTruncationMarker = (value: string, maximum: number): string => {
+  const suffix = '…[TRUNCATED]'
+  if (value.length + suffix.length <= maximum) return `${value}${suffix}`
+  return truncate(value.length > maximum ? value : `${value}${suffix}`, maximum)
+}
+
+const scanRedactedPrefix = (value: string): string => {
+  const output: string[] = []
+  let segmentStart = 0
+  let index = 0
+
+  while (index < value.length) {
+    const character = value[index]
+    if (character === ':' || character === '=') {
+      const label = labelBefore(value, index)
+      if (label && isSensitiveCredentialKey(label)) {
+        let valueStart = index + 1
+        while (valueStart < value.length && WHITESPACE.test(value[valueStart])) {
+          valueStart += 1
+        }
+        const scanned = scanCredentialValue(
+          value,
+          valueStart,
+          normalizeCredentialKey(label).includes('authorization')
+        )
+        output.push(value.slice(segmentStart, valueStart), scanned.replacement)
+        segmentStart = scanned.nextIndex
+        index = scanned.nextIndex
+        continue
+      }
+    }
+
+    if (
+      value.slice(index, index + 6).toLowerCase() === 'bearer' &&
+      isWordBoundary(value, index - 1) &&
+      isWordBoundary(value, index + 6)
+    ) {
+      let valueStart = index + 6
+      if (valueStart < value.length && WHITESPACE.test(value[valueStart])) {
+        while (valueStart < value.length && WHITESPACE.test(value[valueStart])) {
+          valueStart += 1
+        }
+        const scanned = scanCredentialValue(value, valueStart, false)
+        output.push(
+          value.slice(segmentStart, index),
+          'Bearer',
+          value.slice(index + 6, valueStart),
+          scanned.replacement
+        )
+        segmentStart = scanned.nextIndex
+        index = scanned.nextIndex
+        continue
+      }
+    }
+    index += 1
+  }
+
+  output.push(value.slice(segmentStart))
+  return output.join('')
+}
+
 export const redactString = (
   input: string,
   options: RedactStringOptions = {}
 ): string => {
   const maximum = maxLength(options.maxLength, DEFAULT_MAX_STRING_LENGTH)
-  const redacted = input
-    .normalize('NFKC')
-    .replace(JSON_CREDENTIAL, (_match, quote, key, separator, quotedValue) => {
-      const valueQuote = quotedValue[0]
-      return `${quote}${key}${quote}${separator}${valueQuote}${REDACTED}${valueQuote}`
-    })
-    .replace(AUTHORIZATION_VALUE, (match, separator) =>
-      match.toUpperCase().includes('[REDACTED')
-        ? match
-        : `authorization${separator}${REDACTED}`
-    )
-    .replace(OTHER_CREDENTIAL, (match, separator) => {
-      if (match.toUpperCase().includes('[REDACTED')) return match
-      const keyLength = match.indexOf(separator)
-      return `${match.slice(0, keyLength)}${separator}${REDACTED}`
-    })
-    .replace(BEARER_VALUE, `Bearer ${REDACTED}`)
-    .replace(FLEXIBLE_CREDENTIAL, (match, key, separator) =>
-      match.includes('[REDACTED') ? match : `${key}${separator}${REDACTED}`
-    )
-
-  return truncate(redacted, maximum)
+  const scanLimit = Math.min(input.length, maximum + SCAN_LOOKAHEAD)
+  const redacted = scanRedactedPrefix(input.slice(0, scanLimit).normalize('NFKC'))
+  return scanLimit < input.length
+    ? appendTruncationMarker(redacted, maximum)
+    : truncate(redacted, maximum)
 }
 
 const redactValue = (

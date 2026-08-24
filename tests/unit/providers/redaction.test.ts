@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { performance } from 'node:perf_hooks'
 
 import {
   isSensitiveCredentialKey,
@@ -76,6 +77,48 @@ describe('redactString', () => {
     expect(result).not.toContain(secret)
     expect(result).toMatch(/TRUNCATED/)
   })
+
+  it.each([
+    ['clientSecretValue=leak-one', 'leak-one'],
+    ['databasePasswordValue=leak-two', 'leak-two'],
+    ['AuthorizationHeader="leak-three"', 'leak-three']
+  ])('redacts dynamically named sensitive labels in %s', (input, secret) => {
+    const result = redactString(input)
+
+    expect(result).toContain(REDACTED)
+    expect(result).not.toContain(secret)
+  })
+
+  it.each([
+    ['token="unterminated-secret', 'unterminated-secret'],
+    ['Authorization: "unterminated-auth', 'unterminated-auth']
+  ])('redacts a credential value after an unclosed quote in %s', (input, secret) => {
+    const result = redactString(input)
+
+    expect(result).toContain(REDACTED)
+    expect(result).not.toContain(secret)
+  })
+
+  it(
+    'bounds work for a 20 MB diagnostic when the visible result is capped',
+    () => {
+      const smallInput = `prefix token=value ${'x'.repeat(2 * 1024 * 1024)}`
+      const largeInput = `prefix token=value ${'x'.repeat(20 * 1024 * 1024)}`
+      const smallStartedAt = performance.now()
+      redactString(smallInput, { maxLength: 128 })
+      const smallDuration = performance.now() - smallStartedAt
+      const largeStartedAt = performance.now()
+
+      const result = redactString(largeInput, { maxLength: 128 })
+      const largeDuration = performance.now() - largeStartedAt
+
+      expect(result.length).toBeLessThanOrEqual(128)
+      expect(result).toContain(REDACTED)
+      expect(result).toMatch(/TRUNCATED/)
+      expect(largeDuration).toBeLessThan(Math.max(100, smallDuration * 4))
+    },
+    2_000
+  )
 })
 
 describe('redactForLogging', () => {

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { z } from 'zod'
 
-import { AtomicJsonStore } from '../../../src/main/storage/atomic-json'
+import { AtomicJsonStore, parseSafeJson } from '../../../src/main/storage/atomic-json'
 import { createTempDirectory, removeTempDirectories } from '../../helpers/temp-directories'
 
 const valueSchema = z.strictObject({ value: z.string() })
@@ -109,6 +109,54 @@ describe('AtomicJsonStore', () => {
 
     await writeFile(join(root, 'oversized.json'), Buffer.alloc(65, 0x61))
     await expect(store.read('oversized.json', z.unknown())).rejects.toThrow(/large/i)
+  })
+
+  it('rejects proxies before any reflection trap runs', async () => {
+    let trapCalls = 0
+    const proxied = new Proxy(
+      { value: 'hidden' },
+      {
+        getPrototypeOf: () => {
+          trapCalls += 1
+          throw new Error('proxy reflection executed')
+        },
+        ownKeys: () => {
+          trapCalls += 1
+          throw new Error('proxy reflection executed')
+        }
+      }
+    )
+
+    expect(() => parseSafeJson(valueSchema, proxied)).toThrow(/proxy/i)
+    expect(trapCalls).toBe(0)
+  })
+
+  it('safe-materializes the final schema output before returning or serializing it', async () => {
+    const root = await createTempDirectory('atomic-json-final-schema-output-')
+    const store = new AtomicJsonStore(root)
+    let getterCalls = 0
+    const accessorOutputSchema = z.string().transform(() => {
+      const output = Object.create(null) as Record<string, unknown>
+      Object.defineProperty(output, 'value', {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1
+          throw new Error('schema output getter executed')
+        }
+      })
+      return output
+    })
+
+    expect(() => parseSafeJson(accessorOutputSchema, 'input')).toThrow(/accessor/i)
+    await expect(store.write('accessor.json', accessorOutputSchema, 'input')).rejects.toThrow(
+      /accessor/i
+    )
+    expect(getterCalls).toBe(0)
+    expect(await readFile(join(root, 'accessor.json'), 'utf8').catch(() => null)).toBeNull()
+
+    await writeFile(join(root, 'read-accessor.json'), '"input"')
+    await expect(store.read('read-accessor.json', accessorOutputSchema)).rejects.toThrow(/accessor/i)
+    expect(getterCalls).toBe(0)
   })
 
   it('creates a shared first parent safely across store instances', async () => {

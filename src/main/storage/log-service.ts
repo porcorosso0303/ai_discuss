@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, realpath } from 'node:fs/promises'
+import { lstat, open } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 
 import { z } from 'zod'
@@ -11,14 +11,15 @@ import {
 } from '../providers/http/redaction'
 import {
   DirectoryIdentityGuard,
+  initializeGuardedDirectory,
   type FilesystemMutationHook
 } from './directory-identity'
+import { runKeyedTransaction } from './transaction-coordinator'
 
 const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
 const MAX_CONTEXT_DEPTH = 20
 const MAX_CONTEXT_NODES = 5_000
-const queues = new Map<string, Promise<void>>()
 
 const logLevelSchema = z.enum(['debug', 'info', 'warn', 'error'])
 const logRecordSchema = z.strictObject({
@@ -256,34 +257,13 @@ export class LogService {
   }
 
   private async resolveLogFile(fileName: string): Promise<string> {
-    await mkdir(this.root, { recursive: true, mode: 0o700 })
-    const rootInfo = await lstat(this.root)
-    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || (await realpath(this.root)) !== this.root) {
-      throw new TypeError('Log root must be a canonical non-symlink directory')
-    }
+    await initializeGuardedDirectory(this.root, { hook: this.filesystemHook })
     const logs = join(this.root, 'logs')
-    await mkdir(logs, { mode: 0o700 }).catch((error) => {
-      if (errorCode(error) !== 'EEXIST') throw error
-    })
-    const logsInfo = await lstat(logs)
-    if (!logsInfo.isDirectory() || logsInfo.isSymbolicLink()) {
-      throw new TypeError('Logs path must be a non-symlink directory')
-    }
+    await initializeGuardedDirectory(logs, { hook: this.filesystemHook })
     return join(logs, fileName)
   }
 
   private async serialized(file: string, operation: () => Promise<void>): Promise<void> {
-    const previous = queues.get(file) ?? Promise.resolve()
-    const run = previous.catch(() => undefined).then(operation)
-    const tail = run.then(
-      () => undefined,
-      () => undefined
-    )
-    queues.set(file, tail)
-    try {
-      await run
-    } finally {
-      if (queues.get(file) === tail) queues.delete(file)
-    }
+    await runKeyedTransaction(file, 'log-file', operation)
   }
 }

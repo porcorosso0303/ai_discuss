@@ -114,6 +114,20 @@ describe('renderDebateMarkdown', () => {
     expect(markdown.split(/\r?\n/)).not.toContain('## 伪造结果')
     expect(markdown.split(/\r?\n/)).not.toContain('# 伪造标题')
   })
+
+  it('escapes non-layout C0 controls and BOM in all public Markdown text', () => {
+    const session = completedSession()
+    session.setup.topic = 'topic\u0000\u0007\ufeffend'
+    session.setup.roles[0]!.name = 'role\u0001name'
+    session.messages[0]!.speech = 'speech\u000b\u001fend'
+
+    const markdown = renderDebateMarkdown(session)
+
+    expect(markdown).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufeff]/u)
+    expect(markdown).toContain('\\u0000')
+    expect(markdown).toContain('\\uFEFF')
+    expect(markdown).toContain('\\u000B')
+  })
 })
 
 describe('MarkdownExporter', () => {
@@ -127,6 +141,30 @@ describe('MarkdownExporter', () => {
     expect(await exporter.export(completedSession())).toEqual({ cancelled: true })
     expect(showSaveDialog).toHaveBeenCalledOnce()
     expect(await readFile(join(root, 'unused.md'), 'utf8').catch(() => null)).toBeNull()
+  })
+
+  it('strictly materializes and validates the save-dialog result at runtime', async () => {
+    let trapCalls = 0
+    const proxyResult = new Proxy(
+      { canceled: true },
+      {
+        getPrototypeOf: () => {
+          trapCalls += 1
+          throw new Error('dialog proxy reflection executed')
+        }
+      }
+    )
+    const proxyExporter = new MarkdownExporter({
+      showSaveDialog: async () => proxyResult
+    })
+
+    await expect(proxyExporter.export(completedSession())).rejects.toThrow(/proxy/i)
+    expect(trapCalls).toBe(0)
+
+    const extraFieldExporter = new MarkdownExporter({
+      showSaveDialog: async () => ({ canceled: true, unexpected: 'unsafe' }) as never
+    })
+    await expect(extraFieldExporter.export(completedSession())).rejects.toThrow()
   })
 
   it('sanitizes topic and session id before proposing a Windows file name', async () => {

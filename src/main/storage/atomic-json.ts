@@ -9,12 +9,14 @@ import {
 } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { types as utilTypes } from 'node:util'
 
 import type { ZodType } from 'zod'
 
 import { isSensitiveCredentialKey } from '../providers/http/redaction'
 import {
   DirectoryIdentityGuard,
+  initializeGuardedDirectory,
   type FilesystemMutationHook
 } from './directory-identity'
 import { runKeyedTransaction } from './transaction-coordinator'
@@ -63,6 +65,8 @@ const materializeJson = (
     throw new TypeError(`Unsupported JSON value: ${typeof value}`)
   }
 
+  if (utilTypes.isProxy(value)) throw new TypeError('Proxy JSON values are not supported')
+
   if (state.ancestors.has(value)) throw new TypeError('Circular JSON values are not supported')
   state.ancestors.add(value)
   try {
@@ -110,7 +114,9 @@ export const parseSafeJson = <T>(
 ): T => {
   const maxDepth = positiveSafeInteger(options.maxDepth ?? DEFAULT_MAX_DEPTH, 'maxDepth')
   const maxNodes = positiveSafeInteger(options.maxNodes ?? DEFAULT_MAX_NODES, 'maxNodes')
-  return schema.parse(toSafeJson(value, maxDepth, maxNodes))
+  const input = toSafeJson(value, maxDepth, maxNodes)
+  const parsed = schema.parse(input)
+  return toSafeJson(parsed, maxDepth, maxNodes) as T
 }
 
 const isInside = (root: string, candidate: string): boolean => {
@@ -179,7 +185,7 @@ export class AtomicJsonStore {
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
       const decoded = JSON.parse(text) as unknown
       const safe = toSafeJson(decoded, this.maxDepth, this.maxNodes)
-      return schema.parse(safe)
+      return parseSafeJson(schema, safe, { maxDepth: this.maxDepth, maxNodes: this.maxNodes })
     } catch (error) {
       if (isMissing(error)) return null
       throw error
@@ -200,7 +206,8 @@ export class AtomicJsonStore {
       const parsed = schema.parse(input)
       const safeParsed = toSafeJson(parsed, this.maxDepth, this.maxNodes)
       const validated = schema.parse(safeParsed)
-      const bytes = Buffer.from(`${JSON.stringify(validated)}\n`, 'utf8')
+      const finalValue = toSafeJson(validated, this.maxDepth, this.maxNodes) as T
+      const bytes = Buffer.from(`${JSON.stringify(finalValue)}\n`, 'utf8')
       if (bytes.byteLength > this.maxBytes) throw new RangeError('JSON output is too large')
 
       const directory = dirname(target)
@@ -224,7 +231,7 @@ export class AtomicJsonStore {
         await guard.before('before-directory-open', directory)
         await syncDirectoryBestEffort(directory)
         await guard.after()
-        return structuredClone(validated)
+        return structuredClone(finalValue)
       } catch (error) {
         await handle?.close().catch(() => undefined)
         if (await guard.cleanupIfAnchored()) {
@@ -291,27 +298,7 @@ export class AtomicJsonStore {
     const target = resolve(this.root, relativePath)
     if (!isInside(this.root, target)) throw new TypeError('JSON path escapes its root')
 
-    try {
-      await lstat(this.root)
-    } catch (error) {
-      if (!isMissing(error)) throw error
-      const rootParent = dirname(this.root)
-      const parentGuard = await DirectoryIdentityGuard.capture(rootParent, {
-        hook: this.filesystemHook
-      })
-      await parentGuard.before('before-mkdir', this.root)
-      await mkdir(this.root, { mode: 0o700 }).catch((mkdirError) => {
-        if (
-          typeof mkdirError !== 'object' ||
-          mkdirError === null ||
-          !('code' in mkdirError) ||
-          mkdirError.code !== 'EEXIST'
-        ) {
-          throw mkdirError
-        }
-      })
-      await parentGuard.after()
-    }
+    await initializeGuardedDirectory(this.root, { hook: this.filesystemHook })
     const rootInfo = await lstat(this.root)
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
       throw new TypeError('Atomic JSON root must be a non-symlink directory')
