@@ -15,7 +15,7 @@ const trustedDevelopmentHosts = new Set(['localhost', '127.0.0.1', '[::1]'])
 const trustedDevelopmentProtocols = new Set(['http:', 'https:'])
 const trustedDevelopmentPorts = new Set(['5173'])
 
-function getTrustedDevelopmentUrl(rendererUrl: string | undefined): string | undefined {
+export function getTrustedDevelopmentUrl(rendererUrl: string | undefined): string | undefined {
   if (!rendererUrl) {
     return undefined
   }

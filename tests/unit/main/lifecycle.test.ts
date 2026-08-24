@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { startApplication } from '../../../src/main/lifecycle'
 
-type AppEvent = 'activate' | 'window-all-closed'
+type AppEvent = 'activate' | 'window-all-closed' | 'before-quit'
 
 function createLifecycleHarness() {
   const listeners = new Map<AppEvent, () => void>()
@@ -19,7 +19,11 @@ function createLifecycleHarness() {
   const onWindowAllClosed = vi.fn((listener: () => void) => {
     listeners.set('window-all-closed', listener)
   })
+  const onBeforeQuit = vi.fn((listener: (event: { preventDefault(): void }) => void) => {
+    listeners.set('before-quit', listener as () => void)
+  })
   const registerIpcHandlers = vi.fn()
+  const disposeApplication = vi.fn().mockResolvedValue(undefined)
 
   return {
     app,
@@ -28,8 +32,10 @@ function createLifecycleHarness() {
     listeners,
     logger,
     onActivate,
+    onBeforeQuit,
     onWindowAllClosed,
-    registerIpcHandlers
+    registerIpcHandlers,
+    disposeApplication
   }
 }
 
@@ -51,6 +57,27 @@ describe('application lifecycle', () => {
     expect(harness.app.quit).toHaveBeenCalledOnce()
   })
 
+  it('prevents quit once, awaits idempotent disposal, then quits without a loop', async () => {
+    const harness = createLifecycleHarness()
+    let release!: () => void
+    harness.disposeApplication.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve }))
+    await startApplication({ ...harness, platform: 'win32' })
+    const preventDefault = vi.fn()
+    const beforeQuit = harness.listeners.get('before-quit') as unknown as (event: { preventDefault(): void }) => void
+
+    beforeQuit({ preventDefault })
+    beforeQuit({ preventDefault })
+    expect(preventDefault).toHaveBeenCalledTimes(2)
+    expect(harness.disposeApplication).toHaveBeenCalledOnce()
+    expect(harness.app.quit).not.toHaveBeenCalled()
+    release()
+    await vi.waitFor(() => expect(harness.app.quit).toHaveBeenCalledOnce())
+
+    beforeQuit({ preventDefault })
+    expect(preventDefault).toHaveBeenCalledTimes(2)
+    expect(harness.app.quit).toHaveBeenCalledOnce()
+  })
+
   it('logs and quits when initial window creation fails without rejecting startup', async () => {
     const harness = createLifecycleHarness()
     const error = new Error('initial renderer load failed')
@@ -64,6 +91,7 @@ describe('application lifecycle', () => {
       'Failed to start the application',
       error
     )
+    expect(harness.disposeApplication).toHaveBeenCalledOnce()
     expect(harness.app.quit).toHaveBeenCalledOnce()
   })
 
