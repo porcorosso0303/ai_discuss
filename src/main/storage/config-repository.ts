@@ -6,6 +6,7 @@ import {
   type RoleConfig
 } from '../../shared/schemas'
 import { AtomicJsonStore, parseSafeJson } from './atomic-json'
+import { runKeyedTransaction } from './transaction-coordinator'
 
 const SETTINGS_PATH = 'config/settings.json'
 
@@ -26,9 +27,10 @@ const defaultSettings = (): PersistedSettings => ({ roles: [], maxTurns: 100 })
 
 export class ConfigRepository {
   private readonly store: AtomicJsonStore
-  private queue: Promise<void> = Promise.resolve()
+  private readonly root: string
 
   constructor(root: string) {
+    this.root = root
     this.store = new AtomicJsonStore(root)
   }
 
@@ -70,15 +72,10 @@ export class ConfigRepository {
   }
 
   private mutate<T>(operation: (settings: PersistedSettings) => Promise<T>): Promise<T> {
-    const run = this.queue.catch(() => undefined).then(async () => {
+    return runKeyedTransaction(this.root, 'config-repository', async () => {
       const settings =
         (await this.store.read(SETTINGS_PATH, persistedSettingsSchema)) ?? defaultSettings()
       return operation(settings)
     })
-    this.queue = run.then(
-      () => undefined,
-      () => undefined
-    )
-    return run
   }
 }

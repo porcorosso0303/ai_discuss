@@ -1,4 +1,4 @@
-import { readFile, symlink } from 'node:fs/promises'
+import { mkdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -65,10 +65,25 @@ describe('renderDebateMarkdown', () => {
     expect(markdown).not.toContain('raw-auth')
     expect(markdown).not.toContain('raw-token')
     expect(markdown).not.toContain('rawPayload')
-    expect(markdown).not.toContain('raw-speech-secret')
+    expect(markdown).toContain('client_secret=raw-speech-secret')
     expect(
       markdown.split('\n').filter((line) => line.trimEnd() === '# 这不是导出标题')
     ).toHaveLength(1)
+  })
+
+  it('preserves public debate text that resembles log labels', () => {
+    const session = completedSession()
+    session.setup.topic = 'token: democracy; authorization: philosophical; passwordless'
+    session.setup.roles[0]!.personaOrStance = 'private key: a metaphor, not metadata'
+    session.messages[0]!.speech = 'ＡＰＩ ＫＥＹ: rhetoric is part of this speech'
+
+    const markdown = renderDebateMarkdown(session)
+
+    expect(markdown).toContain(session.setup.topic)
+    expect(markdown).toContain(session.setup.roles[0]!.personaOrStance)
+    expect(markdown).toContain(session.messages[0]!.speech)
+    expect(markdown).not.toContain('private-chain')
+    expect(markdown).not.toContain('reasoningTokens')
   })
 
   it('strictly validates input and does not execute nested getters', () => {
@@ -140,6 +155,45 @@ describe('MarkdownExporter', () => {
       fileName: '辩论记录.md'
     })
     expect(await readFile(filePath, 'utf8')).toContain('人工智能会改善教育吗？')
+  })
+
+  it('atomically replaces an existing regular Markdown file', async () => {
+    const root = await createTempDirectory('markdown-overwrite-')
+    const filePath = join(root, 'existing.md')
+    await writeFile(filePath, 'old content')
+    const exporter = new MarkdownExporter({
+      showSaveDialog: async () => ({ canceled: false, filePath })
+    })
+
+    await exporter.export(completedSession())
+
+    expect(await readFile(filePath, 'utf8')).toContain('AI 辩论记录')
+    expect(await readFile(filePath, 'utf8')).not.toContain('old content')
+  })
+
+  it('fails closed when the selected parent is replaced before temp creation', async () => {
+    const root = await createTempDirectory('markdown-parent-swap-')
+    const outside = await createTempDirectory('markdown-parent-swap-outside-')
+    const selectedParent = join(root, 'selected')
+    await mkdir(selectedParent)
+    const filePath = join(selectedParent, 'debate.md')
+    let swapped = false
+    const exporter = new MarkdownExporter(
+      { showSaveDialog: async () => ({ canceled: false, filePath }) },
+      {
+        filesystemHook: async (stage) => {
+          if (stage !== 'before-temp-open' || swapped) return
+          swapped = true
+          await rename(selectedParent, join(root, 'selected-original'))
+          await symlink(outside, selectedParent, 'dir')
+        }
+      }
+    )
+
+    await expect(exporter.export(completedSession())).rejects.toThrow(
+      /directory|identity|symlink/i
+    )
+    expect(await readFile(join(outside, 'debate.md'), 'utf8').catch(() => null)).toBeNull()
   })
 
   it('rejects a symlink overwrite target', async () => {

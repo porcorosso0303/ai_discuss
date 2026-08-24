@@ -61,4 +61,25 @@ describe('ConfigRepository', () => {
 
     expect(await repository.listRoles()).toEqual([openAIRole, kimiRole])
   })
+
+  it('serializes read-modify-write operations across repository instances', async () => {
+    const root = await createTempDirectory('config-repository-cross-instance-')
+    const first = new ConfigRepository(root)
+    const second = new ConfigRepository(root)
+
+    await Promise.all([first.saveRole(openAIRole), second.saveRole(kimiRole)])
+
+    expect(await new ConfigRepository(root).listRoles()).toEqual([openAIRole, kimiRole])
+  })
+
+  it('recovers its shared transaction queue after a rejected operation', async () => {
+    const root = await createTempDirectory('config-repository-rejection-')
+    const first = new ConfigRepository(root)
+    const second = new ConfigRepository(root)
+
+    await expect(first.saveRole({ ...openAIRole, model: '' })).rejects.toThrow()
+    await second.saveRole(kimiRole)
+
+    expect(await first.listRoles()).toEqual([kimiRole])
+  })
 })

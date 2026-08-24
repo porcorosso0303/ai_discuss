@@ -74,6 +74,26 @@ describe('LogService', () => {
     expect(() => JSON.parse(record.message)).not.toThrow()
   })
 
+  it('redacts unicode credential labels in object keys and message text', async () => {
+    const root = await createTempDirectory('log-service-unicode-redact-')
+    const service = new LogService(root, {
+      clock: () => new Date('2026-08-16T12:34:56.000Z')
+    })
+
+    await service.info('ＡＰＩ ＫＥＹ: visible-string-secret', {
+      deep: [{ 'client\u200b secret': 'visible-object-secret' }]
+    })
+
+    const text = await readFile(join(root, 'logs/app-2026-08-16.log'), 'utf8')
+    expect(text).not.toContain('visible-string-secret')
+    expect(text).not.toContain('visible-object-secret')
+    expect(text).toContain('[REDACTED]')
+    const record = JSON.parse(text) as {
+      context: { deep: Array<Record<string, unknown>> }
+    }
+    expect(record.context.deep[0]?.['client\u200b secret']).toBe('[REDACTED]')
+  })
+
   it('schema-validates the structured level before writing', async () => {
     const root = await createTempDirectory('log-service-schema-')
     const service = new LogService(root)

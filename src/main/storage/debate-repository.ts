@@ -9,6 +9,8 @@ import {
   type DebateSession
 } from '../../shared/schemas'
 import { AtomicJsonStore, parseSafeJson } from './atomic-json'
+import { DirectoryIdentityGuard } from './directory-identity'
+import { runKeyedTransaction } from './transaction-coordinator'
 
 const INDEX_PATH = 'debates/index.json'
 const MAX_RESULTS = 200
@@ -84,7 +86,6 @@ const isMissing = (error: unknown): boolean =>
 export class DebateRepository {
   private readonly root: string
   private readonly store: AtomicJsonStore
-  private queue: Promise<void> = Promise.resolve()
 
   constructor(root: string) {
     if (!isAbsolute(root)) throw new TypeError('Debate repository root must be absolute')
@@ -164,12 +165,7 @@ export class DebateRepository {
   }
 
   private async serialized<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.queue.catch(() => undefined).then(operation)
-    this.queue = run.then(
-      () => undefined,
-      () => undefined
-    )
-    return await run
+    return await runKeyedTransaction(this.root, 'debate-repository', operation)
   }
 
   private sessionPath(id: string): string {
@@ -189,7 +185,11 @@ export class DebateRepository {
       if (!info.isDirectory() || info.isSymbolicLink()) {
         throw new TypeError('Debates path must be a non-symlink directory')
       }
-      return (await readdir(directory))
+      const guard = await DirectoryIdentityGuard.capture(directory, { anchor: this.root })
+      await guard.before('before-directory-open', directory)
+      const entries = await readdir(directory)
+      await guard.after()
+      return entries
         .filter((name) => name !== 'index.json' && name.endsWith('.json'))
         .sort()
         .slice(0, MAX_SCANNED_SESSIONS)

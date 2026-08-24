@@ -98,6 +98,54 @@ describe('DebateRepository', () => {
     expect((await repository.get('session-1'))?.state).toBe('completed')
   })
 
+  it('keeps a terminal snapshot across concurrent repository instances', async () => {
+    const root = await createTempDirectory('debate-repository-cross-instance-')
+    const first = new DebateRepository(root)
+    const second = new DebateRepository(root)
+    const terminal = createSession({
+      state: 'completed',
+      terminationReason: 'agreed',
+      updatedAt: '2026-08-11T10:02:00.000Z'
+    })
+    const delayedRunning = createSession({
+      state: 'running',
+      updatedAt: '2026-08-11T10:03:00.000Z'
+    })
+
+    await Promise.all([first.saveSession(terminal), second.saveSession(delayedRunning)])
+
+    expect((await first.get('session-1'))?.state).toBe('completed')
+  })
+
+  it('orders delete, clear, and save across repository instances', async () => {
+    const root = await createTempDirectory('debate-repository-ordering-')
+    const first = new DebateRepository(root)
+    const second = new DebateRepository(root)
+    await first.saveSession(createSession())
+
+    const deletion = first.delete('session-1')
+    const saving = second.saveSession(createSession({ id: 'session-2' }))
+    const clearing = first.clear()
+    await Promise.all([deletion, saving, clearing])
+
+    expect(await second.list()).toEqual([])
+  })
+
+  it('deterministically keeps terminal state on equal timestamps', async () => {
+    const root = await createTempDirectory('debate-repository-equal-time-')
+    const first = new DebateRepository(root)
+    const second = new DebateRepository(root)
+    const updatedAt = '2026-08-11T10:02:00.000Z'
+    await Promise.all([
+      first.saveSession(
+        createSession({ state: 'completed', terminationReason: 'agreed', updatedAt })
+      ),
+      second.saveSession(createSession({ state: 'running', updatedAt }))
+    ])
+
+    expect((await first.get('session-1'))?.state).toBe('completed')
+  })
+
   it('rejects unsafe session ids and nested secret payloads before a file is created', async () => {
     const root = await createTempDirectory('debate-repository-security-')
     const repository = new DebateRepository(root)

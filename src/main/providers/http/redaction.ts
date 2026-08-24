@@ -27,7 +27,11 @@ const OTHER_CREDENTIAL = new RegExp(
 )
 const BEARER_VALUE = /\bbearer\s+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi
 
-const normalizeKey = (key: string): string => key.toLowerCase().replace(/[-_]/g, '')
+export const normalizeCredentialKey = (key: string): string =>
+  key
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{Separator}\p{Format}\p{Punctuation}]/gu, '')
 
 const SENSITIVE_KEYS = new Set([
   'authorization',
@@ -42,19 +46,70 @@ const SENSITIVE_KEYS = new Set([
   'sessiontoken'
 ])
 
-const isSensitiveKey = (key: string): boolean => {
-  const normalized = normalizeKey(key)
+export const isSensitiveCredentialKey = (key: string): boolean => {
+  const normalized = normalizeCredentialKey(key)
+  const words = key
+    .normalize('NFKC')
+    .replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, '$1 $2')
+    .replace(/[\p{Separator}\p{Format}\p{Punctuation}]+/gu, ' ')
+    .toLowerCase()
+    .trim()
+    .split(/\s+/u)
+    .filter(Boolean)
+  const hasWord = (word: string): boolean => words.includes(word)
+  const hasPair = (left: string, right: string): boolean =>
+    words.some((word, index) => word === left && words[index + 1] === right)
   return (
     SENSITIVE_KEYS.has(normalized) ||
-    normalized.includes('secret') ||
-    normalized.includes('credential') ||
-    normalized.includes('password') ||
-    normalized.includes('passphrase') ||
-    normalized.includes('privatekey') ||
-    normalized.includes('accesskey') ||
+    hasWord('authorization') ||
+    hasWord('secret') ||
+    hasWord('credential') ||
+    hasWord('password') ||
+    hasWord('passphrase') ||
+    hasWord('token') ||
+    hasPair('api', 'key') ||
+    hasPair('private', 'key') ||
+    hasPair('access', 'key') ||
+    normalized.endsWith('apikey') ||
+    normalized.endsWith('secret') ||
+    normalized.endsWith('credential') ||
+    normalized.endsWith('password') ||
+    normalized.endsWith('passphrase') ||
+    normalized.endsWith('privatekey') ||
+    normalized.endsWith('accesskey') ||
+    normalized.endsWith('authorization') ||
     normalized.endsWith('token')
   )
 }
+
+const FLEXIBLE_SEPARATOR = '[\\p{Separator}\\p{Format}\\p{Punctuation}]*'
+const FLEXIBLE_SENSITIVE_LABELS = [
+  'authorization',
+  'xapikey',
+  'apikey',
+  'accesstoken',
+  'refreshtoken',
+  'logintoken',
+  'codexlogintoken',
+  'idtoken',
+  'sessiontoken',
+  'clientsecret',
+  'privatekey',
+  'accesskey',
+  'password',
+  'passphrase',
+  'credential',
+  'secret',
+  'token'
+]
+  .sort((left, right) => right.length - left.length)
+  .map((label) => [...label].join(FLEXIBLE_SEPARATOR))
+  .join('|')
+
+const FLEXIBLE_CREDENTIAL = new RegExp(
+  `(?<![\\p{L}\\p{N}])(${FLEXIBLE_SENSITIVE_LABELS})(\\s*[:=]\\s*)(?:"(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;&"'\\\\}\\]]+)`,
+  'giu'
+)
 
 const maxLength = (value: number | undefined, fallback: number): number => {
   const resolved = value ?? fallback
@@ -77,6 +132,7 @@ export const redactString = (
 ): string => {
   const maximum = maxLength(options.maxLength, DEFAULT_MAX_STRING_LENGTH)
   const redacted = input
+    .normalize('NFKC')
     .replace(JSON_CREDENTIAL, (_match, quote, key, separator, quotedValue) => {
       const valueQuote = quotedValue[0]
       return `${quote}${key}${quote}${separator}${valueQuote}${REDACTED}${valueQuote}`
@@ -92,6 +148,9 @@ export const redactString = (
       return `${match.slice(0, keyLength)}${separator}${REDACTED}`
     })
     .replace(BEARER_VALUE, `Bearer ${REDACTED}`)
+    .replace(FLEXIBLE_CREDENTIAL, (match, key, separator) =>
+      match.includes('[REDACTED') ? match : `${key}${separator}${REDACTED}`
+    )
 
   return truncate(redacted, maximum)
 }
@@ -120,7 +179,7 @@ const redactValue = (
     if (typeof Headers !== 'undefined' && value instanceof Headers) {
       const headers: Record<string, unknown> = {}
       value.forEach((headerValue, key) => {
-        headers[key] = isSensitiveKey(key)
+        headers[key] = isSensitiveCredentialKey(key)
           ? REDACTED
           : redactString(headerValue, { maxLength: maximum })
       })
@@ -141,7 +200,7 @@ const redactValue = (
         result.cause = redactValue(value.cause, maximum, ancestors)
       }
       for (const [key, nested] of Object.entries(value)) {
-        result[key] = isSensitiveKey(key)
+        result[key] = isSensitiveCredentialKey(key)
           ? REDACTED
           : redactValue(nested, maximum, ancestors)
       }
@@ -154,7 +213,7 @@ const redactValue = (
 
     const result: Record<string, unknown> = {}
     for (const [key, nested] of Object.entries(value)) {
-      result[key] = isSensitiveKey(key)
+      result[key] = isSensitiveCredentialKey(key)
         ? REDACTED
         : redactValue(nested, maximum, ancestors)
     }

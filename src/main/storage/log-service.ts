@@ -4,7 +4,11 @@ import { isAbsolute, join, resolve } from 'node:path'
 
 import { z } from 'zod'
 
-import { redactForLogging, redactString } from '../providers/http/redaction'
+import {
+  normalizeCredentialKey,
+  redactForLogging,
+  redactString
+} from '../providers/http/redaction'
 
 const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -40,15 +44,13 @@ const positiveSafeInteger = (value: number, label: string): number => {
   return value
 }
 
-const normalizedKey = (key: string): string => key.toLowerCase().replace(/[-_]/g, '')
 const isForbiddenLogKey = (key: string): boolean => {
-  const normalized = normalizedKey(key)
+  const normalized = normalizeCredentialKey(key)
   return (
     normalized.includes('reasoning') ||
     normalized.includes('chainofthought') ||
     normalized.includes('rawpayload') ||
-    normalized.includes('rawproviderpayload') ||
-    normalized === 'authorization'
+    normalized.includes('rawproviderpayload')
   )
 }
 

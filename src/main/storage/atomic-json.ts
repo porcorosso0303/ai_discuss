@@ -12,40 +12,27 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 
 import type { ZodType } from 'zod'
 
-import { redactString } from '../providers/http/redaction'
+import { isSensitiveCredentialKey } from '../providers/http/redaction'
+import {
+  DirectoryIdentityGuard,
+  type FilesystemMutationHook
+} from './directory-identity'
+import { runKeyedTransaction } from './transaction-coordinator'
 
 const DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 const DEFAULT_MAX_DEPTH = 40
 const DEFAULT_MAX_NODES = 100_000
-const queues = new Map<string, Promise<void>>()
 
 export interface AtomicJsonStoreOptions {
   maxBytes?: number
   maxDepth?: number
   maxNodes?: number
+  filesystemHook?: FilesystemMutationHook
 }
 
 interface MaterializeState {
   readonly ancestors: WeakSet<object>
   nodes: number
-}
-
-const normalizedSensitiveKey = (key: string): string => key.toLowerCase().replace(/[-_]/g, '')
-
-const isSensitiveKey = (key: string): boolean => {
-  const normalized = normalizedSensitiveKey(key)
-  return (
-    normalized === 'authorization' ||
-    normalized.includes('apikey') ||
-    normalized.includes('secret') ||
-    normalized.includes('credential') ||
-    normalized.includes('password') ||
-    normalized.includes('passphrase') ||
-    normalized.includes('privatekey') ||
-    normalized.includes('accesskey') ||
-    normalized === 'token' ||
-    normalized.endsWith('token')
-  )
 }
 
 const positiveSafeInteger = (value: number, label: string): number => {
@@ -67,7 +54,7 @@ const materializeJson = (
   if (depth > maxDepth) throw new RangeError('JSON value is too deeply nested')
 
   if (value === null || typeof value === 'boolean') return value
-  if (typeof value === 'string') return redactString(value, { maxLength: 200_000 })
+  if (typeof value === 'string') return value
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError('JSON numbers must be finite')
     return value
@@ -101,7 +88,7 @@ const materializeJson = (
     for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
       if (!descriptor.enumerable) continue
       if (!('value' in descriptor)) throw new TypeError('JSON object accessors are not supported')
-      if (isSensitiveKey(key)) throw new TypeError(`Sensitive field is not allowed: ${key}`)
+      if (isSensitiveCredentialKey(key)) throw new TypeError('Sensitive field is not allowed')
       if (key === '__proto__' || key === 'prototype' || key === 'constructor') {
         throw new TypeError(`Unsafe JSON key is not allowed: ${key}`)
       }
@@ -154,6 +141,7 @@ export class AtomicJsonStore {
   private readonly maxBytes: number
   private readonly maxDepth: number
   private readonly maxNodes: number
+  private readonly filesystemHook?: FilesystemMutationHook
 
   constructor(root: string, options: AtomicJsonStoreOptions = {}) {
     if (!isAbsolute(root)) throw new TypeError('Atomic JSON root must be absolute')
@@ -161,21 +149,32 @@ export class AtomicJsonStore {
     this.maxBytes = positiveSafeInteger(options.maxBytes ?? DEFAULT_MAX_BYTES, 'maxBytes')
     this.maxDepth = positiveSafeInteger(options.maxDepth ?? DEFAULT_MAX_DEPTH, 'maxDepth')
     this.maxNodes = positiveSafeInteger(options.maxNodes ?? DEFAULT_MAX_NODES, 'maxNodes')
+    this.filesystemHook = options.filesystemHook
   }
 
   async read<T>(relativePath: string, schema: ZodType<T>): Promise<T | null> {
     const target = await this.resolveTarget(relativePath, false)
     let handle
     try {
+      const guard = await DirectoryIdentityGuard.capture(dirname(target), {
+        anchor: this.root,
+        hook: this.filesystemHook
+      })
       const pathInfo = await lstat(target)
       if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) {
         throw new TypeError('JSON target must be a regular non-symlink file')
       }
+      await guard.before('before-target-open', target)
       handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      await guard.after()
       const metadata = await handle.stat()
       if (!metadata.isFile()) throw new TypeError('JSON target must be a regular file')
+      if (metadata.dev !== pathInfo.dev || metadata.ino !== pathInfo.ino) {
+        throw new TypeError('JSON target identity changed before it was opened')
+      }
       if (metadata.size > this.maxBytes) throw new RangeError('JSON file is too large')
       const bytes = await handle.readFile()
+      await guard.after()
       if (bytes.byteLength > this.maxBytes) throw new RangeError('JSON file is too large')
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
       const decoded = JSON.parse(text) as unknown
@@ -192,6 +191,10 @@ export class AtomicJsonStore {
   async write<T>(relativePath: string, schema: ZodType<T>, value: unknown): Promise<T> {
     const target = await this.resolveTarget(relativePath, true)
     return this.serialized(target, async () => {
+      const guard = await DirectoryIdentityGuard.capture(dirname(target), {
+        anchor: this.root,
+        hook: this.filesystemHook
+      })
       await this.assertTargetIsRegularOrMissing(target)
       const input = toSafeJson(value, this.maxDepth, this.maxNodes)
       const parsed = schema.parse(input)
@@ -204,21 +207,34 @@ export class AtomicJsonStore {
       const temporary = resolve(directory, `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`)
       let handle
       try {
+        await guard.before('before-temp-open', temporary)
         handle = await open(
           temporary,
           constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
           0o600
         )
+        await guard.after()
         await handle.writeFile(bytes)
         await handle.sync()
         await handle.close()
         handle = undefined
+        await guard.before('before-rename', target)
         await rename(temporary, target)
+        await guard.after()
+        await guard.before('before-directory-open', directory)
         await syncDirectoryBestEffort(directory)
+        await guard.after()
         return structuredClone(validated)
       } catch (error) {
         await handle?.close().catch(() => undefined)
-        await unlink(temporary).catch(() => undefined)
+        if (await guard.cleanupIfAnchored()) {
+          await guard.before('before-unlink', temporary).catch(() => undefined)
+          const cleaned = await unlink(temporary).then(
+            () => true,
+            () => false
+          )
+          if (cleaned) await guard.after().catch(() => undefined)
+        }
         throw error
       }
     })
@@ -228,12 +244,20 @@ export class AtomicJsonStore {
     const target = await this.resolveTarget(relativePath, false)
     return this.serialized(target, async () => {
       try {
+        const guard = await DirectoryIdentityGuard.capture(dirname(target), {
+          anchor: this.root,
+          hook: this.filesystemHook
+        })
         const info = await lstat(target)
         if (!info.isFile() || info.isSymbolicLink()) {
           throw new TypeError('JSON target must be a regular non-symlink file')
         }
+        await guard.before('before-unlink', target)
         await unlink(target)
+        await guard.after()
+        await guard.before('before-directory-open', dirname(target))
         await syncDirectoryBestEffort(dirname(target))
+        await guard.after()
         return true
       } catch (error) {
         if (isMissing(error)) return false
@@ -243,23 +267,19 @@ export class AtomicJsonStore {
   }
 
   private async serialized<T>(target: string, operation: () => Promise<T>): Promise<T> {
-    const previous = queues.get(target) ?? Promise.resolve()
-    let release!: () => void
-    const current = new Promise<void>((resolveQueue) => {
-      release = resolveQueue
-    })
-    const queued = previous.catch(() => undefined).then(() => current)
-    queues.set(target, queued)
-    await previous.catch(() => undefined)
-    try {
-      return await operation()
-    } finally {
-      release()
-      if (queues.get(target) === queued) queues.delete(target)
-    }
+    return await runKeyedTransaction(this.root, `atomic-target:${target}`, operation)
   }
 
   private async resolveTarget(relativePath: string, createParents: boolean): Promise<string> {
+    return await runKeyedTransaction(this.root, 'atomic-directory-initialization', async () =>
+      await this.resolveTargetUncoordinated(relativePath, createParents)
+    )
+  }
+
+  private async resolveTargetUncoordinated(
+    relativePath: string,
+    createParents: boolean
+  ): Promise<string> {
     if (
       relativePath.length === 0 ||
       relativePath.includes('\\') ||
@@ -271,7 +291,27 @@ export class AtomicJsonStore {
     const target = resolve(this.root, relativePath)
     if (!isInside(this.root, target)) throw new TypeError('JSON path escapes its root')
 
-    await mkdir(this.root, { recursive: true, mode: 0o700 })
+    try {
+      await lstat(this.root)
+    } catch (error) {
+      if (!isMissing(error)) throw error
+      const rootParent = dirname(this.root)
+      const parentGuard = await DirectoryIdentityGuard.capture(rootParent, {
+        hook: this.filesystemHook
+      })
+      await parentGuard.before('before-mkdir', this.root)
+      await mkdir(this.root, { mode: 0o700 }).catch((mkdirError) => {
+        if (
+          typeof mkdirError !== 'object' ||
+          mkdirError === null ||
+          !('code' in mkdirError) ||
+          mkdirError.code !== 'EEXIST'
+        ) {
+          throw mkdirError
+        }
+      })
+      await parentGuard.after()
+    }
     const rootInfo = await lstat(this.root)
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
       throw new TypeError('Atomic JSON root must be a non-symlink directory')
@@ -292,7 +332,22 @@ export class AtomicJsonStore {
       } catch (error) {
         if (!isMissing(error)) throw error
         if (!createParents) return target
-        await mkdir(current, { mode: 0o700 })
+        const parentGuard = await DirectoryIdentityGuard.capture(dirname(current), {
+          anchor: this.root,
+          hook: this.filesystemHook
+        })
+        await parentGuard.before('before-mkdir', current)
+        await mkdir(current, { mode: 0o700 }).catch(async (mkdirError) => {
+          if (
+            typeof mkdirError !== 'object' ||
+            mkdirError === null ||
+            !('code' in mkdirError) ||
+            mkdirError.code !== 'EEXIST'
+          ) {
+            throw mkdirError
+          }
+        })
+        await parentGuard.after()
         const info = await lstat(current)
         if (!info.isDirectory() || info.isSymbolicLink()) {
           throw new TypeError('JSON directory creation was redirected')

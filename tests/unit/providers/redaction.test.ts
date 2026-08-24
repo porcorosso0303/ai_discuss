@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  isSensitiveCredentialKey,
   REDACTED,
   redactForLogging,
   redactString
@@ -78,6 +79,39 @@ describe('redactString', () => {
 })
 
 describe('redactForLogging', () => {
+  it('recognizes confusable credential keys without classifying ordinary public keys', () => {
+    for (const key of [
+      'ａｐｉ＿ｋｅｙ',
+      'API KEY',
+      'api-key',
+      'openai.api key',
+      'clientSecretValue',
+      'client\u200b secret',
+      'private key',
+      'access key',
+      'proxy authorization',
+      'database password',
+      'nested credential'
+    ]) {
+      expect(isSensitiveCredentialKey(key), key).toBe(true)
+    }
+    for (const key of ['passwordless', 'tokenize', 'secretary', 'monkey', 'publicKey']) {
+      expect(isSensitiveCredentialKey(key), key).toBe(false)
+    }
+  })
+
+  it('redacts unicode and separated credential labels in strings and nested structures', () => {
+    const result = redactForLogging({
+      'ａｐｉ＿ｋｅｙ': 'fullwidth-secret',
+      deep: [{ 'client\u200b secret': 'zero-width-secret' }],
+      message: 'ＡＰＩ ＫＥＹ: string-secret'
+    })
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain('fullwidth-secret')
+    expect(serialized).not.toContain('zero-width-secret')
+    expect(serialized).not.toContain('string-secret')
+    expect(serialized).toContain('[REDACTED]')
+  })
   it('deeply clones nested objects and arrays without mutating the input', () => {
     const input = {
       request: {

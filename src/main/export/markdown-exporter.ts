@@ -4,8 +4,11 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, resolve } from 'node:path'
 
 import { debateSessionSchema, type DebateSession, type RoleConfig } from '../../shared/schemas'
-import { redactString } from '../providers/http/redaction'
 import { parseSafeJson } from '../storage/atomic-json'
+import {
+  DirectoryIdentityGuard,
+  type FilesystemMutationHook
+} from '../storage/directory-identity'
 
 const CRLF = '\r\n'
 const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
@@ -25,6 +28,7 @@ export interface SaveDialogPort {
 
 export interface MarkdownExporterOptions {
   maxOutputBytes?: number
+  filesystemHook?: FilesystemMutationHook
 }
 
 export interface MarkdownExportResult {
@@ -35,7 +39,7 @@ export interface MarkdownExportResult {
 const providerLabel = (provider: RoleConfig['provider']): string =>
   ({ openai: 'OpenAI', kimi: 'Kimi', deepseek: 'DeepSeek' })[provider]
 
-const safePublicText = (value: string): string => redactString(value, { maxLength: 200_000 })
+const safePublicText = (value: string): string => value
 const safeInlineText = (value: string): string =>
   safePublicText(value)
     .replace(/[\r\n\t]+/g, ' ')
@@ -211,32 +215,50 @@ const validateSelectedPath = async (filePath: string): Promise<string> => {
   return target
 }
 
-const writeAtomicFile = async (target: string, content: string): Promise<void> => {
+const writeAtomicFile = async (
+  target: string,
+  content: string,
+  filesystemHook?: FilesystemMutationHook
+): Promise<void> => {
   const directory = dirname(target)
+  const guard = await DirectoryIdentityGuard.capture(directory, { hook: filesystemHook })
   const temporary = resolve(directory, `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`)
   let handle
   try {
+    await guard.before('before-temp-open', temporary)
     handle = await open(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
       0o600
     )
+    await guard.after()
     await handle.writeFile(content, 'utf8')
     await handle.sync()
     await handle.close()
     handle = undefined
+    await guard.before('before-rename', target)
     await rename(temporary, target)
+    await guard.after()
     if (process.platform !== 'win32') {
+      await guard.before('before-directory-open', directory)
       const directoryHandle = await open(directory, constants.O_RDONLY)
       try {
         await directoryHandle.sync()
       } finally {
         await directoryHandle.close()
       }
+      await guard.after()
     }
   } catch (error) {
     await handle?.close().catch(() => undefined)
-    await unlink(temporary).catch(() => undefined)
+    if (await guard.cleanupIfAnchored()) {
+      await guard.before('before-unlink', temporary).catch(() => undefined)
+      const cleaned = await unlink(temporary).then(
+        () => true,
+        () => false
+      )
+      if (cleaned) await guard.after().catch(() => undefined)
+    }
     throw error
   }
 }
@@ -258,7 +280,7 @@ export class MarkdownExporter {
     if (result.canceled) return { cancelled: true }
     if (!result.filePath) throw new TypeError('Save dialog returned no local file path')
     const target = await validateSelectedPath(result.filePath)
-    await writeAtomicFile(target, markdown)
+    await writeAtomicFile(target, markdown, this.options.filesystemHook)
     return { cancelled: false, fileName: basename(target) }
   }
 }
