@@ -1,7 +1,7 @@
 import { RoleCard } from '../components/RoleCard'
 import { useAppState } from '../state/app-state'
 
-export function ConfigurationPage(): React.JSX.Element {
+export function ConfigurationPage({ onContinue }: { onContinue?: () => void }): React.JSX.Element {
   const { canContinue, loadStatus, loadError, retryLoad } = useAppState()
   return (
     <section id="configuration" className="configuration-page" aria-labelledby="configuration-title">
@@ -10,7 +10,7 @@ export function ConfigurationPage(): React.JSX.Element {
       {loadStatus === 'loading' ? <p className="loading-status" role="status">正在加载配置…</p> : null}
       {loadError ? <div className="load-error"><p className="page-error" role="alert">{loadError}</p><button type="button" className="button secondary" onClick={retryLoad}>重试加载</button></div> : null}
       <div className="role-grid"><RoleCard roleId="role-a" /><RoleCard roleId="role-b" /></div>
-      <footer className="page-footer"><p>两位角色连接测试通过后，即可继续。</p><button type="button" className="button continue" disabled={!canContinue || loadStatus !== 'ready'}>进入辩论设置</button></footer>
+      <footer className="page-footer"><p>两位角色连接测试通过后，即可继续。</p><button type="button" className="button continue" disabled={!canContinue || loadStatus !== 'ready'} onClick={onContinue}>进入辩论设置</button></footer>
     </section>
   )
 }

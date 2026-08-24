@@ -1,0 +1,71 @@
+import { useState } from 'react'
+
+import type { DebateSetup, RoleConfig } from '../../../shared/domain'
+import { DebateControls } from '../components/DebateControls'
+import { DebateSetup as DebateSetupForm } from '../components/DebateSetup'
+import { ResultCard } from '../components/ResultCard'
+import { Timeline } from '../components/Timeline'
+import { useDebateEvents } from '../hooks/use-debate-events'
+
+const phaseLabels: Record<string, string> = {
+  starting: '正在启动', idle: '等待开始', validating: '正在校验', running: '辩论中', pausing: '正在暂停',
+  paused: '已暂停', completed: '已完成', stopped: '已停止', unresolved: '未决', refused: '模型拒绝', failed: '调用失败'
+}
+
+export function DebatePage({ roles, onBack }: { roles: [RoleConfig, RoleConfig]; onBack(): void }): React.JSX.Element {
+  const [state, dispatch] = useDebateEvents()
+  const [started, setStarted] = useState(false)
+  const [startBusy, setStartBusy] = useState(false)
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlError, setControlError] = useState<string>()
+
+  const requestStart = (setup: DebateSetup): void => {
+    setStartBusy(true)
+    dispatch({ type: 'begin', setup })
+    void window.aiDebates.debate.start({ setup }).then(({ session }) => {
+      dispatch({ type: 'session', session })
+    }).catch(() => {
+      dispatch({ type: 'start-error', message: '无法启动辩论，请重试' })
+    }).finally(() => setStartBusy(false))
+  }
+
+  const start = (setup: DebateSetup): void => {
+    if (startBusy || started) return
+    setStarted(true)
+    requestStart(setup)
+  }
+
+  const control = (action: 'pause' | 'resume' | 'stop' | 'retryCurrentTurn'): void => {
+    if (state.sessionId === undefined || controlBusy) return
+    if (action === 'stop') dispatch({ type: 'discard-drafts' })
+    setControlBusy(true)
+    setControlError(undefined)
+    void window.aiDebates.debate[action]({ sessionId: state.sessionId }).catch(() => {
+      setControlError('操作失败，请重试')
+    }).finally(() => setControlBusy(false))
+  }
+
+  const retry = (): void => {
+    if (state.sessionId !== undefined) control('retryCurrentTurn')
+    else if (state.setup !== undefined && !startBusy) requestStart(state.setup)
+  }
+
+  if (!started) return <DebateSetupForm roles={roles} busy={startBusy} onStart={start} onBack={onBack} />
+  const currentRole = roles.find(({ roleId }) => roleId === state.currentRoleId)
+  return <section className="debate-page live-debate-page" aria-labelledby="live-debate-title">
+    <header className="live-heading"><div><p className="eyebrow">第三步</p><h1 id="live-debate-title">{state.setup?.topic}</h1></div>
+      <DebateControls phase={state.phase} enabled={state.sessionId !== undefined}
+        canRetry={!startBusy && (state.sessionId !== undefined || state.setup !== undefined)}
+        retryLabel={state.sessionId === undefined ? '重新启动辩论' : '重试当前轮'} busy={controlBusy}
+        onPause={() => control('pause')} onResume={() => control('resume')} onStop={() => control('stop')}
+        onRetry={retry} /></header>
+    <div className="debate-status-band" role="status"><span className={`phase-badge phase-${state.phase}`}>{phaseLabels[state.phase]}</span>
+      <span>第 {state.currentTurn} / {state.setup?.maxTurns ?? 100} 轮</span>
+      <span>{currentRole ? `当前：${currentRole.name}` : '等待首位辩手'}</span></div>
+    {controlError || state.error ? <p className="page-error live-error" role="alert">{controlError ?? state.error}</p> : null}
+    {state.warnings.map((warning) => <p className="debate-warning" role="status" key={warning.id}>提示：{warning.message}</p>)}
+    {state.compressedRoles.length > 0 ? <p className="context-note">较早对话已压缩，以便继续辩论。</p> : null}
+    <Timeline roles={roles} messages={state.messages} drafts={state.drafts} revision={state.contentRevision} />
+    <ResultCard session={state.session} phase={state.phase} roles={roles} onBack={onBack} />
+  </section>
+}
