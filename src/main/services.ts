@@ -163,6 +163,11 @@ export class DesktopServices {
           response = await this.dependencies.credentials.delete(scope, this.shutdown.signal)
           break
         }
+        case IPC_CHANNELS.credentialsHasProviderSecret: {
+          const { scope } = ipcInvokeContracts[channel].request.parse(input)
+          response = { found: (await this.dependencies.credentials.get(scope, this.shutdown.signal)) !== undefined }
+          break
+        }
         case IPC_CHANNELS.openAIGetAuthStatus:
           response = this.loginPending
             ? { status: 'signing-in' }

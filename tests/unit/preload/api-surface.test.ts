@@ -57,6 +57,14 @@ describe('preload aiDebates API', () => {
 
     electron.invoke.mockResolvedValueOnce({ version: 'secret-shaped-invalid-response' })
     await expect(api.app.getVersion()).rejects.toThrow('桌面服务返回了无效数据')
+
+    electron.invoke.mockResolvedValueOnce({ found: true })
+    await expect(api.credentials.hasProviderSecret({
+      scope: { roleId: 'role-a', provider: 'deepseek', origin: 'https://api.deepseek.com' }
+    })).resolves.toEqual({ found: true })
+    expect(electron.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.credentialsHasProviderSecret, {
+      scope: { roleId: 'role-a', provider: 'deepseek', origin: 'https://api.deepseek.com' }
+    })
   })
 
   it('filters invalid event payloads and unsubscribes exactly once', async () => {

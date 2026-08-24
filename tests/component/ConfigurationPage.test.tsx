@@ -28,15 +28,23 @@ const capabilities: Record<'openai' | 'kimi' | 'deepseek', ProviderCapabilities>
     }]
   },
   deepseek: {
-    provider: 'deepseek', defaultModel: 'deepseek-dynamic', models: [{
-      id: 'deepseek-dynamic', reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
-      thinking: { default: true, keepSupported: false }, maxOutputTokens: 4096,
-      samplingParameters: [
-        { name: 'temperature', min: 0, max: 2, default: 1 },
-        { name: 'topP', min: 0, max: 1, default: 0.9 }
-      ],
-      structuredOutputModes: ['json-object']
-    }]
+    provider: 'deepseek', defaultModel: 'deepseek-dynamic', models: [
+      {
+        id: 'deepseek-dynamic', reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+        thinking: { default: true, keepSupported: false }, maxOutputTokens: 4096,
+        samplingParameters: [
+          { name: 'temperature', min: 0, max: 2, default: 1 },
+          { name: 'topP', min: 0, max: 1, default: 0.9 }
+        ],
+        structuredOutputModes: ['json-object']
+      },
+      {
+        id: 'deepseek-fast', reasoningEfforts: [], thinking: { default: false, keepSupported: false },
+        maxOutputTokens: 2048,
+        samplingParameters: [{ name: 'temperature', min: 0, max: 1, default: 0.4 }],
+        structuredOutputModes: ['json-object']
+      }
+    ]
   }
 }
 
@@ -51,7 +59,8 @@ function apiHarness() {
     },
     credentials: {
       setProviderSecret: vi.fn(async () => ({ stored: true })),
-      deleteProviderSecret: vi.fn()
+      deleteProviderSecret: vi.fn(async () => ({ deleted: true })),
+      hasProviderSecret: vi.fn(async () => ({ found: false }))
     },
     openAI: {
       getAuthStatus: vi.fn(async () => ({ status: 'signed-out' as const })),
@@ -109,6 +118,35 @@ describe('role configuration page', () => {
     await user.click(within(roleA).getByLabelText('思考模式'))
     expect(within(roleA).getByLabelText('temperature')).toBeInTheDocument()
     expect(within(roleA).getByLabelText('topP')).toBeInTheDocument()
+  })
+
+  it('normalizes every dependent field when the selected model changes', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    expect(within(card).getByLabelText('思考强度')).toHaveValue('high')
+
+    await user.selectOptions(within(card).getByLabelText('模型'), 'deepseek-fast')
+    expect(within(card).getByLabelText('思考模式')).not.toBeChecked()
+    expect(within(card).queryByLabelText('思考强度')).not.toBeInTheDocument()
+    expect(within(card).getByLabelText('最大输出 Token')).toHaveValue(2048)
+    await user.click(within(card).getByText('高级参数'))
+    expect(within(card).getByLabelText('temperature')).toHaveValue(0.4)
+    expect(within(card).queryByLabelText('topP')).not.toBeInTheDocument()
+  })
+
+  it('preserves the selected model when connection testing refreshes the same catalog', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.selectOptions(within(card).getByLabelText('模型'), 'deepseek-fast')
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    expect(await within(card).findByText('连接正常')).toBeInTheDocument()
+    expect(within(card).getByLabelText('模型')).toHaveValue('deepseek-fast')
   })
 
   it('clears an entered API key after storing it and never sends it in saved role config', async () => {
@@ -172,8 +210,11 @@ describe('role configuration page', () => {
   })
 
   it('keeps continue disabled until two valid roles pass connection tests', async () => {
+    const { api, emitAuth } = apiHarness()
+    ;(api.openAI.getAuthStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ status: 'signed-in' })
     const user = userEvent.setup()
     render(<App />)
+    emitAuth({ status: 'signed-in' })
     const continueButton = await screen.findByRole('button', { name: '进入辩论设置' })
     expect(continueButton).toBeDisabled()
 
@@ -182,10 +223,42 @@ describe('role configuration page', () => {
       await user.click(within(card).getByRole('button', { name: '获取模型' }))
       await user.click(within(card).getByRole('button', { name: '测试连接' }))
     }
-    expect(continueButton).toBeEnabled()
+    await waitFor(() => expect(continueButton).toBeEnabled())
 
     await user.type(within(screen.getByRole('region', { name: '角色 A 配置' })).getByLabelText('角色立场'), '新观点')
     expect(continueButton).toBeDisabled()
+  })
+
+  it('invalidates passed OpenAI roles when auth starts or becomes signed out', async () => {
+    const { api, emitAuth } = apiHarness()
+    ;(api.openAI.getAuthStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ status: 'signed-in' })
+    const user = userEvent.setup()
+    render(<App />)
+    emitAuth({ status: 'signed-in' })
+    const continueButton = await screen.findByRole('button', { name: '进入辩论设置' })
+    for (const label of ['角色 A 配置', '角色 B 配置']) {
+      const card = screen.getByRole('region', { name: label })
+      await user.click(within(card).getByRole('button', { name: '获取模型' }))
+      await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    }
+    expect(continueButton).toBeEnabled()
+    emitAuth({ status: 'signing-in' })
+    await waitFor(() => expect(continueButton).toBeDisabled())
+    expect(screen.getAllByText('未测试')).toHaveLength(2)
+  })
+
+  it('resets OpenAI connection state immediately on logout', async () => {
+    const { api, emitAuth } = apiHarness()
+    ;(api.openAI.getAuthStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ status: 'signed-in' })
+    const user = userEvent.setup()
+    render(<App />)
+    emitAuth({ status: 'signed-in' })
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    expect(within(card).getByText('连接正常')).toBeInTheDocument()
+    await user.click(within(card).getByRole('button', { name: '退出登录' }))
+    expect(within(card).getByText('未测试')).toBeInTheDocument()
   })
 
   it('invalidates a passed connection when a new secret is entered', async () => {
@@ -210,11 +283,47 @@ describe('role configuration page', () => {
     await user.clear(within(card).getByLabelText('Base URL'))
     await user.type(within(card).getByLabelText('Base URL'), 'http://remote.example')
     await user.click(within(card).getByRole('button', { name: '获取模型' }))
-    expect(await within(card).findByRole('alert')).toHaveTextContent('有效的 HTTPS Base URL')
+    const baseUrl = within(card).getByLabelText('Base URL')
+    expect(await within(card).findByText('请输入有效的 HTTPS Base URL')).toBeInTheDocument()
+    expect(baseUrl).toHaveAttribute('aria-invalid', 'true')
+    expect(baseUrl).toHaveAccessibleDescription('请输入有效的 HTTPS Base URL')
     expect(api.providers.discoverCapabilities).not.toHaveBeenCalled()
   })
 
-  it('loads saved roles without restoring secrets into the API key input', async () => {
+  it('places validation errors beside fields and clears them when edited', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    const name = within(card).getByLabelText('角色名称')
+    await user.clear(name)
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    expect(await within(card).findByText('角色名称不能为空')).toBeInTheDocument()
+    expect(name).toHaveAttribute('aria-invalid', 'true')
+    expect(name).toHaveAccessibleDescription('角色名称不能为空')
+    await user.type(name, '修正名称')
+    expect(within(card).queryByText('角色名称不能为空')).not.toBeInTheDocument()
+  })
+
+  it('validates output and sampling numbers against the selected capability', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.selectOptions(within(card).getByLabelText('模型'), 'deepseek-fast')
+    await user.click(within(card).getByText('高级参数'))
+    const maxTokens = within(card).getByLabelText('最大输出 Token')
+    const temperature = within(card).getByLabelText('temperature')
+    await user.clear(maxTokens); await user.type(maxTokens, '9999')
+    await user.clear(temperature); await user.type(temperature, '1.5')
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    expect(await within(card).findByText('不能超过模型上限 2048')).toBeInTheDocument()
+    expect(within(card).getByText('必须在 0 到 1 之间')).toBeInTheDocument()
+    expect(maxTokens).toHaveAttribute('max', '2048')
+    expect(temperature).toHaveAttribute('aria-invalid', 'true')
+  })
+
+  it('checks the canonical saved-role scope instead of assuming a credential exists', async () => {
     const { api } = apiHarness()
     ;(api.config.listRoles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ roles: [{
       roleId: 'role-a', provider: 'kimi', name: '已保存角色', personaOrStance: '',
@@ -224,7 +333,79 @@ describe('role configuration page', () => {
     const card = await screen.findByRole('region', { name: '角色 A 配置' })
     expect(await within(card).findByDisplayValue('已保存角色')).toBeInTheDocument()
     expect(within(card).getByLabelText('API Key')).toHaveValue('')
+    expect(within(card).getByLabelText('API Key')).toHaveAttribute('placeholder', '输入 API Key')
+    expect(api.credentials.hasProviderSecret).toHaveBeenCalledWith({
+      scope: { roleId: 'role-a', provider: 'kimi', origin: 'https://api.moonshot.cn' }
+    })
+  })
+
+  it('shows a saved credential only when the vault confirms its current scope', async () => {
+    const { api } = apiHarness()
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ roles: [{
+      roleId: 'role-a', provider: 'kimi', name: '已保存角色', personaOrStance: '',
+      model: 'moonshot-dynamic', baseUrl: 'https://api.moonshot.cn/v1/', maxCompletionTokens: 4096
+    }] })
+    ;(api.credentials.hasProviderSecret as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ found: true })
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    expect(await within(card).findByRole('button', { name: '删除已保存凭据' })).toBeInTheDocument()
     expect(within(card).getByLabelText('API Key')).toHaveAttribute('placeholder', expect.stringContaining('已保存凭据'))
+  })
+
+  it('best-effort deletes the old known credential scope when provider changes', async () => {
+    const { api } = apiHarness()
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ roles: [{
+      roleId: 'role-a', provider: 'kimi', name: '已保存角色', personaOrStance: '',
+      model: 'moonshot-dynamic', baseUrl: 'https://api.moonshot.cn/v1/', maxCompletionTokens: 4096
+    }] })
+    ;(api.credentials.hasProviderSecret as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ found: true })
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await within(card).findByRole('button', { name: '删除已保存凭据' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await waitFor(() => expect(api.credentials.deleteProviderSecret).toHaveBeenCalledWith({
+      scope: { roleId: 'role-a', provider: 'kimi', origin: 'https://api.moonshot.cn' }
+    }))
+    expect(within(card).getByLabelText('API Key')).toHaveAttribute('placeholder', '输入 API Key')
+  })
+
+  it('keeps a failed old-scope cleanup actionable without blocking provider editing', async () => {
+    const { api } = apiHarness()
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ roles: [{
+      roleId: 'role-a', provider: 'kimi', name: '已保存角色', personaOrStance: '',
+      model: 'moonshot-dynamic', baseUrl: 'https://api.moonshot.cn/v1/', maxCompletionTokens: 4096
+    }] })
+    ;(api.credentials.hasProviderSecret as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ found: true })
+    ;(api.credentials.deleteProviderSecret as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('vault busy'))
+      .mockResolvedValueOnce({ deleted: true })
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await within(card).findByRole('button', { name: '删除已保存凭据' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    expect(await within(card).findByRole('button', { name: '重试删除旧凭据' })).toBeInTheDocument()
+    expect(within(card).getByLabelText('服务商')).toHaveValue('deepseek')
+    await user.click(within(card).getByRole('button', { name: '重试删除旧凭据' }))
+    await waitFor(() => expect(within(card).queryByRole('button', { name: '重试删除旧凭据' })).not.toBeInTheDocument())
+    expect(api.credentials.deleteProviderSecret).toHaveBeenCalledTimes(2)
+  })
+
+  it('rolls back a newly stored credential when first discovery fails', async () => {
+    const { api } = apiHarness()
+    ;(api.providers.discoverCapabilities as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('offline'))
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.type(within(card).getByLabelText('API Key'), 'rollback-me')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await waitFor(() => expect(api.credentials.deleteProviderSecret).toHaveBeenCalledWith({
+      scope: { roleId: 'role-a', provider: 'deepseek', origin: 'https://api.deepseek.com' }
+    }))
+    expect(within(card).getByLabelText('API Key')).toHaveValue('')
+    expect(within(card).queryByRole('button', { name: '删除已保存凭据' })).not.toBeInTheDocument()
   })
 
   it('updates auth events and cleans every StrictMode subscription', async () => {
@@ -236,5 +417,63 @@ describe('role configuration page', () => {
     view.unmount()
     expect(unsubscribe).toHaveBeenCalledTimes(2)
     expect(api.openAI.onAuthChanged).toHaveBeenCalledTimes(2)
+  })
+
+  it('disables editing while deferred initialization protects the eventual loaded values', async () => {
+    const { api } = apiHarness()
+    let finishLoad!: (value: { roles: unknown[] }) => void
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => { finishLoad = resolve })
+    )
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    const name = within(card).getByLabelText('角色名称')
+    expect(name).toBeDisabled()
+    await user.type(name, '不应写入')
+    expect(name).toHaveValue('辩手 A')
+    finishLoad({ roles: [{
+      roleId: 'role-a', provider: 'openai', name: '服务端配置', personaOrStance: '',
+      model: 'gpt-dynamic', effort: 'high'
+    }] })
+    expect(await within(card).findByDisplayValue('服务端配置')).toBeEnabled()
+  })
+
+  it('shows a retry state after initialization failure and recovers on retry', async () => {
+    const { api } = apiHarness()
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('disk unavailable'))
+      .mockResolvedValueOnce({ roles: [] })
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法读取已保存的配置')
+    const roleA = screen.getByRole('region', { name: '角色 A 配置' })
+    expect(within(roleA).getByLabelText('角色名称')).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '重试加载' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: '重试加载' })).not.toBeInTheDocument())
+    expect(within(roleA).getByLabelText('角色名称')).toBeEnabled()
+  })
+
+  it('ignores stale StrictMode initialization and settles cleanup after unmount', async () => {
+    const { api, unsubscribe } = apiHarness()
+    let finishFirst!: (value: { roles: unknown[] }) => void
+    let finishSecond!: (value: { roles: unknown[] }) => void
+    ;(api.config.listRoles as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(new Promise((resolve) => { finishFirst = resolve }))
+      .mockReturnValueOnce(new Promise((resolve) => { finishSecond = resolve }))
+    const view = render(<StrictMode><App /></StrictMode>)
+    finishSecond({ roles: [{
+      roleId: 'role-a', provider: 'openai', name: '最新配置', personaOrStance: '',
+      model: 'gpt-dynamic', effort: 'high'
+    }] })
+    expect(await screen.findByDisplayValue('最新配置')).toBeInTheDocument()
+    finishFirst({ roles: [{
+      roleId: 'role-a', provider: 'openai', name: '过期配置', personaOrStance: '',
+      model: 'gpt-dynamic', effort: 'high'
+    }] })
+    await Promise.resolve()
+    expect(screen.queryByDisplayValue('过期配置')).not.toBeInTheDocument()
+    view.unmount()
+    expect(unsubscribe).toHaveBeenCalledTimes(2)
   })
 })

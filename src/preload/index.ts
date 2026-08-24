@@ -63,7 +63,9 @@ const credentialsApi = Object.freeze({
   setProviderSecret: (request: IpcRequestMap[typeof IPC_CHANNELS.credentialsSetProviderSecret]) =>
     invoke(IPC_CHANNELS.credentialsSetProviderSecret, request),
   deleteProviderSecret: (request: IpcRequestMap[typeof IPC_CHANNELS.credentialsDeleteProviderSecret]) =>
-    invoke(IPC_CHANNELS.credentialsDeleteProviderSecret, request)
+    invoke(IPC_CHANNELS.credentialsDeleteProviderSecret, request),
+  hasProviderSecret: (request: IpcRequestMap[typeof IPC_CHANNELS.credentialsHasProviderSecret]) =>
+    invoke(IPC_CHANNELS.credentialsHasProviderSecret, request)
 })
 const openAIApi = Object.freeze({
   getAuthStatus: () => invoke(IPC_CHANNELS.openAIGetAuthStatus, {}),

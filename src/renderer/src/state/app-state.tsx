@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import type {
+  CredentialScope,
   ModelCapability,
   Provider,
   ProviderCapabilities,
@@ -28,7 +29,10 @@ export interface RoleDraft {
   connection: ConnectionState
   busy: boolean
   error?: string
-  hasStoredSecret: boolean
+  fieldErrors: Record<string, string>
+  credentialScope?: CredentialScope
+  credentialPresent: boolean
+  orphanedCredentialScope?: CredentialScope
 }
 
 const providerDefaults: Record<Provider, Pick<RoleDraft, 'baseUrl' | 'maxOutputTokens'>> = {
@@ -49,7 +53,8 @@ function emptyDraft(roleId: RoleId): RoleDraft {
     sampling: {},
     connection: 'idle',
     busy: false,
-    hasStoredSecret: false
+    credentialPresent: false,
+    fieldErrors: {}
   }
 }
 
@@ -66,7 +71,7 @@ function fromRole(role: RoleConfig): RoleDraft {
     thinking: role.provider === 'openai' ? undefined : role.thinking,
     thinkingKeep: role.provider === 'kimi' ? role.thinkingKeep : undefined,
     effort: role.effort ?? 'none',
-    hasStoredSecret: role.provider !== 'openai'
+    credentialPresent: false
   }
 }
 
@@ -100,12 +105,66 @@ export function toRoleConfig(draft: RoleDraft): RoleConfig | undefined {
   return parsed.success ? parsed.data : undefined
 }
 
+function zodFieldErrors(draft: RoleDraft): Record<string, string> {
+  const common = {
+    roleId: draft.roleId, name: draft.name, personaOrStance: draft.personaOrStance, model: draft.model
+  }
+  const sampling = Object.keys(draft.sampling).length === 0 ? undefined : draft.sampling
+  const candidate = draft.provider === 'openai'
+    ? { ...common, provider: 'openai', effort: draft.effort }
+    : draft.provider === 'kimi'
+      ? { ...common, provider: 'kimi', baseUrl: draft.baseUrl, thinking: draft.thinking,
+          thinkingKeep: draft.thinkingKeep, ...(draft.effort === 'none' ? {} : { effort: draft.effort }),
+          maxCompletionTokens: draft.maxOutputTokens, ...(sampling === undefined ? {} : { sampling }) }
+      : { ...common, provider: 'deepseek', baseUrl: draft.baseUrl, thinking: draft.thinking,
+          ...(draft.effort === 'none' ? {} : { effort: draft.effort }), maxTokens: draft.maxOutputTokens,
+          ...(sampling === undefined ? {} : { sampling }) }
+  const result = roleConfigSchema.safeParse(candidate)
+  const errors: Record<string, string> = {}
+  if (!result.success) {
+    for (const issue of result.error.issues) {
+      let path = issue.path.join('.')
+      if (path === 'maxCompletionTokens' || path === 'maxTokens') path = 'maxOutputTokens'
+      if (path !== '' && errors[path] === undefined) {
+        errors[path] = path === 'name' ? '角色名称不能为空'
+          : path === 'model' ? '请先获取并选择模型'
+            : path === 'baseUrl' ? '请输入有效的 HTTPS Base URL' : issue.message
+      }
+    }
+  }
+  const capability = selectedModel(draft)
+  if (capability?.maxOutputTokens !== undefined && draft.maxOutputTokens > capability.maxOutputTokens) {
+    errors.maxOutputTokens = `不能超过模型上限 ${capability.maxOutputTokens}`
+  }
+  for (const parameter of capability?.samplingParameters ?? []) {
+    const value = draft.sampling[parameter.name]
+    if (value !== undefined && (value < parameter.min || value > parameter.max)) {
+      errors[`sampling.${parameter.name}`] = `必须在 ${parameter.min} 到 ${parameter.max} 之间`
+    }
+  }
+  return errors
+}
+
+function discoveryFieldErrors(draft: RoleDraft): Record<string, string> {
+  const errors: Record<string, string> = {}
+  if (draft.name.trim() === '') errors.name = '角色名称不能为空'
+  if (draft.name.length > 100) errors.name = '角色名称不能超过 100 个字符'
+  if (draft.personaOrStance.length > 4000) errors.personaOrStance = '角色立场不能超过 4000 个字符'
+  if (draft.provider !== 'openai' && !baseUrlSchema.safeParse(draft.baseUrl).success) {
+    errors.baseUrl = '请输入有效的 HTTPS Base URL'
+  }
+  return errors
+}
+
 interface AppStateValue {
   roles: Record<RoleId, RoleDraft>
   auth: { status: 'signed-out' | 'signing-in' | 'signed-in'; accountLabel?: string }
+  loadStatus: 'loading' | 'ready' | 'error'
   loadError?: string
+  retryLoad(): void
   updateRole(roleId: RoleId, change: Partial<RoleDraft>): void
   switchProvider(roleId: RoleId, provider: Provider): void
+  selectModel(roleId: RoleId, modelId: string): void
   discover(roleId: RoleId, secret?: string, onSecretStored?: () => void): Promise<void>
   test(roleId: RoleId, secret: string, onSecretStored?: () => void): Promise<void>
   deleteSecret(roleId: RoleId): Promise<void>
@@ -116,10 +175,13 @@ interface AppStateValue {
 
 const AppStateContext = createContext<AppStateValue | undefined>(undefined)
 
-function applyModel(draft: RoleDraft, capabilities: ProviderCapabilities): RoleDraft {
-  const modelId = capabilities.defaultModel ?? capabilities.models[0]?.id ?? ''
-  const model = capabilities.models.find(({ id }) => id === modelId)
-  const effort = model?.defaultReasoningEffort ?? model?.reasoningEfforts[0] ?? 'none'
+function normalizeModel(draft: RoleDraft, model: ModelCapability | undefined): RoleDraft {
+  const allowedEfforts = draft.provider === 'openai'
+    ? (model?.reasoningEfforts ?? [])
+    : (model?.reasoningEfforts ?? []).filter((effort) => effort === 'low' || effort === 'high' || effort === 'max')
+  const effort = model?.defaultReasoningEffort !== undefined && allowedEfforts.includes(model.defaultReasoningEffort)
+    ? model.defaultReasoningEffort
+    : (allowedEfforts[0] ?? 'none')
   const thinking = model?.thinking?.default
   const sampling = thinking === false
     ? Object.fromEntries((model?.samplingParameters ?? []).flatMap((parameter) =>
@@ -128,15 +190,23 @@ function applyModel(draft: RoleDraft, capabilities: ProviderCapabilities): RoleD
     : {}
   return {
     ...draft,
-    capabilities,
-    model: modelId,
+    model: model?.id ?? '',
     effort,
     thinking,
     thinkingKeep: model?.thinking?.keepSupported && thinking ? 'all' : undefined,
     maxOutputTokens: model?.maxOutputTokens ?? draft.maxOutputTokens,
     sampling,
     connection: 'idle',
-    error: capabilities.models.length === 0 ? '没有发现可用模型' : undefined
+    error: model === undefined ? '没有发现可用模型' : undefined
+  }
+}
+
+function applyCapabilities(draft: RoleDraft, capabilities: ProviderCapabilities): RoleDraft {
+  const preserved = capabilities.models.find(({ id }) => id === draft.model)
+  const modelId = preserved?.id ?? capabilities.defaultModel ?? capabilities.models[0]?.id ?? ''
+  return {
+    ...normalizeModel(draft, capabilities.models.find(({ id }) => id === modelId)),
+    capabilities
   }
 }
 
@@ -145,44 +215,125 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
     'role-a': emptyDraft('role-a'), 'role-b': emptyDraft('role-b')
   })
   const [auth, setAuth] = useState<AppStateValue['auth']>({ status: 'signed-out' })
+  const [loadStatus, setLoadStatus] = useState<AppStateValue['loadStatus']>('loading')
   const [loadError, setLoadError] = useState<string>()
+  const mounted = useRef(false)
+  const loadGeneration = useRef(0)
+  const authEventGeneration = useRef(0)
 
-  useEffect(() => {
-    let active = true
-    void Promise.all([window.aiDebates.config.listRoles(), window.aiDebates.openAI.getAuthStatus()])
-      .then(([result, status]) => {
-        if (!active) return
-        setRoles((current) => {
-          const next = { ...current }
-          for (const role of result.roles) next[role.roleId] = fromRole(role)
-          return next
-        })
-        setAuth(status)
-      })
-      .catch(() => { if (active) setLoadError('无法读取已保存的配置，请稍后重试') })
-    const unsubscribe = window.aiDebates.openAI.onAuthChanged((status) => {
-      if (active) setAuth(status)
-    })
-    return () => { active = false; unsubscribe() }
+  const applyAuth = useCallback((status: AppStateValue['auth']) => {
+    setAuth(status)
+    if (status.status !== 'signed-in') {
+      setRoles((current) => ({
+        'role-a': current['role-a'].provider === 'openai'
+          ? { ...current['role-a'], connection: 'idle' } : current['role-a'],
+        'role-b': current['role-b'].provider === 'openai'
+          ? { ...current['role-b'], connection: 'idle' } : current['role-b']
+      }))
+    }
   }, [])
 
+  const load = useCallback(async (): Promise<void> => {
+    const generation = ++loadGeneration.current
+    const authGeneration = authEventGeneration.current
+    setLoadStatus('loading')
+    setLoadError(undefined)
+    try {
+      const [result, status] = await Promise.all([
+        window.aiDebates.config.listRoles(), window.aiDebates.openAI.getAuthStatus()
+      ])
+      const loaded = await Promise.all(result.roles.map(async (role) => {
+        const draft = fromRole(role)
+        if (role.provider === 'openai') return draft
+        const scope: CredentialScope = {
+          roleId: role.roleId, provider: role.provider, origin: new URL(role.baseUrl).origin
+        }
+        const { found } = await window.aiDebates.credentials.hasProviderSecret({ scope })
+        return { ...draft, credentialScope: scope, credentialPresent: found }
+      }))
+      if (!mounted.current || generation !== loadGeneration.current) return
+      setRoles((current) => {
+        const next = { ...current }
+        for (const role of loaded) next[role.roleId] = role
+        return next
+      })
+      if (authGeneration === authEventGeneration.current) applyAuth(status)
+      setLoadStatus('ready')
+    } catch {
+      if (!mounted.current || generation !== loadGeneration.current) return
+      setLoadError('无法读取已保存的配置，请稍后重试')
+      setLoadStatus('error')
+    }
+  }, [applyAuth])
+
+  useEffect(() => {
+    mounted.current = true
+    void load()
+    const unsubscribe = window.aiDebates.openAI.onAuthChanged((status) => {
+      if (mounted.current) {
+        authEventGeneration.current += 1
+        applyAuth(status)
+      }
+    })
+    return () => {
+      mounted.current = false
+      loadGeneration.current += 1
+      unsubscribe()
+    }
+  }, [applyAuth, load])
+
   const updateRole = useCallback((roleId: RoleId, change: Partial<RoleDraft>) => {
-    setRoles((current) => ({
-      ...current,
-      [roleId]: { ...current[roleId], ...change, connection: 'idle', error: undefined }
-    }))
+    setRoles((current) => {
+      const previous = current[roleId]
+      const scopeChanged = change.baseUrl !== undefined && change.baseUrl !== previous.baseUrl
+      if (scopeChanged && previous.credentialPresent && previous.credentialScope !== undefined) {
+        const oldScope = previous.credentialScope
+        void window.aiDebates.credentials.deleteProviderSecret({ scope: oldScope }).catch(() => {
+          setRoles((latest) => ({ ...latest, [roleId]: {
+            ...latest[roleId], orphanedCredentialScope: oldScope, error: '旧凭据删除失败，请重试删除旧凭据'
+          } }))
+        })
+      }
+      return {
+        ...current,
+        [roleId]: {
+          ...previous, ...change, connection: 'idle', error: undefined,
+          fieldErrors: Object.fromEntries(Object.entries(previous.fieldErrors).filter(([path]) => {
+            if (change.sampling !== undefined && path.startsWith('sampling.')) return false
+            return !Object.keys(change).includes(path)
+          })),
+          ...(scopeChanged ? { credentialPresent: false, credentialScope: undefined } : {})
+        }
+      }
+    })
   }, [])
 
   const switchProvider = useCallback((roleId: RoleId, provider: Provider) => {
     setRoles((current) => {
       const previous = current[roleId]
+      if (previous.credentialPresent && previous.credentialScope !== undefined) {
+        const oldScope = previous.credentialScope
+        void window.aiDebates.credentials.deleteProviderSecret({ scope: oldScope }).catch(() => {
+          setRoles((latest) => ({ ...latest, [roleId]: {
+            ...latest[roleId], orphanedCredentialScope: oldScope, error: '旧凭据删除失败，请重试删除旧凭据'
+          } }))
+        })
+      }
       return {
         ...current,
         [roleId]: {
           ...emptyDraft(roleId), name: previous.name, personaOrStance: previous.personaOrStance,
-          provider, ...providerDefaults[provider]
+          provider, ...providerDefaults[provider], orphanedCredentialScope: previous.orphanedCredentialScope
         }
       }
+    })
+  }, [])
+
+  const selectModel = useCallback((roleId: RoleId, modelId: string) => {
+    setRoles((current) => {
+      const draft = current[roleId]
+      const model = draft.capabilities?.models.find(({ id }) => id === modelId)
+      return { ...current, [roleId]: { ...normalizeModel(draft, model), connection: 'idle', fieldErrors: {} } }
     })
   }, [])
 
@@ -191,35 +342,54 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
     const request = draft.provider === 'openai'
       ? { roleId, provider: 'openai' as const }
       : { roleId, provider: draft.provider, baseUrl: draft.baseUrl }
-    if (draft.provider !== 'openai' && !baseUrlSchema.safeParse(draft.baseUrl).success) {
-      setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], error: '请输入有效的 HTTPS Base URL' } }))
+    const fieldErrors = discoveryFieldErrors(draft)
+    if (Object.keys(fieldErrors).length > 0) {
+      setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], fieldErrors } }))
       return
     }
     setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], busy: true, error: undefined } }))
     let credentialStored = false
+    const hadCredential = draft.credentialPresent
+    let storedScope: CredentialScope | undefined
     try {
       if (draft.provider !== 'openai' && secret.trim() !== '') {
+        const scope: CredentialScope = { roleId, provider: draft.provider, origin: new URL(draft.baseUrl).origin }
+        storedScope = scope
         await window.aiDebates.credentials.setProviderSecret({
-          scope: { roleId, provider: draft.provider, origin: new URL(draft.baseUrl).origin },
+          scope,
           secret
         })
         credentialStored = true
         onSecretStored?.()
-        setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], hasStoredSecret: true } }))
+        setRoles((current) => ({ ...current, [roleId]: {
+          ...current[roleId], credentialScope: scope, credentialPresent: true
+        } }))
       }
       const found = await window.aiDebates.providers.discoverCapabilities(request)
       setRoles((current) => ({
         ...current,
         [roleId]: current[roleId].provider === found.provider
-          ? { ...applyModel(current[roleId], found), busy: false }
+          ? { ...applyCapabilities(current[roleId], found), busy: false }
           : current[roleId]
       }))
     } catch {
+      let rollbackFailed = false
+      if (credentialStored && !hadCredential && storedScope !== undefined) {
+        try {
+          await window.aiDebates.credentials.deleteProviderSecret({ scope: storedScope })
+        } catch {
+          rollbackFailed = true
+        }
+      }
       setRoles((current) => ({
         ...current,
         [roleId]: {
           ...current[roleId], busy: false,
-          error: credentialStored ? '凭据已安全保存，但获取模型失败' : '获取模型失败'
+          credentialPresent: rollbackFailed || hadCredential,
+          credentialScope: rollbackFailed || hadCredential ? (storedScope ?? current[roleId].credentialScope) : undefined,
+          error: rollbackFailed
+            ? '获取模型失败，且新凭据清理失败；请手动删除凭据'
+            : hadCredential && credentialStored ? '凭据已更新，但获取模型失败' : '获取模型失败'
         }
       }))
     }
@@ -227,18 +397,17 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
 
   const deleteSecret = useCallback(async (roleId: RoleId): Promise<void> => {
     const draft = roles[roleId]
-    if (draft.provider === 'openai') return
-    const parsed = baseUrlSchema.safeParse(draft.baseUrl)
-    if (!parsed.success) {
-      setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], error: '请输入有效的 HTTPS Base URL' } }))
-      return
-    }
+    const scope = draft.orphanedCredentialScope ?? draft.credentialScope
+    if (scope === undefined) return
     try {
       await window.aiDebates.credentials.deleteProviderSecret({
-        scope: { roleId, provider: draft.provider, origin: new URL(parsed.data).origin }
+        scope
       })
       setRoles((current) => ({ ...current, [roleId]: {
-        ...current[roleId], hasStoredSecret: false, connection: 'idle', error: undefined
+        ...current[roleId],
+        ...(current[roleId].orphanedCredentialScope !== undefined
+          ? { orphanedCredentialScope: undefined, error: undefined }
+          : { credentialPresent: false, credentialScope: undefined, connection: 'idle', error: undefined })
       } }))
     } catch {
       setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], error: '删除凭据失败' } }))
@@ -247,20 +416,25 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
 
   const test = useCallback(async (roleId: RoleId, secret: string, onSecretStored?: () => void): Promise<void> => {
     const draft = roles[roleId]
+    const fieldErrors = zodFieldErrors(draft)
     const role = toRoleConfig(draft)
-    if (role === undefined) {
-      setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], error: '请先完整填写并获取模型' } }))
+    if (role === undefined || Object.keys(fieldErrors).length > 0) {
+      setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], fieldErrors } }))
       return
     }
     setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], busy: true, connection: 'testing', error: undefined } }))
     try {
       await window.aiDebates.config.saveRole({ role })
       if (role.provider !== 'openai' && secret.trim() !== '') {
+        const scope: CredentialScope = { roleId, provider: role.provider, origin: new URL(role.baseUrl).origin }
         await window.aiDebates.credentials.setProviderSecret({
-          scope: { roleId, provider: role.provider, origin: new URL(role.baseUrl).origin },
+          scope,
           secret
         })
         onSecretStored?.()
+        setRoles((current) => ({ ...current, [roleId]: {
+          ...current[roleId], credentialScope: scope, credentialPresent: true
+        } }))
       }
       const request = role.provider === 'openai'
         ? { roleId, provider: 'openai' as const }
@@ -269,9 +443,9 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
       setRoles((current) => ({
         ...current,
         [roleId]: {
-          ...(result.capabilities === undefined ? current[roleId] : applyModel(current[roleId], result.capabilities)),
+          ...(result.capabilities === undefined ? current[roleId] : applyCapabilities(current[roleId], result.capabilities)),
           busy: false, connection: result.ok ? 'passed' : 'failed',
-          hasStoredSecret: current[roleId].hasStoredSecret || secret.trim() !== '',
+          credentialPresent: current[roleId].credentialPresent || secret.trim() !== '',
           error: result.ok ? undefined : (result.message ?? '连接测试失败')
         }
       }))
@@ -281,19 +455,22 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
   }, [roles])
 
   const startLogin = useCallback(async () => {
-    setAuth({ status: 'signing-in' })
-    try { await window.aiDebates.openAI.startLogin() } catch { setAuth({ status: 'signed-out' }) }
-  }, [])
+    applyAuth({ status: 'signing-in' })
+    try { await window.aiDebates.openAI.startLogin() } catch { applyAuth({ status: 'signed-out' }) }
+  }, [applyAuth])
   const logout = useCallback(async () => {
-    try { await window.aiDebates.openAI.logout(); setAuth({ status: 'signed-out' }) } catch { /* status event remains authoritative */ }
-  }, [])
+    applyAuth({ status: 'signed-out' })
+    try { await window.aiDebates.openAI.logout() } catch { /* status event remains authoritative */ }
+  }, [applyAuth])
 
   const canContinue = (['role-a', 'role-b'] as const).every((id) =>
-    roles[id].connection === 'passed' && toRoleConfig(roles[id]) !== undefined
+    roles[id].connection === 'passed' && toRoleConfig(roles[id]) !== undefined &&
+      (roles[id].provider !== 'openai' || auth.status === 'signed-in')
   )
   const value = useMemo(() => ({
-    roles, auth, loadError, updateRole, switchProvider, discover, test, deleteSecret, startLogin, logout, canContinue
-  }), [roles, auth, loadError, updateRole, switchProvider, discover, test, deleteSecret, startLogin, logout, canContinue])
+    roles, auth, loadStatus, loadError, retryLoad: () => { void load() }, updateRole, switchProvider,
+    selectModel, discover, test, deleteSecret, startLogin, logout, canContinue
+  }), [roles, auth, loadStatus, loadError, load, updateRole, switchProvider, selectModel, discover, test, deleteSecret, startLogin, logout, canContinue])
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>
 }
 

@@ -143,6 +143,14 @@ describe('desktop services', () => {
     expect(h.config.listRoles).not.toHaveBeenCalled()
   })
 
+  it('reports credential existence without returning the secret', async () => {
+    const h = harness()
+    const services = new DesktopServices(h.dependencies)
+    const scope = { roleId: 'role-b' as const, provider: 'kimi' as const, origin: 'https://api.moonshot.cn' }
+    await expect(services.invoke(IPC_CHANNELS.credentialsHasProviderSecret, { scope })).resolves.toEqual({ found: true })
+    expect(h.credentials.get).toHaveBeenCalledWith(scope, expect.any(AbortSignal))
+  })
+
   it('requires an exact provider/origin match for connection tests', async () => {
     const h = harness()
     const services = new DesktopServices(h.dependencies)

@@ -21,6 +21,7 @@ export const IPC_CHANNELS = {
   configDeleteRole: 'config:delete-role',
   credentialsSetProviderSecret: 'credentials:set-provider-secret',
   credentialsDeleteProviderSecret: 'credentials:delete-provider-secret',
+  credentialsHasProviderSecret: 'credentials:has-provider-secret',
   openAIGetAuthStatus: 'openai:get-auth-status',
   openAIStartLogin: 'openai:start-login',
   openAILogout: 'openai:logout',
@@ -99,6 +100,10 @@ const ipcSchemas = {
   credentialsDeleteProviderSecret: {
     request: z.strictObject({ scope: credentialScopeSchema }),
     response: z.strictObject({ deleted: z.boolean() })
+  },
+  credentialsHasProviderSecret: {
+    request: z.strictObject({ scope: credentialScopeSchema }),
+    response: z.strictObject({ found: z.boolean() })
   },
   openAIGetAuthStatus: {
     request: emptyRequestSchema,
@@ -179,6 +184,7 @@ export const ipcInvokeContracts = {
   [IPC_CHANNELS.configDeleteRole]: ipcSchemas.configDeleteRole,
   [IPC_CHANNELS.credentialsSetProviderSecret]: ipcSchemas.credentialsSetProviderSecret,
   [IPC_CHANNELS.credentialsDeleteProviderSecret]: ipcSchemas.credentialsDeleteProviderSecret,
+  [IPC_CHANNELS.credentialsHasProviderSecret]: ipcSchemas.credentialsHasProviderSecret,
   [IPC_CHANNELS.openAIGetAuthStatus]: ipcSchemas.openAIGetAuthStatus,
   [IPC_CHANNELS.openAIStartLogin]: ipcSchemas.openAIStartLogin,
   [IPC_CHANNELS.openAILogout]: ipcSchemas.openAILogout,
