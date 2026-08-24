@@ -118,18 +118,40 @@ interface ScannedValue {
   nextIndex: number
 }
 
+const startsWithRedactionMarker = (value: string, start: number): boolean =>
+  value.slice(start, start + REDACTED.length).toUpperCase() === REDACTED
+
+const isUnquotedValueDelimiter = (
+  character: string | undefined,
+  consumeSpaces: boolean
+): boolean =>
+  character === undefined ||
+  character === '\r' ||
+  character === '\n' ||
+  character === ',' ||
+  character === ';' ||
+  character === '&' ||
+  character === '}' ||
+  character === ']' ||
+  (!consumeSpaces && WHITESPACE.test(character))
+
 const scanCredentialValue = (
   value: string,
   start: number,
   consumeSpaces: boolean
 ): ScannedValue => {
   if (start >= value.length) return { replacement: REDACTED, nextIndex: start }
-  if (value.slice(start, start + REDACTED.length).toUpperCase() === REDACTED) {
-    return { replacement: REDACTED, nextIndex: start + REDACTED.length }
-  }
 
   const quote = value[start]
   if (quote === '"' || quote === "'") {
+    const markerStart = start + 1
+    const markerEnd = markerStart + REDACTED.length
+    if (startsWithRedactionMarker(value, markerStart) && value[markerEnd] === quote) {
+      return {
+        replacement: `${quote}${REDACTED}${quote}`,
+        nextIndex: markerEnd + 1
+      }
+    }
     let index = start + 1
     let escaped = false
     while (index < value.length) {
@@ -151,7 +173,16 @@ const scanCredentialValue = (
     return { replacement: `${quote}${REDACTED}`, nextIndex: index }
   }
 
-  let index = start
+  const markerEnd = start + REDACTED.length
+  const startsWithMarker = startsWithRedactionMarker(value, start)
+  if (
+    startsWithMarker &&
+    isUnquotedValueDelimiter(value[markerEnd], consumeSpaces)
+  ) {
+    return { replacement: REDACTED, nextIndex: markerEnd }
+  }
+
+  let index = startsWithMarker ? markerEnd : start
   while (index < value.length) {
     const character = value[index]
     if (

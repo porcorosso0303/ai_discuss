@@ -184,8 +184,10 @@ export class AtomicJsonStore {
       if (bytes.byteLength > this.maxBytes) throw new RangeError('JSON file is too large')
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
       const decoded = JSON.parse(text) as unknown
-      const safe = toSafeJson(decoded, this.maxDepth, this.maxNodes)
-      return parseSafeJson(schema, safe, { maxDepth: this.maxDepth, maxNodes: this.maxNodes })
+      return parseSafeJson(schema, decoded, {
+        maxDepth: this.maxDepth,
+        maxNodes: this.maxNodes
+      })
     } catch (error) {
       if (isMissing(error)) return null
       throw error
@@ -202,11 +204,10 @@ export class AtomicJsonStore {
         hook: this.filesystemHook
       })
       await this.assertTargetIsRegularOrMissing(target)
-      const input = toSafeJson(value, this.maxDepth, this.maxNodes)
-      const parsed = schema.parse(input)
-      const safeParsed = toSafeJson(parsed, this.maxDepth, this.maxNodes)
-      const validated = schema.parse(safeParsed)
-      const finalValue = toSafeJson(validated, this.maxDepth, this.maxNodes) as T
+      const finalValue = parseSafeJson(schema, value, {
+        maxDepth: this.maxDepth,
+        maxNodes: this.maxNodes
+      })
       const bytes = Buffer.from(`${JSON.stringify(finalValue)}\n`, 'utf8')
       if (bytes.byteLength > this.maxBytes) throw new RangeError('JSON output is too large')
 

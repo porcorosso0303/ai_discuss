@@ -159,6 +159,24 @@ describe('AtomicJsonStore', () => {
     expect(getterCalls).toBe(0)
   })
 
+  it('runs a non-idempotent schema transform exactly once at each read and write boundary', async () => {
+    const root = await createTempDirectory('atomic-json-transform-once-')
+    const store = new AtomicJsonStore(root)
+    let transformCalls = 0
+    const numberToStringSchema = z.number().transform((value) => {
+      transformCalls += 1
+      return String(value)
+    })
+
+    await expect(store.write('write.json', numberToStringSchema, 42)).resolves.toBe('42')
+    expect(transformCalls).toBe(1)
+    expect(JSON.parse(await readFile(join(root, 'write.json'), 'utf8'))).toBe('42')
+
+    await writeFile(join(root, 'read.json'), '7')
+    await expect(store.read('read.json', numberToStringSchema)).resolves.toBe('7')
+    expect(transformCalls).toBe(2)
+  })
+
   it('creates a shared first parent safely across store instances', async () => {
     const root = join(await createTempDirectory('atomic-json-parent-'), 'new-root')
     const first = new AtomicJsonStore(root)

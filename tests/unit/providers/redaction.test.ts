@@ -67,6 +67,38 @@ describe('redactString', () => {
     expect(redactString('client_secret=[REDACTED]')).toBe('client_secret=[REDACTED]')
   })
 
+  it.each([
+    ['token=[REDACTED]suffix', 'token=[REDACTED]'],
+    ['Bearer [REDACTED]suffix', 'Bearer [REDACTED]'],
+    ['token="[REDACTED]suffix"', 'token="[REDACTED]"'],
+    ["Bearer '[REDACTED]suffix'", "Bearer '[REDACTED]'"]
+  ])('redacts the complete value when a marker is only a prefix in %s', (input, expected) => {
+    expect(redactString(input)).toBe(expected)
+  })
+
+  it.each([
+    ['token=[REDACTED]', 'token=[REDACTED]'],
+    ['token=[REDACTED],model=gpt-test', 'token=[REDACTED],model=gpt-test'],
+    ['token="[REDACTED]",model=gpt-test', 'token="[REDACTED]",model=gpt-test'],
+    ["token='[REDACTED]';model=gpt-test", "token='[REDACTED]';model=gpt-test"],
+    ['Bearer [REDACTED]\nstatus=401', 'Bearer [REDACTED]\nstatus=401']
+  ])('keeps a complete redaction marker idempotent in %s', (input, expected) => {
+    expect(redactString(input)).toBe(expected)
+  })
+
+  it.each([
+    ['token=[REDACTED]boundary-secret', 40],
+    ['Bearer [REDACTED]boundary-secret', 40],
+    ['token="[REDACTED]boundary-secret"', 40]
+  ])('does not expose a marker-prefixed value at the scan boundary in %s', (input, maximum) => {
+    const result = redactString(`${input}${'x'.repeat(2_000)}`, { maxLength: maximum })
+
+    expect(result.length).toBeLessThanOrEqual(maximum)
+    expect(result).toContain(REDACTED)
+    expect(result).not.toContain('boundary')
+    expect(result).not.toContain('secret')
+  })
+
   it('bounds visible log strings after redacting secrets', () => {
     const secret = 'never-visible'
     const result = redactString(`${'x'.repeat(200)}\nAuthorization: Bearer ${secret}`, {
