@@ -77,7 +77,10 @@ export interface DesktopServicesDependencies {
   repository: DebateRepositoryPort
   exporter: ExporterPort
   createOrchestrator(onEvent: (event: DebateEvent) => void): OrchestratorPort
-  emit<Channel extends IpcEventChannel>(channel: Channel, payload: IpcEventMap[Channel]): void
+  emit<Channel extends IpcEventChannel>(
+    channel: Channel,
+    payload: IpcEventMap[Channel]
+  ): void | Promise<void>
   log?: { error(error: unknown, context?: unknown): Promise<void> | void }
   shutdownController?: AbortController
 }
@@ -338,11 +341,16 @@ export class DesktopServices {
     payload: IpcEventMap[Channel]
   ): void {
     if (this.disposed) return
+    let result: void | Promise<void>
     try {
-      this.dependencies.emit(channel, payload)
+      result = this.dependencies.emit(channel, payload)
     } catch (error) {
       void this.recordAsyncFailure(error, 'event-sink')
+      return
     }
+    void Promise.resolve(result)
+      .catch((error: unknown) => this.recordAsyncFailure(error, 'event-sink'))
+      .catch(() => undefined)
   }
 
   private async recordAsyncFailure(error: unknown, operation: string): Promise<void> {
@@ -395,7 +403,10 @@ export class DesktopServices {
 }
 
 export interface ProductionDesktopServicesOptions {
-  emit<Channel extends IpcEventChannel>(channel: Channel, payload: IpcEventMap[Channel]): void
+  emit<Channel extends IpcEventChannel>(
+    channel: Channel,
+    payload: IpcEventMap[Channel]
+  ): void | Promise<void>
   app: {
     getPath(name: 'userData'): string
     getVersion(): string

@@ -7,7 +7,7 @@ import {
 } from '../../../src/main/services'
 import type { CodexAccountStatus } from '../../../src/main/providers/codex/codex-provider'
 import { IPC_CHANNELS } from '../../../src/shared/ipc'
-import type { CredentialScope, RoleConfig } from '../../../src/shared/domain'
+import type { CredentialScope, DebateEvent, RoleConfig } from '../../../src/shared/domain'
 import { createSession, kimiRole, openAIRole } from '../../helpers/debate-fixtures'
 
 function harness() {
@@ -62,11 +62,39 @@ function harness() {
   }
   const emit = vi.fn()
   const log = { error: vi.fn().mockResolvedValue(undefined) }
+  const createOrchestrator = vi.fn<
+    (onEvent: (event: DebateEvent) => void) => typeof orchestrator
+  >(() => orchestrator)
   const dependencies = {
     version: '0.1.0', config, credentials, providers, repository, exporter,
-    createOrchestrator: vi.fn(() => orchestrator), emit, log
+    createOrchestrator, emit, log
   } as DesktopServicesDependencies
-  return { config, credentials, dependencies, emit, exporter, log, orchestrator, providers, repository, roles }
+  return { config, createOrchestrator, credentials, dependencies, emit, exporter, log, orchestrator, providers, repository, roles }
+}
+
+async function captureUnhandled(operation: () => Promise<void>): Promise<unknown[]> {
+  const unhandled: unknown[] = []
+  const listener = (reason: unknown): void => { unhandled.push(reason) }
+  process.on('unhandledRejection', listener)
+  try {
+    await operation()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    return unhandled
+  } finally {
+    process.off('unhandledRejection', listener)
+  }
+}
+
+function installAsyncRejectingEmitter(h: ReturnType<typeof harness>, message: string) {
+  const observed = vi.fn()
+  const thenable = {
+    then(_resolve: (value: void) => void, reject: (error: Error) => void): void {
+      observed()
+      queueMicrotask(() => reject(new Error(message)))
+    }
+  }
+  h.emit.mockImplementation(() => thenable as unknown as Promise<void>)
+  return observed
 }
 
 describe('desktop services', () => {
@@ -178,6 +206,82 @@ describe('desktop services', () => {
     complete()
     await new Promise((resolve) => setTimeout(resolve, 0))
     await expect(services.invoke(IPC_CHANNELS.openAIGetAuthStatus, {})).resolves.toEqual({ status: 'signed-in' })
+  })
+
+  it('contains an asynchronous signing-in event rejection', async () => {
+    const h = harness()
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({
+      loginId: 'login-1', completion: new Promise(() => undefined)
+    })
+    const observed = installAsyncRejectingEmitter(h, 'async signing-in sink failure')
+    const services = new DesktopServices(h.dependencies)
+
+    const unhandled = await captureUnhandled(async () => {
+      await expect(services.invoke(IPC_CHANNELS.openAIStartLogin, {})).resolves.toEqual({ started: true })
+    })
+    expect(unhandled).toEqual([])
+    expect(observed).toHaveBeenCalled()
+    await services.dispose()
+  })
+
+  it('contains an asynchronous signed-in completion event rejection', async () => {
+    const h = harness()
+    let complete!: () => void
+    const completion = new Promise<void>((resolve) => { complete = resolve })
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({ loginId: 'login-1', completion })
+    h.providers.openai.readAccount.mockResolvedValue({ signedIn: true, requiresOpenaiAuth: true })
+    const observed = installAsyncRejectingEmitter(h, 'async signed-in sink failure')
+    const services = new DesktopServices(h.dependencies)
+
+    const unhandled = await captureUnhandled(async () => {
+      await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+      complete()
+    })
+    expect(unhandled).toEqual([])
+    expect(observed).toHaveBeenCalled()
+    await services.dispose()
+  })
+
+  it('contains an asynchronous signed-out event rejection after account read failure', async () => {
+    const h = harness()
+    let complete!: () => void
+    const completion = new Promise<void>((resolve) => { complete = resolve })
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({ loginId: 'login-1', completion })
+    h.providers.openai.readAccount.mockRejectedValue(new Error('account read failed'))
+    const observed = installAsyncRejectingEmitter(h, 'async signed-out sink failure')
+    const services = new DesktopServices(h.dependencies)
+
+    const unhandled = await captureUnhandled(async () => {
+      await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+      complete()
+    })
+    expect(unhandled).toEqual([])
+    expect(observed).toHaveBeenCalled()
+    await vi.waitFor(async () => {
+      await expect(services.invoke(IPC_CHANNELS.openAIGetAuthStatus, {})).rejects.toThrow('操作失败')
+    })
+    await services.dispose()
+  })
+
+  it('contains asynchronous debate event rejection and emits nothing after disposal', async () => {
+    const h = harness()
+    const observed = installAsyncRejectingEmitter(h, 'async debate sink failure')
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.debateStart, { setup: createSession().setup })
+    const onEvent = h.createOrchestrator.mock.calls[0]?.[0]
+    const event: DebateEvent = {
+      id: 'event-1', sessionId: 'session-1', createdAt: new Date().toISOString(),
+      type: 'state-changed', state: 'running'
+    }
+
+    const unhandled = await captureUnhandled(async () => { onEvent?.(event) })
+    expect(unhandled).toEqual([])
+    expect(observed).toHaveBeenCalled()
+    await services.dispose()
+    h.emit.mockClear()
+    onEvent?.(event)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(h.emit).not.toHaveBeenCalled()
   })
 })
 
