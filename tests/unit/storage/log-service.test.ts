@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -109,13 +109,109 @@ describe('LogService', () => {
       maxEntryBytes: 180,
       maxFileBytes: 360
     })
+    const secondService = new LogService(root, {
+      clock: () => new Date('2026-08-16T12:34:56.000Z'),
+      maxEntryBytes: 180,
+      maxFileBytes: 360
+    })
 
-    await Promise.all(Array.from({ length: 20 }, (_, index) => service.info(`entry-${index}`)))
+    await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        (index % 2 === 0 ? service : secondService).info(`entry-${index}`)
+      )
+    )
 
     const bytes = await readFile(join(root, 'logs/app-2026-08-16.log'))
     expect(bytes.byteLength).toBeLessThanOrEqual(360)
     for (const line of bytes.toString('utf8').trimEnd().split('\n')) {
       expect(() => JSON.parse(line)).not.toThrow()
     }
+  })
+
+  it('revalidates the logs parent inside the cross-instance write queue', async () => {
+    const root = await createTempDirectory('log-service-queued-parent-')
+    const outside = await createTempDirectory('log-service-queued-parent-outside-')
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let entered!: () => void
+    const firstEntered = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let firstOpen = true
+    const options = {
+      clock: () => new Date('2026-08-16T12:34:56.000Z'),
+      filesystemHook: async (stage: string) => {
+        if (stage === 'before-target-open' && firstOpen) {
+          firstOpen = false
+          entered()
+          await blocked
+        }
+      }
+    }
+    const firstService = new LogService(root, options)
+    const secondService = new LogService(root, options)
+    const first = firstService.info('first')
+    await firstEntered
+    const second = secondService.info('external-marker')
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await rename(join(root, 'logs'), join(root, 'logs-original'))
+    await symlink(outside, join(root, 'logs'), 'dir')
+    release()
+
+    await expect(first).rejects.toThrow(/directory|identity|symlink/i)
+    await expect(second).rejects.toThrow(/directory|identity|symlink/i)
+    expect(await readFile(join(outside, 'app-2026-08-16.log'), 'utf8').catch(() => '')).not.toContain(
+      'external-marker'
+    )
+  })
+
+  it('detects parent replacement immediately before append and after close', async () => {
+    for (const trigger of ['before-file-write', 'after-target-close'] as const) {
+      const root = await createTempDirectory(`log-service-${trigger}-`)
+      const outside = await createTempDirectory(`log-service-${trigger}-outside-`)
+      let swapped = false
+      const service = new LogService(root, {
+        clock: () => new Date('2026-08-16T12:34:56.000Z'),
+        filesystemHook: async (stage) => {
+          if (stage !== trigger || swapped) return
+          swapped = true
+          await rename(join(root, 'logs'), join(root, 'logs-original'))
+          await symlink(outside, join(root, 'logs'), 'dir')
+        }
+      })
+
+      await expect(service.info(`marker-${trigger}`)).rejects.toThrow(
+        /directory|identity|symlink/i
+      )
+      expect(
+        await readFile(join(outside, 'app-2026-08-16.log'), 'utf8').catch(() => '')
+      ).not.toContain(`marker-${trigger}`)
+    }
+  })
+
+  it('revalidates the logs directory before taking the file-cap early return', async () => {
+    const root = await createTempDirectory('log-service-cap-parent-')
+    const outside = await createTempDirectory('log-service-cap-parent-outside-')
+    await mkdir(join(root, 'logs'))
+    await writeFile(join(root, 'logs/app-2026-08-16.log'), Buffer.alloc(256, 0x61))
+    let swapped = false
+    const service = new LogService(root, {
+      clock: () => new Date('2026-08-16T12:34:56.000Z'),
+      maxEntryBytes: 128,
+      maxFileBytes: 256,
+      filesystemHook: async (stage) => {
+        if (stage !== 'before-file-cap-check' || swapped) return
+        swapped = true
+        await rename(join(root, 'logs'), join(root, 'logs-original'))
+        await symlink(outside, join(root, 'logs'), 'dir')
+      }
+    })
+
+    await expect(service.info('must-not-follow-cap-symlink')).rejects.toThrow(
+      /directory|identity|symlink/i
+    )
+    expect(await readFile(join(outside, 'app-2026-08-16.log'), 'utf8').catch(() => '')).toBe('')
   })
 })

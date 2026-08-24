@@ -8,6 +8,9 @@ export type FilesystemMutationStage =
   | 'before-unlink'
   | 'before-directory-open'
   | 'before-mkdir'
+  | 'before-file-cap-check'
+  | 'before-file-write'
+  | 'after-target-close'
 
 export type FilesystemMutationHook = (
   stage: FilesystemMutationStage,

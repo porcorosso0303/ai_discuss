@@ -9,6 +9,10 @@ import {
   redactForLogging,
   redactString
 } from '../providers/http/redaction'
+import {
+  DirectoryIdentityGuard,
+  type FilesystemMutationHook
+} from './directory-identity'
 
 const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -30,6 +34,7 @@ export interface LogServiceOptions {
   clock?: () => Date
   maxEntryBytes?: number
   maxFileBytes?: number
+  filesystemHook?: FilesystemMutationHook
 }
 
 interface SnapshotState {
@@ -117,6 +122,7 @@ export class LogService {
   private readonly clock: () => Date
   private readonly maxEntryBytes: number
   private readonly maxFileBytes: number
+  private readonly filesystemHook?: FilesystemMutationHook
 
   constructor(root: string, options: LogServiceOptions = {}) {
     if (!isAbsolute(root)) throw new TypeError('Log root must be absolute')
@@ -130,6 +136,7 @@ export class LogService {
       options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
       'maxFileBytes'
     )
+    this.filesystemHook = options.filesystemHook
     if (this.maxEntryBytes > this.maxFileBytes) {
       throw new RangeError('maxEntryBytes must not exceed maxFileBytes')
     }
@@ -160,7 +167,8 @@ export class LogService {
     }
     if (context !== undefined) record.context = sanitized(context)
     const validated = logRecordSchema.parse(record)
-    const file = await this.resolveLogFile(`app-${timestamp.slice(0, 10)}.log`)
+    const fileName = `app-${timestamp.slice(0, 10)}.log`
+    const file = join(this.root, 'logs', fileName)
 
     let bytes = Buffer.from(`${JSON.stringify(validated)}\n`, 'utf8')
     if (bytes.byteLength > this.maxEntryBytes) {
@@ -178,17 +186,27 @@ export class LogService {
     if (bytes.byteLength > this.maxEntryBytes) return
 
     await this.serialized(file, async () => {
+      const resolvedFile = await this.resolveLogFile(fileName)
+      if (resolvedFile !== file) throw new TypeError('Resolved log path changed unexpectedly')
+      const guard = await DirectoryIdentityGuard.capture(join(this.root, 'logs'), {
+        anchor: this.root,
+        hook: this.filesystemHook
+      })
       let handle
       try {
+        let pathInfo
         try {
-          const info = await lstat(file)
-          if (!info.isFile() || info.isSymbolicLink()) {
+          await guard.before('before-file-cap-check', file)
+          pathInfo = await lstat(file)
+          await guard.after()
+          if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) {
             throw new TypeError('Log target must be a regular non-symlink file')
           }
-          if (info.size + bytes.byteLength > this.maxFileBytes) return
+          if (pathInfo.size + bytes.byteLength > this.maxFileBytes) return
         } catch (error) {
           if (errorCode(error) !== 'ENOENT') throw error
         }
+        await guard.before('before-target-open', file)
         handle = await open(
           file,
           constants.O_WRONLY |
@@ -197,13 +215,42 @@ export class LogService {
             (constants.O_NOFOLLOW ?? 0),
           0o600
         )
+        await guard.after()
         const info = await handle.stat()
         if (!info.isFile()) throw new TypeError('Log target must be a regular file')
+        if (pathInfo !== undefined) {
+          if (info.dev !== pathInfo.dev || info.ino !== pathInfo.ino) {
+            throw new TypeError('Log target identity changed before it was opened')
+          }
+        } else {
+          const createdInfo = await lstat(file)
+          if (
+            !createdInfo.isFile() ||
+            createdInfo.isSymbolicLink() ||
+            info.dev !== createdInfo.dev ||
+            info.ino !== createdInfo.ino
+          ) {
+            throw new TypeError('Created log target identity does not match its open handle')
+          }
+        }
         if (info.size + bytes.byteLength > this.maxFileBytes) return
+        await guard.before('before-file-write', file)
         await handle.writeFile(bytes)
+        await guard.after()
         await handle.sync()
       } finally {
-        await handle?.close().catch(() => undefined)
+        if (handle !== undefined) {
+          const closingHandle = handle
+          handle = undefined
+          let closeError: unknown
+          try {
+            await closingHandle.close()
+          } catch (error) {
+            closeError = error
+          }
+          await guard.before('after-target-close', file)
+          if (closeError !== undefined) throw closeError
+        }
       }
     })
   }
