@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import {
+  baseUrlSchema,
   credentialScopeSchema,
   deepSeekCredentialScopeSchema,
   debateEventSchema,
@@ -49,6 +50,12 @@ export const providerTestConnectionRequestSchema = z.discriminatedUnion('provide
   z.strictObject({ roleId: roleIdSchema, provider: z.literal('openai') }),
   kimiCredentialScopeSchema,
   deepSeekCredentialScopeSchema
+])
+
+export const providerDiscoveryRequestSchema = z.discriminatedUnion('provider', [
+  z.strictObject({ roleId: roleIdSchema, provider: z.literal('openai') }),
+  z.strictObject({ roleId: roleIdSchema, provider: z.literal('kimi'), baseUrl: baseUrlSchema }),
+  z.strictObject({ roleId: roleIdSchema, provider: z.literal('deepseek'), baseUrl: baseUrlSchema })
 ])
 
 export const openAIAuthStatusSchema = z.strictObject({
@@ -106,7 +113,7 @@ const ipcSchemas = {
     response: z.strictObject({ signedOut: z.boolean() })
   },
   providerDiscoverCapabilities: {
-    request: z.strictObject({ roleId: roleIdSchema }),
+    request: providerDiscoveryRequestSchema,
     response: providerCapabilitiesSchema
   },
   providerTestConnection: {

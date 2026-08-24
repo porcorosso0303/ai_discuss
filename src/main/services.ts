@@ -155,13 +155,11 @@ export class DesktopServices {
         }
         case IPC_CHANNELS.credentialsSetProviderSecret: {
           const { scope, secret } = ipcInvokeContracts[channel].request.parse(input)
-          await this.requireMatchingCredentialScope(scope)
           response = await this.dependencies.credentials.set(scope, secret, this.shutdown.signal)
           break
         }
         case IPC_CHANNELS.credentialsDeleteProviderSecret: {
           const { scope } = ipcInvokeContracts[channel].request.parse(input)
-          await this.requireMatchingCredentialScope(scope)
           response = await this.dependencies.credentials.delete(scope, this.shutdown.signal)
           break
         }
@@ -177,8 +175,8 @@ export class DesktopServices {
           response = await this.logout()
           break
         case IPC_CHANNELS.providerDiscoverCapabilities: {
-          const { roleId } = ipcInvokeContracts[channel].request.parse(input)
-          response = await this.discoverSavedRole(roleId)
+          const draft = ipcInvokeContracts[channel].request.parse(input)
+          response = await this.discoverDraft(draft)
           break
         }
         case IPC_CHANNELS.providerTestConnection: {
@@ -274,20 +272,22 @@ export class DesktopServices {
     return role
   }
 
-  private async discoverSavedRole(roleId: RoleId): Promise<ProviderCapabilities> {
-    const role = await this.role(roleId)
-    return await this.dependencies.providers[role.provider].discover(role, this.shutdown.signal)
-  }
-
-  private async requireMatchingCredentialScope(scope: CredentialScope): Promise<void> {
-    const role = await this.role(scope.roleId)
-    if (
-      role.provider === 'openai' ||
-      role.provider !== scope.provider ||
-      new URL(role.baseUrl).origin !== scope.origin
-    ) {
-      throw new Error('Credential scope does not match the saved role')
+  private async discoverDraft(
+    draft: { roleId: RoleId; provider: 'openai' } |
+      { roleId: RoleId; provider: 'kimi' | 'deepseek'; baseUrl: string }
+  ): Promise<ProviderCapabilities> {
+    const common = {
+      roleId: draft.roleId,
+      name: draft.roleId === 'role-a' ? '辩手 A' : '辩手 B',
+      personaOrStance: '',
+      model: 'capability-discovery'
     }
+    const role: RoleConfig = draft.provider === 'openai'
+      ? { ...common, provider: 'openai', effort: 'none' }
+      : draft.provider === 'kimi'
+        ? { ...common, provider: 'kimi', baseUrl: draft.baseUrl, maxCompletionTokens: 1 }
+        : { ...common, provider: 'deepseek', baseUrl: draft.baseUrl, maxTokens: 1 }
+    return await this.dependencies.providers[draft.provider].discover(role, this.shutdown.signal)
   }
 
   private async testConnection(

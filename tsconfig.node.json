@@ -17,5 +17,6 @@
     "src/main/**/*",
     "src/preload/**/*",
     "tests/**/*"
-  ]
+  ],
+  "exclude": ["tests/component/**/*"]
 }

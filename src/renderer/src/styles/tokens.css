@@ -1,0 +1,17 @@
+:root {
+  color: #e8edf5;
+  background: #0c1322;
+  font-family: Inter, "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --bg: #0c1322;
+  --panel: #121c2e;
+  --panel-raised: #17243a;
+  --border: #293852;
+  --muted: #91a0b8;
+  --text: #e8edf5;
+  --cyan: #31c7d5;
+  --orange: #f29b58;
+  --danger: #ff7b82;
+  --focus: #75dce5;
+}

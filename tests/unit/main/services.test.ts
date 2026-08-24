@@ -113,22 +113,45 @@ describe('desktop services', () => {
     })
   })
 
-  it('discovers only saved roles and requires an exact provider/origin match for tests', async () => {
+  it('discovers capabilities from a validated unsaved provider draft without persisting it', async () => {
     const h = harness()
     const services = new DesktopServices(h.dependencies)
-    await services.invoke(IPC_CHANNELS.providerDiscoverCapabilities, { roleId: 'role-b' })
-    expect(h.providers.kimi.discover).toHaveBeenCalledWith(kimiRole, expect.any(AbortSignal))
+    await services.invoke(IPC_CHANNELS.providerDiscoverCapabilities, {
+      roleId: 'role-a', provider: 'deepseek', baseUrl: 'https://api.deepseek.com'
+    })
+    expect(h.providers.deepseek.discover).toHaveBeenCalledWith(expect.objectContaining({
+      roleId: 'role-a', provider: 'deepseek', baseUrl: 'https://api.deepseek.com/'
+    }), expect.any(AbortSignal))
+    expect(h.config.saveRole).not.toHaveBeenCalled()
+    expect(h.config.listRoles).not.toHaveBeenCalled()
+
+    await expect(services.invoke(IPC_CHANNELS.providerDiscoverCapabilities, {
+      roleId: 'role-a', provider: 'deepseek', baseUrl: 'https://api.deepseek.com', apiKey: 'forbidden'
+    })).rejects.toThrow('操作失败')
+    expect(h.providers.deepseek.discover).toHaveBeenCalledOnce()
+  })
+
+  it('stages and deletes a strictly scoped provider credential before a role is saved', async () => {
+    const h = harness()
+    h.roles.splice(0, h.roles.length)
+    const services = new DesktopServices(h.dependencies)
+    const scope = { roleId: 'role-a' as const, provider: 'kimi' as const, origin: 'https://api.moonshot.cn' }
+    await services.invoke(IPC_CHANNELS.credentialsSetProviderSecret, { scope, secret: 'staged' })
+    await services.invoke(IPC_CHANNELS.credentialsDeleteProviderSecret, { scope })
+    expect(h.credentials.set).toHaveBeenCalledWith(scope, 'staged', expect.any(AbortSignal))
+    expect(h.credentials.delete).toHaveBeenCalledWith(scope, expect.any(AbortSignal))
+    expect(h.config.listRoles).not.toHaveBeenCalled()
+  })
+
+  it('requires an exact provider/origin match for connection tests', async () => {
+    const h = harness()
+    const services = new DesktopServices(h.dependencies)
 
     await expect(services.invoke(IPC_CHANNELS.providerTestConnection, {
       roleId: 'role-b', provider: 'kimi', origin: 'https://evil.test/'
     })).rejects.toThrow('操作失败')
-    expect(h.providers.kimi.discover).toHaveBeenCalledTimes(1)
+    expect(h.providers.kimi.discover).not.toHaveBeenCalled()
 
-    await expect(services.invoke(IPC_CHANNELS.credentialsSetProviderSecret, {
-      scope: { roleId: 'role-b', provider: 'kimi', origin: 'https://evil.test/' },
-      secret: 'not-stored'
-    })).rejects.toThrow('操作失败')
-    expect(h.credentials.set).not.toHaveBeenCalled()
   })
 
   it('publishes auth changes without leaking login URLs or rejected login promises', async () => {
