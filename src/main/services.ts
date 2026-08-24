@@ -44,6 +44,7 @@ interface CredentialPort {
 interface OpenAIProviderPort extends Provider {
   readAccount(): Promise<CodexAccountStatus>
   startChatGptLogin(): Promise<{ loginId: string; completion: Promise<void> }>
+  cancelChatGptLogin(loginId: string): Promise<void>
   logout(): Promise<void>
   dispose(): Promise<void>
 }
@@ -120,6 +121,8 @@ export class DesktopServices {
   private active?: OrchestratorPort
   private startInFlight?: Promise<DebateSession>
   private loginPending = false
+  private loginGeneration = 0
+  private activeLogin?: { generation: number; loginId: string }
   private disposed = false
   private disposePromise?: Promise<void>
 
@@ -171,10 +174,7 @@ export class DesktopServices {
           response = await this.startLogin()
           break
         case IPC_CHANNELS.openAILogout:
-          await this.dependencies.providers.openai.logout()
-          this.loginPending = false
-          this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
-          response = { signedOut: true }
+          response = await this.logout()
           break
         case IPC_CHANNELS.providerDiscoverCapabilities: {
           const { roleId } = ipcInvokeContracts[channel].request.parse(input)
@@ -243,8 +243,8 @@ export class DesktopServices {
 
   dispose(): Promise<void> {
     if (this.disposePromise !== undefined) return this.disposePromise
+    const activeLogin = this.invalidateLoginAttempt()
     this.disposed = true
-    this.loginPending = false
     this.shutdown.abort(new DOMException('Application is closing', 'AbortError'))
     this.disposePromise = (async () => {
       const operations: Promise<unknown>[] = []
@@ -255,6 +255,9 @@ export class DesktopServices {
       operations.push(
         Promise.resolve().then(() => this.dependencies.providers.openai.dispose())
       )
+      if (activeLogin !== undefined) {
+        operations.push(this.cancelLoginBestEffort(activeLogin.loginId))
+      }
       void this.startInFlight?.catch(() => undefined)
       await Promise.allSettled(operations)
     })()
@@ -306,34 +309,92 @@ export class DesktopServices {
     }
   }
 
-  private async startLogin(): Promise<{ started: true }> {
-    const attempt = await this.dependencies.providers.openai.startChatGptLogin()
+  private async startLogin(): Promise<{ started: boolean }> {
+    if (this.loginPending) throw new Error('A login attempt is already active')
+    const generation = ++this.loginGeneration
     this.loginPending = true
+    let attempt: { loginId: string; completion: Promise<void> }
+    try {
+      attempt = await this.dependencies.providers.openai.startChatGptLogin()
+    } catch (error) {
+      if (this.loginGeneration === generation) this.loginPending = false
+      throw error
+    }
+    if (this.disposed || this.loginGeneration !== generation) {
+      await this.cancelLoginBestEffort(attempt.loginId)
+      return { started: false }
+    }
+    this.activeLogin = { generation, loginId: attempt.loginId }
     this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signing-in' })
     void Promise.resolve(attempt.completion)
       .then(
-        () => this.finishLogin(),
-        () => this.failLogin()
+        () => this.finishLogin(generation, attempt.loginId),
+        () => this.failLogin(generation, attempt.loginId)
       )
       .catch((error: unknown) => this.recordAsyncFailure(error, 'login-completion'))
     return { started: true }
   }
 
-  private async finishLogin(): Promise<void> {
-    this.loginPending = false
-    if (this.disposed) return
+  private async finishLogin(generation: number, loginId: string): Promise<void> {
+    if (!this.isCurrentLogin(generation, loginId)) return
     try {
       const account = await this.dependencies.providers.openai.readAccount()
-      if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, authStatus(account))
+      if (!this.isCurrentLogin(generation, loginId)) return
+      this.settleLogin(generation, loginId)
+      this.safeEmit(IPC_CHANNELS.openAIAuthChanged, authStatus(account))
     } catch (error) {
-      if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+      if (this.isCurrentLogin(generation, loginId)) {
+        this.settleLogin(generation, loginId)
+        this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+      }
       await this.recordAsyncFailure(error, 'login-account-read')
     }
   }
 
-  private failLogin(): void {
+  private failLogin(generation: number, loginId: string): void {
+    if (!this.isCurrentLogin(generation, loginId)) return
+    this.settleLogin(generation, loginId)
+    this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+  }
+
+  private isCurrentLogin(generation: number, loginId: string): boolean {
+    return !this.disposed &&
+      this.loginGeneration === generation &&
+      this.activeLogin?.generation === generation &&
+      this.activeLogin.loginId === loginId
+  }
+
+  private settleLogin(generation: number, loginId: string): void {
+    if (
+      this.activeLogin?.generation !== generation ||
+      this.activeLogin.loginId !== loginId
+    ) return
+    this.activeLogin = undefined
     this.loginPending = false
-    if (!this.disposed) this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+  }
+
+  private invalidateLoginAttempt(): { generation: number; loginId: string } | undefined {
+    this.loginGeneration += 1
+    this.loginPending = false
+    const active = this.activeLogin
+    this.activeLogin = undefined
+    return active
+  }
+
+  private async cancelLoginBestEffort(loginId: string): Promise<void> {
+    try {
+      await this.dependencies.providers.openai.cancelChatGptLogin(loginId)
+    } catch (error) {
+      await this.recordAsyncFailure(error, 'login-cancel')
+    }
+  }
+
+  private async logout(): Promise<{ signedOut: true }> {
+    const active = this.invalidateLoginAttempt()
+    if (active !== undefined) await this.cancelLoginBestEffort(active.loginId)
+    await this.dependencies.providers.openai.logout()
+    this.safeEmit(IPC_CHANNELS.openAIAuthChanged, { status: 'signed-out' })
+    return { signedOut: true }
   }
 
   private safeEmit<Channel extends IpcEventChannel>(

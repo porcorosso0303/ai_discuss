@@ -42,7 +42,7 @@ function harness() {
       discover: vi.fn(async () => ({ ...capabilities, provider: 'openai' as const })),
       streamReply: vi.fn(), cancelActive: vi.fn(), dispose: vi.fn(),
       readAccount: vi.fn<() => Promise<CodexAccountStatus>>(async () => ({ signedIn: false, requiresOpenaiAuth: true })),
-      startChatGptLogin: vi.fn(), logout: vi.fn()
+      startChatGptLogin: vi.fn(), cancelChatGptLogin: vi.fn(), logout: vi.fn()
     },
     kimi: { discover: vi.fn(async () => capabilities), streamReply: vi.fn(), cancelActive: vi.fn() },
     deepseek: { discover: vi.fn(async () => ({ ...capabilities, provider: 'deepseek' as const })), streamReply: vi.fn(), cancelActive: vi.fn() }
@@ -282,6 +282,115 @@ describe('desktop services', () => {
     onEvent?.(event)
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(h.emit).not.toHaveBeenCalled()
+  })
+
+  it('ignores a pending login completion after logout', async () => {
+    const h = harness()
+    let complete!: () => void
+    const completion = new Promise<void>((resolve) => { complete = resolve })
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({ loginId: 'login-old', completion })
+    h.providers.openai.readAccount.mockResolvedValue({ signedIn: true, requiresOpenaiAuth: true })
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+    await services.invoke(IPC_CHANNELS.openAILogout, {})
+    h.emit.mockClear()
+
+    complete()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(h.providers.openai.cancelChatGptLogin).toHaveBeenCalledWith('login-old')
+    expect(h.providers.openai.readAccount).not.toHaveBeenCalled()
+    expect(h.emit).not.toHaveBeenCalledWith(
+      IPC_CHANNELS.openAIAuthChanged,
+      expect.objectContaining({ status: 'signed-in' })
+    )
+  })
+
+  it('cancels a late login id when logout races the delayed start response', async () => {
+    const h = harness()
+    let releaseStart!: () => void
+    const delayed = new Promise<{ loginId: string; completion: Promise<void> }>((resolve) => {
+      releaseStart = () => resolve({ loginId: 'login-late', completion: new Promise(() => undefined) })
+    })
+    h.providers.openai.startChatGptLogin.mockReturnValueOnce(delayed)
+    const services = new DesktopServices(h.dependencies)
+    const starting = services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+    await vi.waitFor(() => expect(h.providers.openai.startChatGptLogin).toHaveBeenCalledOnce())
+    await services.invoke(IPC_CHANNELS.openAILogout, {})
+    h.emit.mockClear()
+
+    releaseStart()
+    await expect(starting).resolves.toEqual({ started: false })
+    expect(h.providers.openai.cancelChatGptLogin).toHaveBeenCalledWith('login-late')
+    expect(h.emit).not.toHaveBeenCalledWith(
+      IPC_CHANNELS.openAIAuthChanged,
+      expect.objectContaining({ status: 'signing-in' })
+    )
+  })
+
+  it('does not let an old completion disturb a new login after logout', async () => {
+    const h = harness()
+    let completeOld!: () => void
+    let completeNew!: () => void
+    h.providers.openai.startChatGptLogin
+      .mockResolvedValueOnce({
+        loginId: 'login-old',
+        completion: new Promise<void>((resolve) => { completeOld = resolve })
+      })
+      .mockResolvedValueOnce({
+        loginId: 'login-new',
+        completion: new Promise<void>((resolve) => { completeNew = resolve })
+      })
+    h.providers.openai.readAccount.mockResolvedValue({ signedIn: true, requiresOpenaiAuth: true })
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+    await services.invoke(IPC_CHANNELS.openAILogout, {})
+    await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+    h.emit.mockClear()
+
+    completeOld()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(h.providers.openai.readAccount).not.toHaveBeenCalled()
+    await expect(services.invoke(IPC_CHANNELS.openAIGetAuthStatus, {})).resolves.toEqual({ status: 'signing-in' })
+
+    completeNew()
+    await vi.waitFor(() => expect(h.emit).toHaveBeenCalledWith(
+      IPC_CHANNELS.openAIAuthChanged,
+      { status: 'signed-in' }
+    ))
+  })
+
+  it('still logs out without unhandled rejection when login cancellation fails', async () => {
+    const h = harness()
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({
+      loginId: 'login-1', completion: new Promise(() => undefined)
+    })
+    h.providers.openai.cancelChatGptLogin.mockRejectedValueOnce(new Error('cancel failed'))
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+
+    const unhandled = await captureUnhandled(async () => {
+      await expect(services.invoke(IPC_CHANNELS.openAILogout, {})).resolves.toEqual({ signedOut: true })
+    })
+    expect(unhandled).toEqual([])
+    expect(h.providers.openai.logout).toHaveBeenCalledOnce()
+    expect(h.log.error).toHaveBeenCalledWith(expect.any(Error), {
+      boundary: 'services', operation: 'login-cancel'
+    })
+  })
+
+  it('cancels the active login during disposal', async () => {
+    const h = harness()
+    h.providers.openai.startChatGptLogin.mockResolvedValueOnce({
+      loginId: 'login-dispose', completion: new Promise(() => undefined)
+    })
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.openAIStartLogin, {})
+
+    await services.dispose()
+
+    expect(h.providers.openai.cancelChatGptLogin).toHaveBeenCalledWith('login-dispose')
+    expect(h.providers.openai.dispose).toHaveBeenCalledOnce()
   })
 })
 
