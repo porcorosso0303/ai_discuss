@@ -201,12 +201,37 @@ function normalizeModel(draft: RoleDraft, model: ModelCapability | undefined): R
   }
 }
 
-function applyCapabilities(draft: RoleDraft, capabilities: ProviderCapabilities): RoleDraft {
+function applyDiscoveryCapabilities(draft: RoleDraft, capabilities: ProviderCapabilities): RoleDraft {
   const preserved = capabilities.models.find(({ id }) => id === draft.model)
   const modelId = preserved?.id ?? capabilities.defaultModel ?? capabilities.models[0]?.id ?? ''
   return {
     ...normalizeModel(draft, capabilities.models.find(({ id }) => id === modelId)),
     capabilities
+  }
+}
+
+function applyTestCapabilities(
+  draft: RoleDraft,
+  capabilities: ProviderCapabilities
+): { draft: RoleDraft; modelPresent: boolean } {
+  if (capabilities.models.some(({ id }) => id === draft.model)) {
+    return { draft: { ...draft, capabilities }, modelPresent: true }
+  }
+  return {
+    draft: {
+      ...draft,
+      capabilities,
+      model: '',
+      effort: 'none',
+      thinking: undefined,
+      thinkingKeep: undefined,
+      sampling: {},
+      maxOutputTokens: providerDefaults[draft.provider].maxOutputTokens,
+      connection: 'idle',
+      fieldErrors: { model: '已测试的模型不再可用，请重新选择模型' },
+      error: '模型目录已更新，请重新选择并测试'
+    },
+    modelPresent: false
   }
 }
 
@@ -369,7 +394,7 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
       setRoles((current) => ({
         ...current,
         [roleId]: current[roleId].provider === found.provider
-          ? { ...applyCapabilities(current[roleId], found), busy: false }
+          ? { ...applyDiscoveryCapabilities(current[roleId], found), busy: false }
           : current[roleId]
       }))
     } catch {
@@ -440,15 +465,23 @@ export function AppStateProvider({ children }: { children: React.ReactNode }): R
         ? { roleId, provider: 'openai' as const }
         : { roleId, provider: role.provider, origin: new URL(role.baseUrl).origin }
       const result = await window.aiDebates.providers.testConnection(request)
-      setRoles((current) => ({
-        ...current,
-        [roleId]: {
-          ...(result.capabilities === undefined ? current[roleId] : applyCapabilities(current[roleId], result.capabilities)),
-          busy: false, connection: result.ok ? 'passed' : 'failed',
-          credentialPresent: current[roleId].credentialPresent || secret.trim() !== '',
-          error: result.ok ? undefined : (result.message ?? '连接测试失败')
+      setRoles((current) => {
+        const refreshed = result.capabilities === undefined
+          ? { draft: current[roleId], modelPresent: true }
+          : applyTestCapabilities(current[roleId], result.capabilities)
+        return {
+          ...current,
+          [roleId]: {
+            ...refreshed.draft,
+            busy: false,
+            connection: refreshed.modelPresent ? (result.ok ? 'passed' : 'failed') : 'idle',
+            credentialPresent: current[roleId].credentialPresent || secret.trim() !== '',
+            error: refreshed.modelPresent
+              ? (result.ok ? undefined : (result.message ?? '连接测试失败'))
+              : refreshed.draft.error
+          }
         }
-      }))
+      })
     } catch {
       setRoles((current) => ({ ...current, [roleId]: { ...current[roleId], busy: false, connection: 'failed', error: '连接测试失败' } }))
     }

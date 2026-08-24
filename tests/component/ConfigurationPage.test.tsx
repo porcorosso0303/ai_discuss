@@ -41,7 +41,10 @@ const capabilities: Record<'openai' | 'kimi' | 'deepseek', ProviderCapabilities>
       {
         id: 'deepseek-fast', reasoningEfforts: [], thinking: { default: false, keepSupported: false },
         maxOutputTokens: 2048,
-        samplingParameters: [{ name: 'temperature', min: 0, max: 1, default: 0.4 }],
+        samplingParameters: [
+          { name: 'temperature', min: 0, max: 1, default: 0.4 },
+          { name: 'topP', min: 0, max: 1, default: 0.8 }
+        ],
         structuredOutputModes: ['json-object']
       }
     ]
@@ -134,7 +137,7 @@ describe('role configuration page', () => {
     expect(within(card).getByLabelText('最大输出 Token')).toHaveValue(2048)
     await user.click(within(card).getByText('高级参数'))
     expect(within(card).getByLabelText('temperature')).toHaveValue(0.4)
-    expect(within(card).queryByLabelText('topP')).not.toBeInTheDocument()
+    expect(within(card).getByLabelText('topP')).toHaveValue(0.8)
   })
 
   it('preserves the selected model when connection testing refreshes the same catalog', async () => {
@@ -147,6 +150,84 @@ describe('role configuration page', () => {
     await user.click(within(card).getByRole('button', { name: '测试连接' }))
     expect(await within(card).findByText('连接正常')).toBeInTheDocument()
     expect(within(card).getByLabelText('模型')).toHaveValue('deepseek-fast')
+  })
+
+  it('preserves every tested DeepSeek parameter when refreshed capabilities still contain the model', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.selectOptions(within(card).getByLabelText('模型'), 'deepseek-fast')
+    await user.click(within(card).getByText('高级参数'))
+    const maxTokens = within(card).getByLabelText('最大输出 Token')
+    const temperature = within(card).getByLabelText('temperature')
+    const topP = within(card).getByLabelText('topP')
+    await user.clear(maxTokens); await user.type(maxTokens, '1024')
+    await user.clear(temperature); await user.type(temperature, '0.7')
+    await user.clear(topP); await user.type(topP, '0.6')
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    expect(await within(card).findByText('连接正常')).toBeInTheDocument()
+    expect(within(card).getByLabelText('模型')).toHaveValue('deepseek-fast')
+    expect(within(card).getByLabelText('思考模式')).not.toBeChecked()
+    expect(maxTokens).toHaveValue(1024)
+    expect(temperature).toHaveValue(0.7)
+    expect(topP).toHaveValue(0.6)
+  })
+
+  it('preserves legal Kimi keep/max and K3 effort values across a test refresh', async () => {
+    const { api } = apiHarness()
+    const kimiCatalog: ProviderCapabilities = {
+      provider: 'kimi', defaultModel: 'moonshot-dynamic', models: [
+        capabilities.kimi.models[0]!,
+        {
+          id: 'kimi-k3-test', reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+          thinking: null, maxOutputTokens: 12000, samplingParameters: [],
+          structuredOutputModes: ['json-object']
+        }
+      ]
+    }
+    ;(api.providers.discoverCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue(kimiCatalog)
+    ;(api.providers.testConnection as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, capabilities: kimiCatalog })
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'kimi')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.click(within(card).getByLabelText('思考模式'))
+    const genericMax = within(card).getByLabelText('最大输出 Token')
+    await user.clear(genericMax); await user.type(genericMax, '6000')
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    const savedGeneric = (api.config.saveRole as ReturnType<typeof vi.fn>).mock.calls[1]?.[0].role
+    expect(savedGeneric).toMatchObject({ model: 'moonshot-dynamic', thinking: true, thinkingKeep: 'all', maxCompletionTokens: 6000 })
+
+    await user.selectOptions(within(card).getByLabelText('模型'), 'kimi-k3-test')
+    await user.selectOptions(within(card).getByLabelText('思考强度'), 'low')
+    const k3Max = within(card).getByLabelText('最大输出 Token')
+    await user.clear(k3Max); await user.type(k3Max, '7000')
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    expect(within(card).getByLabelText('模型')).toHaveValue('kimi-k3-test')
+    expect(within(card).getByLabelText('思考强度')).toHaveValue('low')
+    expect(k3Max).toHaveValue(7000)
+  })
+
+  it('cannot pass when refreshed capabilities no longer contain the tested model', async () => {
+    const { api } = apiHarness()
+    const user = userEvent.setup()
+    render(<App />)
+    const card = await screen.findByRole('region', { name: '角色 A 配置' })
+    await user.selectOptions(within(card).getByLabelText('服务商'), 'deepseek')
+    await user.click(within(card).getByRole('button', { name: '获取模型' }))
+    await user.selectOptions(within(card).getByLabelText('模型'), 'deepseek-fast')
+    ;(api.providers.testConnection as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      capabilities: { ...capabilities.deepseek, defaultModel: 'deepseek-dynamic', models: [capabilities.deepseek.models[0]] }
+    })
+    await user.click(within(card).getByRole('button', { name: '测试连接' }))
+    await waitFor(() => expect(within(card).getByLabelText('模型')).toHaveValue(''))
+    expect(within(card).queryByText('连接正常')).not.toBeInTheDocument()
+    expect(within(card).getByText('未测试')).toBeInTheDocument()
   })
 
   it('clears an entered API key after storing it and never sends it in saved role config', async () => {

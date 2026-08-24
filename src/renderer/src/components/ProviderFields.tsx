@@ -42,7 +42,7 @@ export function ProviderFields({ draft, apiKey, onApiKey, onChange, onSelectMode
 
       <div className="model-row">
         <label className="field grow">模型
-          <select {...errorProps(draft, 'model')} value={draft.model} onChange={(event) => onSelectModel(event.target.value)} disabled={!draft.capabilities?.models.length}>
+          <select aria-label="模型" {...errorProps(draft, 'model')} value={draft.model} onChange={(event) => onSelectModel(event.target.value)} disabled={!draft.capabilities?.models.length}>
             <option value="">先获取模型</option>
             {draft.capabilities?.models.map((model) => <option key={model.id} value={model.id}>{model.displayName ?? model.id}</option>)}
           </select>
