@@ -1,11 +1,12 @@
-type AppRoute = 'configuration' | 'debate'
+export type AppRoute = 'configuration' | 'debate' | 'history'
 
 export function AppShell({ children, active = 'configuration', configurationDisabled = false,
-  debateDisabled = false, onNavigate }: {
+  debateDisabled = false, historyDisabled = false, onNavigate }: {
   children: React.ReactNode
   active?: AppRoute
   configurationDisabled?: boolean
   debateDisabled?: boolean
+  historyDisabled?: boolean
   onNavigate?(route: AppRoute): void
 }): React.JSX.Element {
   return (
@@ -23,7 +24,9 @@ export function AppShell({ children, active = 'configuration', configurationDisa
           <button type="button" className={`nav-item${active === 'debate' ? ' active' : ''}`}
             aria-current={active === 'debate' ? 'page' : undefined}
             disabled={debateDisabled || active === 'debate'} onClick={() => onNavigate?.('debate')}>辩论现场</button>
-          <button type="button" className="nav-item disabled" disabled>历史记录</button>
+          <button type="button" className={`nav-item${active === 'history' ? ' active' : ''}`}
+            aria-current={active === 'history' ? 'page' : undefined}
+            disabled={historyDisabled || active === 'history'} onClick={() => onNavigate?.('history')}>历史记录</button>
         </nav>
         <div className="sidebar-note"><strong>凭据保护</strong><span>API Key 由 Windows Credential Manager 保存。</span></div>
       </aside>

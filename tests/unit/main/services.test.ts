@@ -7,7 +7,7 @@ import {
 } from '../../../src/main/services'
 import type { CodexAccountStatus } from '../../../src/main/providers/codex/codex-provider'
 import { IPC_CHANNELS } from '../../../src/shared/ipc'
-import type { CredentialScope, DebateEvent, RoleConfig } from '../../../src/shared/domain'
+import type { CredentialScope, DebateEvent, DebateSession, RoleConfig } from '../../../src/shared/domain'
 import { createSession, kimiRole, openAIRole } from '../../helpers/debate-fixtures'
 
 function harness() {
@@ -49,6 +49,10 @@ function harness() {
   }
   const repository = {
     saveSession: vi.fn(), list: vi.fn(async () => []), get: vi.fn(async () => null),
+    getRecoveryCandidate: vi.fn<() => Promise<{
+      session: DebateSession
+      requiresUserResume: true
+    } | null>>(async () => null),
     delete: vi.fn(async () => true), clear: vi.fn(async () => 2)
   }
   const exporter = { export: vi.fn(async () => ({ cancelled: false, fileName: 'debate.md' })) }
@@ -63,7 +67,7 @@ function harness() {
   const emit = vi.fn()
   const log = { error: vi.fn().mockResolvedValue(undefined) }
   const createOrchestrator = vi.fn<
-    (onEvent: (event: DebateEvent) => void) => typeof orchestrator
+    (onEvent: (event: DebateEvent) => void, initialSession?: ReturnType<typeof createSession>) => typeof orchestrator
   >(() => orchestrator)
   const dependencies = {
     version: '0.1.0', config, credentials, providers, repository, exporter,
@@ -98,6 +102,49 @@ function installAsyncRejectingEmitter(h: ReturnType<typeof harness>, message: st
 }
 
 describe('desktop services', () => {
+  it('recovers an incomplete persisted session as the active paused session without starting it', async () => {
+    const h = harness()
+    const saved = createSession({ state: 'running' })
+    const restored = createSession({ state: 'paused' })
+    h.repository.getRecoveryCandidate.mockResolvedValueOnce({ session: saved, requiresUserResume: true })
+    h.orchestrator.getSession.mockReturnValue(restored)
+    const services = new DesktopServices(h.dependencies)
+
+    await expect(services.invoke(IPC_CHANNELS.debateRecover, { sessionId: saved.id }))
+      .resolves.toEqual({ session: restored })
+    expect(h.createOrchestrator).toHaveBeenCalledWith(expect.any(Function), saved)
+    expect(h.orchestrator.start).not.toHaveBeenCalled()
+
+    await services.invoke(IPC_CHANNELS.debateResume, { sessionId: saved.id })
+    expect(h.orchestrator.resume).toHaveBeenCalledOnce()
+    await services.dispose()
+  })
+
+  it('rejects recovery when the repository has no incomplete candidate', async () => {
+    const h = harness()
+    const services = new DesktopServices(h.dependencies)
+    await expect(services.invoke(IPC_CHANNELS.debateRecover, { sessionId: 'terminal-or-missing' }))
+      .rejects.toThrow('操作失败')
+    expect(h.createOrchestrator).not.toHaveBeenCalled()
+  })
+
+  it('serializes recovery against debate start', async () => {
+    const h = harness()
+    h.orchestrator.getSession.mockReturnValue(createSession({ state: 'paused' }))
+    let resolveCandidate!: (value: { session: ReturnType<typeof createSession>; requiresUserResume: true }) => void
+    h.repository.getRecoveryCandidate.mockReturnValueOnce(new Promise((resolve) => { resolveCandidate = resolve }))
+    const services = new DesktopServices(h.dependencies)
+    const recovering = services.invoke(IPC_CHANNELS.debateRecover, { sessionId: 'session-1' })
+    await vi.waitFor(() => expect(h.repository.getRecoveryCandidate).toHaveBeenCalledOnce())
+
+    await expect(services.invoke(IPC_CHANNELS.debateStart, { setup: createSession().setup }))
+      .rejects.toThrow('操作失败')
+    resolveCandidate({ session: createSession({ state: 'running' }), requiresUserResume: true })
+    await recovering
+    expect(h.orchestrator.start).not.toHaveBeenCalled()
+    await services.dispose()
+  })
+
   it.each([
     [IPC_CHANNELS.debateResume, 'resume'],
     [IPC_CHANNELS.debateRetryCurrentTurn, 'retryCurrentTurn']

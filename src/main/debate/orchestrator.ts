@@ -6,7 +6,7 @@ import type {
   RoleConfig,
   Usage
 } from '../../shared/domain'
-import { debateEventSchema, debateSetupSchema } from '../../shared/schemas'
+import { debateEventSchema, debateSessionSchema, debateSetupSchema } from '../../shared/schemas'
 import {
   ProviderNonRetryableError,
   ProviderRefusalError,
@@ -24,6 +24,7 @@ import { parseReply } from './reply-parser'
 import {
   createDebateMachine,
   reduceDebateState,
+  restoreDebateMachine,
   type DebateMachineAction,
   type DebateMachineState
 } from './state-machine'
@@ -64,6 +65,9 @@ export class DebateOrchestrator {
   private saveQueue: Promise<void> = Promise.resolve()
   private generation = 0
   private durableEvents: DebateEvent[] = []
+  private contextCompressed = false
+  private restoredNeedsValidation = false
+  private restoreResumePromise?: Promise<DebateSession>
   private readonly clock: () => Date
   private readonly idFactory: () => string
   private readonly retryPolicy: RetryPolicy
@@ -83,6 +87,23 @@ export class DebateOrchestrator {
     this.retryNow = dependencies.retryNow ?? Date.now
     this.retryRandom = dependencies.retryRandom ?? Math.random
     this.retryMaxDelayMs = dependencies.retryMaxDelayMs
+  }
+
+  static restore(
+    dependencies: OrchestratorDependencies,
+    input: DebateSession
+  ): DebateOrchestrator {
+    const session = debateSessionSchema.parse(input)
+    if (session.events.some((event) => event.sessionId !== session.id)) {
+      throw new TypeError('Cannot restore debate session')
+    }
+    const orchestrator = new DebateOrchestrator(dependencies)
+    orchestrator.machine = restoreDebateMachine(session)
+    orchestrator.createdAt = session.createdAt
+    orchestrator.durableEvents = structuredClone(session.events)
+    orchestrator.contextCompressed = session.contextCompressed
+    orchestrator.restoredNeedsValidation = true
+    return orchestrator
   }
 
   async start(input: DebateSetup, signal?: AbortSignal): Promise<DebateSession> {
@@ -139,9 +160,42 @@ export class DebateOrchestrator {
   }
 
   async resume(): Promise<DebateSession> {
+    if (this.restoredNeedsValidation) {
+      if (this.restoreResumePromise !== undefined) return await this.restoreResumePromise
+      const pending = this.resumeRestored()
+      this.restoreResumePromise = pending
+      try {
+        return await pending
+      } finally {
+        if (this.restoreResumePromise === pending) this.restoreResumePromise = undefined
+      }
+    }
     if (!this.transition({ type: 'resume' })) {
       return this.session()
     }
+    await this.ensureDrive()
+    return this.session()
+  }
+
+  private async resumeRestored(): Promise<DebateSession> {
+    if (this.requireMachine().phase !== 'paused') return this.session()
+    for (const role of this.requireMachine().setup.roles) {
+      try {
+        const capabilities = await this.dependencies.registry[role.provider].discover(role)
+        if (!capabilities.models.some(({ id }) => id === role.model)) {
+          throw new ProviderNonRetryableError(
+            'The configured model is not available from provider discovery'
+          )
+        }
+      } catch (error) {
+        this.emitProviderDiscoveryError(role, error)
+        this.transition({ type: 'recoveryValidationFailed' })
+        await this.enqueueSave()
+        return this.session()
+      }
+    }
+    this.restoredNeedsValidation = false
+    this.transition({ type: 'resume' })
     await this.ensureDrive()
     return this.session()
   }
@@ -455,7 +509,7 @@ export class DebateOrchestrator {
       ...(machine.terminationReason === undefined
         ? {}
         : { terminationReason: machine.terminationReason }),
-      contextCompressed: false
+      contextCompressed: this.contextCompressed
     }
   }
 }

@@ -56,12 +56,13 @@ const terminalStates: ReadonlySet<DebateSessionState> = new Set([
 
 const turnKey = (roleId: RoleId, turn: number): string => `${roleId}:${turn}`
 
-export function createDebateViewState(): DebateViewState {
-  return {
+export function createDebateViewState(initialSession?: DebateSession): DebateViewState {
+  const empty: DebateViewState = {
     attempt: 0, phase: 'starting', currentTurn: 0, messages: [], drafts: {}, warnings: [],
     compressedRoles: [], usage: {}, startRejected: false, hasStartedSession: false,
     ignoredSessionIds: new Set(), seenEventIds: new Set(), completedTurns: new Set(), contentRevision: 0
   }
+  return initialSession === undefined ? empty : mergeSession(empty, initialSession)
 }
 
 function upsertMessage(messages: DebateMessage[], message: DebateMessage): DebateMessage[] {
@@ -82,6 +83,11 @@ function mergeSession(state: DebateViewState, session: DebateSession): DebateVie
     completedTurns.add(turnKey(message.roleId, message.turn))
   }
   return { ...next, phase: session.state, currentTurn: Math.max(next.currentTurn, session.currentTurn),
+    currentRoleId: session.state === 'paused'
+      ? (session.currentTurn % 2 === 0
+          ? session.setup.firstSpeaker
+          : session.setup.firstSpeaker === 'role-a' ? 'role-b' : 'role-a')
+      : next.currentRoleId,
     hasStartedSession: next.hasStartedSession || session.messages.length > 0 ||
       !['idle', 'validating', 'failed'].includes(session.state),
     session, messages, completedTurns, drafts: terminalStates.has(session.state) ? {} : next.drafts,
@@ -153,8 +159,8 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
   }
 }
 
-export function useDebateEvents(): [DebateViewState, React.Dispatch<DebateViewAction>] {
-  const [state, dispatch] = useReducer(debateViewReducer, undefined, createDebateViewState)
+export function useDebateEvents(initialSession?: DebateSession): [DebateViewState, React.Dispatch<DebateViewAction>] {
+  const [state, dispatch] = useReducer(debateViewReducer, initialSession, createDebateViewState)
   useEffect(() => window.aiDebates.debate.onEvent((event) => dispatch({ type: 'event', event })), [])
   return [state, dispatch]
 }

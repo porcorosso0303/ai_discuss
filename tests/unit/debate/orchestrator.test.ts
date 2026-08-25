@@ -50,6 +50,77 @@ const jsonReply = (speech: string, status = 'continue'): string =>
 const acceptsProviderContract = (_provider: Provider): void => undefined
 
 describe('DebateOrchestrator turn scheduling', () => {
+  it('restores passively and validates providers only when the user resumes', async () => {
+    const openai = new FakeProvider([])
+    const kimi = new FakeProvider([{ chunks: [
+      { type: 'content', content: jsonReply('恢复后的乙方回应') },
+      { type: 'final', finishReason: 'stop' }
+    ] }])
+    const saved = {
+      id: 'restored-session', setup: setup(2), state: 'running' as const,
+      messages: [{
+        id: 'old-message', turn: 1, roleId: 'role-a' as const, provider: 'openai' as const,
+        model: 'gpt-5', speech: '已保存的甲方观点', status: 'continue' as const,
+        createdAt: '2026-08-12T00:00:01.000Z'
+      }],
+      events: [{
+        id: 'old-event', sessionId: 'restored-session', createdAt: '2026-08-12T00:00:01.000Z',
+        type: 'message-completed' as const,
+        message: {
+          id: 'old-message', turn: 1, roleId: 'role-a' as const, provider: 'openai' as const,
+          model: 'gpt-5', speech: '已保存的甲方观点', status: 'continue' as const,
+          createdAt: '2026-08-12T00:00:01.000Z'
+        }
+      }],
+      currentTurn: 1, createdAt: '2026-08-12T00:00:00.000Z',
+      updatedAt: '2026-08-12T00:00:01.000Z', contextCompressed: true
+    }
+    const repository = new FakeDebateRepository()
+    const orchestrator = DebateOrchestrator.restore({
+      ...deterministicDependencies(), registry: { openai, kimi, deepseek: new FakeProvider([]) },
+      repository
+    }, saved)
+
+    expect(orchestrator.getSession()).toMatchObject({
+      id: 'restored-session', state: 'paused', currentTurn: 1,
+      messages: saved.messages, events: saved.events, contextCompressed: true
+    })
+    expect(openai.discoverCalls).toEqual([])
+    expect(kimi.discoverCalls).toEqual([])
+    expect(kimi.requests).toEqual([])
+
+    const resumed = await orchestrator.resume()
+    expect(openai.discoverCalls).toHaveLength(1)
+    expect(kimi.discoverCalls).toHaveLength(1)
+    expect(kimi.requests).toHaveLength(1)
+    expect(resumed.messages.map(({ speech }) => speech)).toEqual([
+      '已保存的甲方观点', '恢复后的乙方回应'
+    ])
+    expect(resumed.state).toBe('unresolved')
+    expect(resumed.contextCompressed).toBe(true)
+  })
+
+  it('fails a restored session if its models are unavailable when resume is requested', async () => {
+    const openai = new FakeProvider([])
+    openai.discover = async () => { throw new ProviderNonRetryableError('model unavailable') }
+    const saved = {
+      id: 'restored-session', setup: setup(2), state: 'paused' as const, messages: [], events: [],
+      currentTurn: 0, createdAt: '2026-08-12T00:00:00.000Z',
+      updatedAt: '2026-08-12T00:00:01.000Z', contextCompressed: false
+    }
+    const events: Array<{ type: string }> = []
+    const orchestrator = DebateOrchestrator.restore({
+      ...deterministicDependencies(),
+      registry: { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(), onEvent: (item) => events.push(item)
+    }, saved)
+
+    await expect(orchestrator.resume()).resolves.toMatchObject({
+      state: 'failed', terminationReason: 'call-failed'
+    })
+    expect(events.map(({ type }) => type)).toEqual(['warning', 'state-changed'])
+  })
+
   it('passes the startup abort signal through every role validation', async () => {
     const signals: Array<AbortSignal | undefined> = []
     const openai = new FakeProvider([])

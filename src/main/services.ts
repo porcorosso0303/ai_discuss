@@ -53,6 +53,10 @@ interface DebateRepositoryPort {
   saveSession(session: DebateSession): Promise<void>
   list(options?: DebateListOptions): Promise<DebateSessionSummary[]>
   get(id: unknown): Promise<DebateSession | null>
+  getRecoveryCandidate(id: unknown): Promise<{
+    session: DebateSession
+    requiresUserResume: true
+  } | null>
   delete(id: unknown): Promise<boolean>
   clear(): Promise<number>
 }
@@ -77,7 +81,10 @@ export interface DesktopServicesDependencies {
   providers: { openai: OpenAIProviderPort; kimi: Provider; deepseek: Provider }
   repository: DebateRepositoryPort
   exporter: ExporterPort
-  createOrchestrator(onEvent: (event: DebateEvent) => void): OrchestratorPort
+  createOrchestrator(
+    onEvent: (event: DebateEvent) => void,
+    initialSession?: DebateSession
+  ): OrchestratorPort
   emit<Channel extends IpcEventChannel>(
     channel: Channel,
     payload: IpcEventMap[Channel]
@@ -120,6 +127,7 @@ export class DesktopServices {
   private readonly shutdown: AbortController
   private active?: OrchestratorPort
   private startInFlight?: Promise<DebateSession>
+  private recoverInFlight?: Promise<DebateSession>
   private loginPending = false
   private loginGeneration = 0
   private activeLogin?: { generation: number; loginId: string }
@@ -192,6 +200,11 @@ export class DesktopServices {
         case IPC_CHANNELS.debateStart: {
           const { setup } = ipcInvokeContracts[channel].request.parse(input)
           response = { session: await this.startDebate(setup) }
+          break
+        }
+        case IPC_CHANNELS.debateRecover: {
+          const { sessionId } = ipcInvokeContracts[channel].request.parse(input)
+          response = { session: await this.recoverDebate(sessionId) }
           break
         }
         case IPC_CHANNELS.debatePause:
@@ -428,7 +441,9 @@ export class DesktopServices {
   }
 
   private async startDebate(setup: DebateSetup): Promise<DebateSession> {
-    if (this.startInFlight !== undefined) throw new Error('Debate start is already in progress')
+    if (this.startInFlight !== undefined || this.recoverInFlight !== undefined) {
+      throw new Error('Debate activation is already in progress')
+    }
     if (this.active !== undefined) {
       const current = this.active.getSession()
       if (!terminalStates.has(current.state)) throw new Error('A debate is already active')
@@ -451,6 +466,35 @@ export class DesktopServices {
       throw error
     } finally {
       if (this.startInFlight === pending) this.startInFlight = undefined
+    }
+  }
+
+  private async recoverDebate(sessionId: string): Promise<DebateSession> {
+    if (this.startInFlight !== undefined || this.recoverInFlight !== undefined) {
+      throw new Error('Debate activation is already in progress')
+    }
+    if (this.active !== undefined && !terminalStates.has(this.active.getSession().state)) {
+      throw new Error('A debate is already active')
+    }
+    const pending = (async (): Promise<DebateSession> => {
+      const candidate = await this.dependencies.repository.getRecoveryCandidate(sessionId)
+      this.ensureUsable()
+      if (candidate === null) throw new Error('No incomplete debate can be recovered')
+      const orchestrator = this.dependencies.createOrchestrator((event) => {
+        this.safeEmit(IPC_CHANNELS.debateEvent, event)
+      }, candidate.session)
+      const restored = orchestrator.getSession()
+      if (restored.id !== candidate.session.id || restored.state !== 'paused') {
+        throw new Error('Recovered debate was not normalized to paused')
+      }
+      this.active = orchestrator
+      return restored
+    })()
+    this.recoverInFlight = pending
+    try {
+      return await pending
+    } finally {
+      if (this.recoverInFlight === pending) this.recoverInFlight = undefined
     }
   }
 
@@ -552,7 +596,9 @@ export function createProductionDesktopServices({
   const services = new DesktopServices({
     version: app.getVersion(), config, credentials, providers, repository, exporter, emit, log,
     shutdownController,
-    createOrchestrator: (onEvent) => new DebateOrchestrator({ registry: providers, repository, onEvent })
+    createOrchestrator: (onEvent, initialSession) => initialSession === undefined
+      ? new DebateOrchestrator({ registry: providers, repository, onEvent })
+      : DebateOrchestrator.restore({ registry: providers, repository, onEvent }, initialSession)
   })
   return { services, log }
 }

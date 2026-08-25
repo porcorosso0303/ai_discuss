@@ -84,12 +84,16 @@ function apiHarness(options: { delayedStart?: boolean } = {}) {
     },
     providers: { discoverCapabilities: vi.fn(), testConnection: vi.fn() },
     debate: {
-      start: vi.fn(() => startResult), pause: vi.fn(async () => ({ accepted: true })),
+      start: vi.fn(() => startResult), recover: vi.fn(async () => ({ session: session({ state: 'paused', terminationReason: undefined }) })),
+      pause: vi.fn(async () => ({ accepted: true })),
       resume: vi.fn(async () => ({ accepted: true })), stop: vi.fn(async () => ({ accepted: true })),
       retryCurrentTurn: vi.fn(async () => ({ accepted: true })),
       onEvent: vi.fn((listener) => { debateListener = listener; return unsubscribeDebate })
     },
-    history: { list: vi.fn(), get: vi.fn(), delete: vi.fn(), clear: vi.fn() },
+    history: {
+      list: vi.fn(async () => ({ sessions: [] })),
+      get: vi.fn(async () => ({ session: null })), delete: vi.fn(), clear: vi.fn()
+    },
     export: { markdown: vi.fn() }
   } as unknown as AiDebatesApi
   Object.defineProperty(window, 'aiDebates', { configurable: true, value: api })
@@ -191,6 +195,29 @@ describe('live debate page', () => {
       topic: '人工智能是否改善教育公平', firstSpeaker: 'role-a', maxTurns: 100, roles
     }) })
     expect(screen.getByText('正在启动')).toBeInTheDocument()
+  })
+
+  it('loads a recovered session as paused and makes no request until continue is clicked', async () => {
+    const harness = apiHarness()
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1,
+      messages: [{
+        id: 'restored-message', turn: 1, roleId: 'role-a', provider: 'openai', model: 'gpt-test',
+        speech: '恢复前的发言', status: 'continue', createdAt: now
+      }]
+    })
+    const user = userEvent.setup()
+
+    render(<DebatePage roles={roles} initialSession={recovered} onBack={vi.fn()} />)
+
+    expect(screen.getByText('已恢复，等待用户继续')).toBeInTheDocument()
+    expect(screen.getByText('恢复前的发言')).toBeInTheDocument()
+    expect(screen.getByText('已暂停')).toBeInTheDocument()
+    expect(harness.api.debate.start).not.toHaveBeenCalled()
+    expect(harness.api.debate.resume).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: '继续辩论' }))
+    expect(harness.api.debate.resume).toHaveBeenCalledWith({ sessionId: 'session-1' })
   })
 
   it('shows streamed speech before the start promise resolves without rendering hidden payloads', async () => {
@@ -380,6 +407,34 @@ describe('live debate page', () => {
 })
 
 describe('configuration navigation', () => {
+  it('opens history and mounts a recovered session from its saved role snapshot without auto-resuming', async () => {
+    const harness = apiHarness()
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 0,
+      messages: [], updatedAt: '2026-08-24T09:00:00.000Z'
+    })
+    ;(harness.api.history.list as ReturnType<typeof vi.fn>).mockResolvedValue({ sessions: [{
+      id: recovered.id, topic: recovered.setup.topic, state: recovered.state,
+      currentTurn: recovered.currentTurn, createdAt: recovered.createdAt, updatedAt: recovered.updatedAt
+    }] })
+    ;(harness.api.history.get as ReturnType<typeof vi.fn>).mockResolvedValue({ session: recovered })
+    ;(harness.api.debate.recover as ReturnType<typeof vi.fn>).mockResolvedValue({ session: recovered })
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(await screen.findByRole('button', { name: '历史记录' }))
+    expect(await screen.findByRole('heading', { name: '辩论档案' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '历史记录' })).toHaveAttribute('aria-current', 'page')
+    await user.click(await screen.findByRole('button', { name: /查看测试话题/ }))
+    await user.click(await screen.findByRole('button', { name: '加载并恢复' }))
+
+    expect(await screen.findByText('已恢复，等待用户继续')).toBeInTheDocument()
+    expect(harness.api.debate.start).not.toHaveBeenCalled()
+    expect(harness.api.debate.resume).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: '角色配置' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '历史记录' })).toBeDisabled()
+  })
+
   it('navigates with buttons and locks configuration while a debate is active', async () => {
     const harness = apiHarness({ delayedStart: true })
     const { api } = harness
@@ -420,6 +475,6 @@ describe('configuration navigation', () => {
     expect(configuration).toBeEnabled()
     await user.click(screen.getByRole('button', { name: '返回角色配置' }))
     expect(await screen.findByRole('heading', { name: '配置 AI 角色' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '历史记录' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '历史记录' })).toBeEnabled()
   })
 })

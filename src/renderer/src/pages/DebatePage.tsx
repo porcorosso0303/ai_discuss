@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import type { DebateSetup, RoleConfig } from '../../../shared/domain'
+import type { DebateSession, DebateSetup, RoleConfig } from '../../../shared/domain'
 import { DebateControls } from '../components/DebateControls'
 import { DebateSetup as DebateSetupForm } from '../components/DebateSetup'
 import { ResultCard } from '../components/ResultCard'
@@ -14,13 +14,14 @@ const phaseLabels: Record<string, string> = {
 
 const terminalPhases = new Set(['completed', 'stopped', 'unresolved', 'refused', 'failed'])
 
-export function DebatePage({ roles, onBack, onActivityChange }: {
+export function DebatePage({ roles, initialSession, onBack, onActivityChange }: {
   roles: [RoleConfig, RoleConfig]
+  initialSession?: DebateSession
   onBack(): void
   onActivityChange?(active: boolean): void
 }): React.JSX.Element {
-  const [state, dispatch] = useDebateEvents()
-  const [started, setStarted] = useState(false)
+  const [state, dispatch] = useDebateEvents(initialSession)
+  const [started, setStarted] = useState(initialSession !== undefined)
   const [startBusy, setStartBusy] = useState(false)
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string>()
@@ -83,6 +84,8 @@ export function DebatePage({ roles, onBack, onActivityChange }: {
       <span>第 {state.currentTurn} / {state.setup?.maxTurns ?? 100} 轮</span>
       <span>{currentRole ? `当前：${currentRole.name}` : '等待首位辩手'}</span></div>
     {controlError || state.error ? <p className="page-error live-error" role="alert">{controlError ?? state.error}</p> : null}
+    {initialSession !== undefined && state.phase === 'paused'
+      ? <p className="recovered-note" role="status">已恢复，等待用户继续</p> : null}
     {state.warnings.map((warning) => <p className="debate-warning" role="status" key={warning.id}>提示：{warning.message}</p>)}
     {state.compressedRoles.length > 0 ? <p className="context-note">较早对话已压缩，以便继续辩论。</p> : null}
     <Timeline roles={roles} messages={state.messages} drafts={state.drafts} revision={state.contentRevision} />

@@ -28,6 +28,7 @@ export const IPC_CHANNELS = {
   providerDiscoverCapabilities: 'provider:discover-capabilities',
   providerTestConnection: 'provider:test-connection',
   debateStart: 'debate:start',
+  debateRecover: 'debate:recover',
   debatePause: 'debate:pause',
   debateResume: 'debate:resume',
   debateStop: 'debate:stop',
@@ -72,6 +73,8 @@ export const debateSessionSummarySchema = z.strictObject({
   createdAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true })
 })
+
+export type DebateSessionSummary = z.output<typeof debateSessionSummarySchema>
 
 const ipcSchemas = {
   appGetVersion: {
@@ -133,6 +136,10 @@ const ipcSchemas = {
     request: z.strictObject({ setup: debateSetupSchema }),
     response: z.strictObject({ session: debateSessionSchema })
   },
+  debateRecover: {
+    request: sessionRequestSchema,
+    response: z.strictObject({ session: debateSessionSchema })
+  },
   debatePause: {
     request: sessionRequestSchema,
     response: acknowledgementSchema
@@ -191,6 +198,7 @@ export const ipcInvokeContracts = {
   [IPC_CHANNELS.providerDiscoverCapabilities]: ipcSchemas.providerDiscoverCapabilities,
   [IPC_CHANNELS.providerTestConnection]: ipcSchemas.providerTestConnection,
   [IPC_CHANNELS.debateStart]: ipcSchemas.debateStart,
+  [IPC_CHANNELS.debateRecover]: ipcSchemas.debateRecover,
   [IPC_CHANNELS.debatePause]: ipcSchemas.debatePause,
   [IPC_CHANNELS.debateResume]: ipcSchemas.debateResume,
   [IPC_CHANNELS.debateStop]: ipcSchemas.debateStop,

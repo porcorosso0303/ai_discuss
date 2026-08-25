@@ -82,6 +82,7 @@ const providersApi = Object.freeze({
 })
 const debateApi = Object.freeze({
   start: (request: IpcRequestMap[typeof IPC_CHANNELS.debateStart]) => invoke(IPC_CHANNELS.debateStart, request),
+  recover: (request: IpcRequestMap[typeof IPC_CHANNELS.debateRecover]) => invoke(IPC_CHANNELS.debateRecover, request),
   pause: (request: IpcRequestMap[typeof IPC_CHANNELS.debatePause]) => invoke(IPC_CHANNELS.debatePause, request),
   resume: (request: IpcRequestMap[typeof IPC_CHANNELS.debateResume]) => invoke(IPC_CHANNELS.debateResume, request),
   stop: (request: IpcRequestMap[typeof IPC_CHANNELS.debateStop]) => invoke(IPC_CHANNELS.debateStop, request),

@@ -1,30 +1,53 @@
 import { useState } from 'react'
 
-import { AppShell } from './components/AppShell'
+import type { DebateSession, RoleConfig } from '../../shared/domain'
+import { AppShell, type AppRoute } from './components/AppShell'
 import { DebatePage } from './pages/DebatePage'
 import { ConfigurationPage } from './pages/ConfigurationPage'
+import { HistoryPage } from './pages/HistoryPage'
 import { AppStateProvider, toRoleConfig, useAppState } from './state/app-state'
 
 function AppContent(): React.JSX.Element {
   const { roles, canContinue } = useAppState()
-  const [route, setRoute] = useState<'configuration' | 'debate'>('configuration')
+  const [route, setRoute] = useState<AppRoute>('configuration')
   const [debateActive, setDebateActive] = useState(false)
+  const [initialSession, setInitialSession] = useState<DebateSession>()
+  const [debateRoles, setDebateRoles] = useState<[RoleConfig, RoleConfig]>()
   const roleA = toRoleConfig(roles['role-a'])
   const roleB = toRoleConfig(roles['role-b'])
   const enterDebate = (): void => {
-    if (canContinue && roleA !== undefined && roleB !== undefined) setRoute('debate')
+    if (canContinue && roleA !== undefined && roleB !== undefined) {
+      setInitialSession(undefined)
+      setDebateRoles([roleA, roleB])
+      setRoute('debate')
+    }
   }
-  const navigate = (next: 'configuration' | 'debate'): void => {
+  const navigate = (next: AppRoute): void => {
+    if (debateActive && next !== 'debate') return
     if (next === 'configuration') {
-      if (!debateActive) setRoute(next)
+      setInitialSession(undefined)
+      setRoute(next)
       return
     }
-    enterDebate()
+    if (next === 'history') {
+      setRoute('history')
+      return
+    }
+    if (initialSession !== undefined && debateRoles !== undefined) setRoute('debate')
+    else enterDebate()
   }
   return <AppShell active={route} onNavigate={navigate} configurationDisabled={debateActive}
-    debateDisabled={!canContinue || roleA === undefined || roleB === undefined}>{route === 'debate' && roleA !== undefined && roleB !== undefined
-    ? <DebatePage roles={[roleA, roleB]} onActivityChange={setDebateActive} onBack={() => setRoute('configuration')} />
-    : <ConfigurationPage onContinue={enterDebate} />}</AppShell>
+    debateDisabled={debateRoles === undefined && (!canContinue || roleA === undefined || roleB === undefined)}
+    historyDisabled={debateActive}>{route === 'debate' && debateRoles !== undefined
+    ? <DebatePage roles={debateRoles} initialSession={initialSession} onActivityChange={setDebateActive}
+        onBack={() => { setInitialSession(undefined); setRoute('configuration') }} />
+    : route === 'history'
+      ? <HistoryPage onRecover={(session) => {
+          setDebateRoles(session.setup.roles)
+          setInitialSession(session)
+          setRoute('debate')
+        }} />
+      : <ConfigurationPage onContinue={enterDebate} />}</AppShell>
 }
 
 export default function App(): React.JSX.Element {

@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   createDebateMachine,
-  reduceDebateState
+  reduceDebateState,
+  restoreDebateMachine
 } from '../../../src/main/debate/state-machine'
-import type { DebateMessage, DebateSetup, RoleId } from '../../../src/shared/domain'
+import type { DebateMessage, DebateSession, DebateSetup, RoleId } from '../../../src/shared/domain'
 
 const setup = (firstSpeaker: RoleId = 'role-a', maxTurns = 100): DebateSetup => ({
   topic: '人工智能应否进入课堂？',
@@ -55,6 +56,39 @@ const start = (firstSpeaker: RoleId = 'role-a', maxTurns = 100) => {
 }
 
 describe('debate state machine basics', () => {
+  it('restores a consistent incomplete session as paused at the next speaker', () => {
+    const saved: DebateSession = {
+      id: 'saved-session', setup: setup(), state: 'running', messages: [message(1, 'role-a', 'agree')],
+      events: [], currentTurn: 1, createdAt: '2026-08-12T00:00:00.000Z',
+      updatedAt: '2026-08-12T00:01:00.000Z', contextCompressed: true
+    }
+
+    const machine = restoreDebateMachine(saved)
+
+    expect(machine).toMatchObject({
+      sessionId: 'saved-session', phase: 'paused', turnCount: 1,
+      currentSpeaker: 'role-b', turnInFlight: false,
+      pendingAgreementRoleId: 'role-a', messages: saved.messages
+    })
+  })
+
+  it.each([
+    ['terminal state', { state: 'completed', terminationReason: 'agreed' }],
+    ['turn count mismatch', { currentTurn: 2 }],
+    ['wrong speaker order', { messages: [message(1, 'role-b')] }],
+    ['provider mismatch', { messages: [{ ...message(1, 'role-a'), provider: 'kimi' }] }],
+    ['termination fields', { terminationReason: 'call-failed' }]
+  ] as const)('rejects an inconsistent recovery snapshot: %s', (_label, change) => {
+    const saved: DebateSession = {
+      id: 'saved-session', setup: setup(), state: 'running', messages: [message(1, 'role-a')],
+      events: [], currentTurn: 1, createdAt: '2026-08-12T00:00:00.000Z',
+      updatedAt: '2026-08-12T00:01:00.000Z', contextCompressed: false,
+      ...change
+    } as DebateSession
+
+    expect(() => restoreDebateMachine(saved)).toThrow('Cannot restore debate session')
+  })
+
   it('moves through validation and starts with the configured first speaker', () => {
     let machine = createDebateMachine('session-1', setup('role-b'))
 

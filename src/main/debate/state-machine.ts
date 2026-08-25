@@ -1,5 +1,6 @@
 import type {
   DebateMessage,
+  DebateSession,
   DebateSessionState,
   DebateSetup,
   DebateTerminationReason,
@@ -24,6 +25,7 @@ export type DebateMachineAction =
   | { type: 'beginValidation' }
   | { type: 'validationSucceeded' }
   | { type: 'validationFailed' }
+  | { type: 'recoveryValidationFailed' }
   | { type: 'turnStarted'; roleId: RoleId }
   | { type: 'turnCompleted'; message: DebateMessage }
   | { type: 'pauseRequested' }
@@ -63,6 +65,52 @@ const unchanged = (
 
 const otherRole = (roleId: RoleId): RoleId => (roleId === 'role-a' ? 'role-b' : 'role-a')
 
+const recoverablePhases: ReadonlySet<DebateSessionState> = new Set([
+  'idle', 'validating', 'running', 'pausing', 'paused'
+])
+
+export const restoreDebateMachine = (session: DebateSession): DebateMachineState => {
+  const fail = (): never => { throw new TypeError('Cannot restore debate session') }
+  if (
+    !recoverablePhases.has(session.state) ||
+    session.terminationReason !== undefined ||
+    session.winnerRoleId !== undefined ||
+    session.currentTurn !== session.messages.length ||
+    session.currentTurn >= session.setup.maxTurns
+  ) fail()
+
+  for (let index = 0; index < session.messages.length; index += 1) {
+    const item = session.messages[index]
+    const expectedRole = index % 2 === 0
+      ? session.setup.firstSpeaker
+      : otherRole(session.setup.firstSpeaker)
+    const role = session.setup.roles.find(({ roleId }) => roleId === expectedRole)
+    if (
+      item === undefined || role === undefined || item.turn !== index + 1 ||
+      item.roleId !== expectedRole || item.provider !== role.provider || item.model !== role.model ||
+      item.status === 'concede'
+    ) fail()
+    if (item.status === 'agree' && index > 0 && session.messages[index - 1]?.status === 'agree') {
+      fail()
+    }
+  }
+
+  const currentSpeaker = session.currentTurn % 2 === 0
+    ? session.setup.firstSpeaker
+    : otherRole(session.setup.firstSpeaker)
+  const last = session.messages.at(-1)
+  return {
+    sessionId: session.id,
+    setup: session.setup,
+    phase: 'paused',
+    messages: session.messages,
+    turnCount: session.currentTurn,
+    currentSpeaker,
+    turnInFlight: false,
+    ...(last?.status === 'agree' ? { pendingAgreementRoleId: last.roleId } : {})
+  }
+}
+
 export const reduceDebateState = (
   state: DebateMachineState,
   action: DebateMachineAction
@@ -80,6 +128,19 @@ export const reduceDebateState = (
 
     case 'validationFailed':
       return state.phase === 'validating'
+        ? {
+            state: {
+              ...state,
+              phase: 'failed',
+              turnInFlight: false,
+              terminationReason: 'call-failed',
+              failureStage: 'validation'
+            }
+          }
+        : unchanged(state, action)
+
+    case 'recoveryValidationFailed':
+      return state.phase === 'paused'
         ? {
             state: {
               ...state,

@@ -39,7 +39,7 @@ describe('preload aiDebates API', () => {
       'app', 'config', 'credentials', 'openAI', 'providers', 'debate', 'history', 'export'
     ])
     expect(Reflect.ownKeys(api.debate)).toEqual([
-      'start', 'pause', 'resume', 'stop', 'retryCurrentTurn', 'onEvent'
+      'start', 'recover', 'pause', 'resume', 'stop', 'retryCurrentTurn', 'onEvent'
     ])
     expect(Reflect.ownKeys(api.openAI)).toEqual([
       'getAuthStatus', 'startLogin', 'logout', 'onAuthChanged'
@@ -65,6 +65,20 @@ describe('preload aiDebates API', () => {
     expect(electron.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.credentialsHasProviderSecret, {
       scope: { roleId: 'role-a', provider: 'deepseek', origin: 'https://api.deepseek.com' }
     })
+
+    const recovered = {
+      id: 'session-1', setup: {
+        topic: '恢复话题', roles: [
+          { roleId: 'role-a', provider: 'openai', name: 'A', personaOrStance: '', model: 'gpt', effort: 'none' },
+          { roleId: 'role-b', provider: 'openai', name: 'B', personaOrStance: '', model: 'gpt', effort: 'none' }
+        ], firstSpeaker: 'role-a', maxTurns: 100
+      }, state: 'paused', messages: [], events: [], currentTurn: 0,
+      createdAt: '2026-08-25T00:00:00.000Z', updatedAt: '2026-08-25T00:00:00.000Z',
+      contextCompressed: false
+    }
+    electron.invoke.mockResolvedValueOnce({ session: recovered })
+    await expect(api.debate.recover({ sessionId: 'session-1' })).resolves.toEqual({ session: recovered })
+    expect(electron.invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.debateRecover, { sessionId: 'session-1' })
   })
 
   it('filters invalid event payloads and unsubscribes exactly once', async () => {
