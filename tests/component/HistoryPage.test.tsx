@@ -66,6 +66,47 @@ function installApi() {
 afterEach(cleanup)
 
 describe('history page', () => {
+  it('locks selection and history mutations while recovery is pending, then navigates once', async () => {
+    const api = installApi()
+    const recovery = deferred<{ session: DebateSession }>()
+    api.debate.recover.mockReturnValueOnce(recovery.promise)
+    const onRecover = vi.fn()
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={onRecover} />)
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await screen.findByRole('heading', { name: newer.setup.topic })
+
+    await user.click(screen.getByRole('button', { name: '加载并恢复' }))
+    expect(screen.getByRole('button', { name: /查看人工智能会改善教育吗/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '搜索' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '清空历史记录' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /删除人工智能会改善教育吗/ })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '加载并恢复' }))
+    expect(api.debate.recover).toHaveBeenCalledTimes(1)
+
+    recovery.resolve({ session: newer })
+    await waitFor(() => expect(onRecover).toHaveBeenCalledWith(newer))
+    expect(onRecover).toHaveBeenCalledTimes(1)
+  })
+
+  it('unlocks and preserves selection after recovery rejects', async () => {
+    const api = installApi()
+    const recovery = deferred<{ session: DebateSession }>()
+    api.debate.recover.mockReturnValueOnce(recovery.promise)
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await screen.findByRole('heading', { name: newer.setup.topic })
+    await user.click(screen.getByRole('button', { name: '加载并恢复' }))
+
+    recovery.reject(new Error('restore failed'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('恢复失败')
+    expect(screen.getByRole('heading', { name: newer.setup.topic })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /查看人工智能会改善教育吗/ })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: /查看人工智能会改善教育吗/ }))
+    expect(await screen.findByRole('heading', { name: older.setup.topic })).toBeInTheDocument()
+  })
+
   it('ignores an older detail response after a newer selection', async () => {
     const api = installApi()
     const oldDetail = deferred<{ session: DebateSession | null }>()

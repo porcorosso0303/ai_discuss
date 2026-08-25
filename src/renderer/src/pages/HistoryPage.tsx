@@ -7,6 +7,7 @@ import { HistoryDetail } from '../components/HistoryDetail'
 import { HistoryList } from '../components/HistoryList'
 
 type Confirmation = { kind: 'delete'; sessionId: string } | { kind: 'clear' }
+type OperationKind = 'export' | 'recover' | 'mutation'
 
 export function HistoryPage({ onRecover }: {
   onRecover(session: DebateSession): void
@@ -15,7 +16,7 @@ export function HistoryPage({ onRecover }: {
   const [selected, setSelected] = useState<DebateSession>()
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
-  const [busy, setBusy] = useState(false)
+  const [operationKind, setOperationKind] = useState<OperationKind>()
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [query, setQuery] = useState('')
@@ -23,14 +24,19 @@ export function HistoryPage({ onRecover }: {
   const listGeneration = useRef(0)
   const detailGeneration = useRef(0)
   const operationGeneration = useRef(0)
+  const activeOperation = useRef<OperationKind | undefined>(undefined)
+  const mounted = useRef(false)
+  const busy = operationKind !== undefined
 
   const loadList = useCallback((search?: string): void => {
+    if (activeOperation.current === 'recover' || activeOperation.current === 'mutation') return
     const generation = ++listGeneration.current
     detailGeneration.current += 1
     operationGeneration.current += 1
     setLoading(true)
     setDetailLoading(false)
-    setBusy(false)
+    activeOperation.current = undefined
+    setOperationKind(undefined)
     setSelected(undefined)
     setNotice(undefined)
     setError(undefined)
@@ -51,19 +57,24 @@ export function HistoryPage({ onRecover }: {
   }, [])
 
   useEffect(() => {
+    mounted.current = true
     loadList()
     return () => {
+      mounted.current = false
       listGeneration.current += 1
       detailGeneration.current += 1
       operationGeneration.current += 1
+      activeOperation.current = undefined
     }
   }, [loadList])
 
   const selectSession = (sessionId: string): void => {
+    if (activeOperation.current === 'recover' || activeOperation.current === 'mutation') return
     const generation = ++detailGeneration.current
     operationGeneration.current += 1
+    activeOperation.current = undefined
     setDetailLoading(true)
-    setBusy(false)
+    setOperationKind(undefined)
     setSelected(undefined)
     setError(undefined)
     setNotice(undefined)
@@ -79,9 +90,10 @@ export function HistoryPage({ onRecover }: {
   }
 
   const exportSelected = (): void => {
-    if (selected === undefined || busy) return
+    if (selected === undefined || activeOperation.current !== undefined) return
     const generation = ++operationGeneration.current
-    setBusy(true)
+    activeOperation.current = 'export'
+    setOperationKind('export')
     setError(undefined)
     setNotice(undefined)
     void window.aiDebates.export.markdown({ sessionId: selected.id }).then((result) => {
@@ -90,36 +102,48 @@ export function HistoryPage({ onRecover }: {
     }).catch(() => {
       if (generation === operationGeneration.current) setError('导出失败，请重试')
     }).finally(() => {
-      if (generation === operationGeneration.current) setBusy(false)
+      if (generation === operationGeneration.current) {
+        activeOperation.current = undefined
+        if (mounted.current) setOperationKind(undefined)
+      }
     })
   }
 
   const recoverSelected = (): void => {
-    if (selected === undefined || busy) return
+    if (selected === undefined || activeOperation.current !== undefined) return
+    const sessionId = selected.id
     const generation = ++operationGeneration.current
-    setBusy(true)
+    activeOperation.current = 'recover'
+    setOperationKind('recover')
     setError(undefined)
-    void window.aiDebates.debate.recover({ sessionId: selected.id })
+    void window.aiDebates.debate.recover({ sessionId })
       .then(({ session }) => {
-        if (generation === operationGeneration.current) onRecover(session)
+        if (session.id !== sessionId) throw new Error('Recovered session mismatch')
+        if (generation === operationGeneration.current && mounted.current) onRecover(session)
       })
       .catch(() => {
-        if (generation === operationGeneration.current) setError('恢复失败，请重试')
+        if (generation === operationGeneration.current && mounted.current) {
+          setError('恢复失败，请重试')
+        }
       })
       .finally(() => {
-        if (generation === operationGeneration.current) setBusy(false)
+        if (generation === operationGeneration.current) {
+          activeOperation.current = undefined
+          if (mounted.current) setOperationKind(undefined)
+        }
       })
   }
 
   const confirmOperation = (): void => {
-    if (confirmation === undefined || busy) return
+    if (confirmation === undefined || activeOperation.current !== undefined) return
     const target = confirmation
     listGeneration.current += 1
     detailGeneration.current += 1
     const generation = ++operationGeneration.current
+    activeOperation.current = 'mutation'
     setLoading(false)
     setDetailLoading(false)
-    setBusy(true)
+    setOperationKind('mutation')
     setError(undefined)
     const operation = target.kind === 'clear'
       ? window.aiDebates.history.clear()
@@ -142,7 +166,10 @@ export function HistoryPage({ onRecover }: {
       setError(target.kind === 'clear' ? '清空失败，请重试' : '删除失败，请重试')
       setConfirmation(undefined)
     }).finally(() => {
-      if (generation === operationGeneration.current) setBusy(false)
+      if (generation === operationGeneration.current) {
+        activeOperation.current = undefined
+        if (mounted.current) setOperationKind(undefined)
+      }
     })
   }
 
@@ -154,8 +181,11 @@ export function HistoryPage({ onRecover }: {
     </header>
     <form className="history-search" role="search" onSubmit={(event) => { event.preventDefault(); loadList(query) }}>
       <label htmlFor="history-search">搜索历史记录</label>
-      <input id="history-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
-      <button type="submit" className="button secondary" disabled={loading || busy}>搜索</button>
+      <input id="history-search" type="search" value={query}
+        disabled={operationKind === 'recover' || operationKind === 'mutation'}
+        onChange={(event) => setQuery(event.target.value)} />
+      <button type="submit" className="button secondary"
+        disabled={loading || operationKind === 'recover' || operationKind === 'mutation'}>搜索</button>
     </form>
     {error ? <p className="page-error" role="alert">{error}</p> : null}
     {loading && sessions.length === 0 ? <p className="history-empty" role="status">正在加载历史记录…</p> : null}
@@ -163,7 +193,7 @@ export function HistoryPage({ onRecover }: {
     {!loading && !error && sessions.length === 0 ? <div className="history-empty"><h2>暂无历史记录</h2><p>完成或暂停一场辩论后，会在这里显示。</p></div> : null}
     {sessions.length > 0 ? <div className="history-layout">
       <aside><HistoryList sessions={sessions} selectedId={selected?.id} busy={busy}
-        selectionDisabled={busy && confirmation !== undefined}
+        selectionDisabled={operationKind === 'recover' || operationKind === 'mutation'}
         onSelect={selectSession} onDelete={(sessionId) => setConfirmation({ kind: 'delete', sessionId })} /></aside>
       <main>{detailLoading ? <p className="history-empty" role="status">正在加载详情…</p>
         : selected === undefined ? <div className="history-empty"><h2>选择一条记录</h2><p>详情将在此处显示。</p></div>
