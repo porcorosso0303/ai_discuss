@@ -56,9 +56,11 @@ export function DebatePage({ roles, initialSession, onBack, onActivityChange }: 
   const control = (action: 'pause' | 'resume' | 'stop' | 'retryCurrentTurn'): void => {
     if (state.sessionId === undefined || controlBusy) return
     if (action === 'stop') dispatch({ type: 'discard-drafts' })
+    if (action === 'resume') dispatch({ type: 'recovery-resume-requested' })
     setControlBusy(true)
     setControlError(undefined)
     void window.aiDebates.debate[action]({ sessionId: state.sessionId }).catch(() => {
+      if (action === 'resume') dispatch({ type: 'recovery-resume-rejected' })
       setControlError('操作失败，请重试')
     }).finally(() => setControlBusy(false))
   }
@@ -74,7 +76,7 @@ export function DebatePage({ roles, initialSession, onBack, onActivityChange }: 
   return <section className="debate-page live-debate-page" aria-labelledby="live-debate-title">
     <header className="live-heading"><div><p className="eyebrow">第三步</p><h1 id="live-debate-title">{state.setup?.topic}</h1></div>
       <DebateControls phase={state.phase} enabled={state.sessionId !== undefined}
-        canRetry={state.startRejected
+        canRetry={state.recoveryValidationFailed ? false : state.startRejected
           ? !startBusy && state.setup !== undefined
           : state.sessionId !== undefined}
         retryLabel={state.startRejected || state.sessionId === undefined ? '重新启动辩论' : '重试当前轮'} busy={controlBusy}
@@ -84,6 +86,8 @@ export function DebatePage({ roles, initialSession, onBack, onActivityChange }: 
       <span>第 {state.currentTurn} / {state.setup?.maxTurns ?? 100} 轮</span>
       <span>{currentRole ? `当前：${currentRole.name}` : '等待首位辩手'}</span></div>
     {controlError || state.error ? <p className="page-error live-error" role="alert">{controlError ?? state.error}</p> : null}
+    {state.recoveryValidationFailed
+      ? <p className="page-error live-error" role="alert">模型配置已变化，请返回角色配置后重新测试</p> : null}
     {initialSession !== undefined && state.phase === 'paused'
       ? <p className="recovered-note" role="status">已恢复，等待用户继续</p> : null}
     {state.warnings.map((warning) => <p className="debate-warning" role="status" key={warning.id}>提示：{warning.message}</p>)}

@@ -107,6 +107,44 @@ function apiHarness(options: { delayedStart?: boolean } = {}) {
 afterEach(cleanup)
 
 describe('debate event reducer', () => {
+  it.each(['running', 'pausing', 'paused'] as const)(
+    'restores %s from formal snapshot data and ignores persisted partial turn events',
+    (stateName) => {
+      const formal = {
+        id: 'formal-1', turn: 1, roleId: 'role-a' as const, provider: 'openai' as const,
+        model: 'gpt-test', speech: '正式第一轮', status: 'continue' as const, createdAt: now
+      }
+      const restored = session({
+        state: stateName, terminationReason: undefined, currentTurn: 1, messages: [formal],
+        events: [
+          event({ id: 'completed-old', type: 'message-completed', message: formal }),
+          event({ id: 'started-partial', type: 'turn-started', roleId: 'role-b', turn: 2 }),
+          event({ id: 'delta-partial', type: 'speech-delta', roleId: 'role-b', turn: 2, delta: '不应恢复的残片' }),
+          event({ id: 'warning-old', type: 'warning', code: 'notice', message: '保留的提示' }),
+          event({ id: 'compressed-old', type: 'context-compressed', roleId: 'role-a', throughTurn: 1 }),
+          event({ id: 'usage-old', type: 'usage-updated', roleId: 'role-a', usage: {
+            inputTokens: 2, outputTokens: 3, totalTokens: 5
+          } })
+        ]
+      })
+
+      let state = createDebateViewState(restored)
+      expect(state.phase).toBe(stateName)
+      expect(state.currentTurn).toBe(1)
+      expect(state.messages).toEqual([formal])
+      expect(state.drafts).toEqual({})
+      expect(state.completedTurns).toContain('role-a:1')
+      expect(state.warnings.map(({ message }) => message)).toEqual(['保留的提示'])
+      expect(state.compressedRoles).toEqual(['role-a'])
+      expect(state.usage['role-a']?.totalTokens).toBe(5)
+
+      state = debateViewReducer(state, { type: 'event', event: event({
+        id: 'fresh-delta', type: 'speech-delta', roleId: 'role-b', turn: 2, delta: '全新内容'
+      }) })
+      expect(state.drafts['role-b:2']?.speech).toBe('全新内容')
+    }
+  )
+
   it('restarts a rejected validation attempt and quarantines its late responses and events', () => {
     const setup = session().setup
     let state = debateViewReducer(createDebateViewState(), { type: 'begin', setup, attempt: 1 })
@@ -218,6 +256,27 @@ describe('live debate page', () => {
 
     await user.click(screen.getByRole('button', { name: '继续辩论' }))
     expect(harness.api.debate.resume).toHaveBeenCalledWith({ sessionId: 'session-1' })
+  })
+
+  it('offers configuration repair instead of turn retry when recovered model validation fails', async () => {
+    const harness = apiHarness()
+    const onBack = vi.fn()
+    const recovered = session({ state: 'paused', terminationReason: undefined, currentTurn: 0, messages: [] })
+    const user = userEvent.setup()
+    render(<DebatePage roles={roles} initialSession={recovered} onBack={onBack} />)
+
+    await user.click(screen.getByRole('button', { name: '继续辩论' }))
+    harness.emit(event({
+      type: 'warning', code: 'provider-discovery-error', roleId: 'role-a',
+      message: 'configured model unavailable', retryable: false
+    }))
+    harness.emit(event({ type: 'state-changed', state: 'failed' }))
+
+    expect(screen.getByRole('alert')).toHaveTextContent('模型配置已变化，请返回角色配置后重新测试')
+    expect(screen.getByRole('button', { name: '重试当前轮' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '返回角色配置' }))
+    expect(onBack).toHaveBeenCalledOnce()
+    expect(harness.api.debate.retryCurrentTurn).not.toHaveBeenCalled()
   })
 
   it('shows streamed speech before the start promise resolves without rendering hidden payloads', async () => {

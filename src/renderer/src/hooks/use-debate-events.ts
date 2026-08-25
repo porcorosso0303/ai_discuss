@@ -41,6 +41,9 @@ export interface DebateViewState {
   seenEventIds: ReadonlySet<string>
   completedTurns: ReadonlySet<string>
   contentRevision: number
+  recovered: boolean
+  recoveryResumePending: boolean
+  recoveryValidationFailed: boolean
 }
 
 export type DebateViewAction =
@@ -49,6 +52,8 @@ export type DebateViewAction =
   | { type: 'session'; session: DebateSession; attempt: number }
   | { type: 'start-error'; message: string; attempt: number }
   | { type: 'discard-drafts' }
+  | { type: 'recovery-resume-requested' }
+  | { type: 'recovery-resume-rejected' }
 
 const terminalStates: ReadonlySet<DebateSessionState> = new Set([
   'completed', 'stopped', 'unresolved', 'refused', 'failed'
@@ -60,9 +65,47 @@ export function createDebateViewState(initialSession?: DebateSession): DebateVie
   const empty: DebateViewState = {
     attempt: 0, phase: 'starting', currentTurn: 0, messages: [], drafts: {}, warnings: [],
     compressedRoles: [], usage: {}, startRejected: false, hasStartedSession: false,
-    ignoredSessionIds: new Set(), seenEventIds: new Set(), completedTurns: new Set(), contentRevision: 0
+    ignoredSessionIds: new Set(), seenEventIds: new Set(), completedTurns: new Set(), contentRevision: 0,
+    recovered: false, recoveryResumePending: false, recoveryValidationFailed: false
   }
-  return initialSession === undefined ? empty : mergeSession(empty, initialSession)
+  return initialSession === undefined ? empty : restoreViewState(empty, initialSession)
+}
+
+function restoreViewState(empty: DebateViewState, session: DebateSession): DebateViewState {
+  const warnings: DebateWarning[] = []
+  const compressedRoles: RoleId[] = []
+  const usage: Partial<Record<RoleId, Usage>> = {}
+  const seenEventIds = new Set<string>()
+  for (const item of session.events) {
+    seenEventIds.add(item.id)
+    if (item.type === 'warning') warnings.push({ id: item.id, message: item.message })
+    else if (item.type === 'context-compressed' && !compressedRoles.includes(item.roleId)) {
+      compressedRoles.push(item.roleId)
+    } else if (item.type === 'usage-updated') usage[item.roleId] = item.usage
+  }
+  const completedTurns = new Set(session.messages.map(({ roleId, turn }) => turnKey(roleId, turn)))
+  const nextRole = session.currentTurn % 2 === 0
+    ? session.setup.firstSpeaker
+    : session.setup.firstSpeaker === 'role-a' ? 'role-b' : 'role-a'
+  return {
+    ...empty,
+    sessionId: session.id,
+    setup: session.setup,
+    phase: session.state,
+    currentTurn: session.currentTurn,
+    currentRoleId: nextRole,
+    messages: session.messages,
+    drafts: {},
+    warnings,
+    compressedRoles,
+    usage,
+    session,
+    hasStartedSession: session.messages.length > 0 || !['idle', 'validating'].includes(session.state),
+    seenEventIds,
+    completedTurns,
+    contentRevision: session.messages.length > 0 ? 1 : 0,
+    recovered: true
+  }
 }
 
 function upsertMessage(messages: DebateMessage[], message: DebateMessage): DebateMessage[] {
@@ -113,6 +156,14 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
   if (action.type === 'discard-drafts') {
     return { ...state, drafts: {}, contentRevision: state.contentRevision + 1 }
   }
+  if (action.type === 'recovery-resume-requested') {
+    return state.recovered
+      ? { ...state, recoveryResumePending: true, recoveryValidationFailed: false }
+      : state
+  }
+  if (action.type === 'recovery-resume-rejected') {
+    return { ...state, recoveryResumePending: false }
+  }
 
   const item = action.event
   if (state.ignoredSessionIds.has(item.sessionId)) return state
@@ -127,7 +178,8 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
         hasStartedSession: next.hasStartedSession || !['idle', 'validating', 'failed'].includes(item.state),
         drafts: terminalStates.has(item.state) ? {} : next.drafts }
     case 'turn-started':
-      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId }
+      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn),
+        currentRoleId: item.roleId, recoveryResumePending: false }
     case 'speech-delta': {
       const key = turnKey(item.roleId, item.turn)
       if (next.completedTurns.has(key)) return next
@@ -150,7 +202,9 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
         contentRevision: next.contentRevision + 1 }
     }
     case 'warning':
-      return { ...next, warnings: [...next.warnings, { id: item.id, message: item.message }] }
+      return { ...next, warnings: [...next.warnings, { id: item.id, message: item.message }],
+        recoveryValidationFailed: next.recoveryResumePending && item.code === 'provider-discovery-error'
+          ? true : next.recoveryValidationFailed }
     case 'context-compressed':
       return { ...next, compressedRoles: next.compressedRoles.includes(item.roleId)
         ? next.compressedRoles : [...next.compressedRoles, item.roleId] }

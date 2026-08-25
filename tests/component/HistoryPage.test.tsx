@@ -31,18 +31,30 @@ const summary = (session: DebateSession) => ({
   currentTurn: session.currentTurn, createdAt: session.createdAt, updatedAt: session.updatedAt
 })
 
+function deferred<Value>() {
+  let resolve!: (value: Value) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<Value>((accept, decline) => { resolve = accept; reject = decline })
+  return { promise, resolve, reject }
+}
+
 function installApi() {
   const api = {
     history: {
       list: vi.fn(async () => ({ sessions: [summary(older), summary(newer)] })),
-      get: vi.fn(async ({ sessionId }: { sessionId: string }) => ({
+      get: vi.fn<(request: { sessionId: string }) => Promise<{
+        session: DebateSession | null
+      }>>(async ({ sessionId }) => ({
         session: sessionId === newer.id ? newer : older
       })),
       delete: vi.fn(async () => ({ deleted: true })),
       clear: vi.fn(async () => ({ deletedCount: 2 }))
     },
     debate: { recover: vi.fn(async () => ({ session: newer })) },
-    export: { markdown: vi.fn(async () => ({ cancelled: false, fileName: '辩论记录.md' })) }
+    export: { markdown: vi.fn<() => Promise<{
+      cancelled: boolean
+      fileName?: string
+    }>>(async () => ({ cancelled: false, fileName: '辩论记录.md' })) }
   }
   Object.defineProperty(window, 'aiDebates', {
     configurable: true,
@@ -54,6 +66,125 @@ function installApi() {
 afterEach(cleanup)
 
 describe('history page', () => {
+  it('ignores an older detail response after a newer selection', async () => {
+    const api = installApi()
+    const oldDetail = deferred<{ session: DebateSession | null }>()
+    api.history.get.mockImplementation(({ sessionId }) => sessionId === older.id
+      ? oldDetail.promise
+      : Promise.resolve({ session: newer }))
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /查看人工智能会改善教育吗/ }))
+    await user.click(screen.getByRole('button', { name: /查看可恢复的新辩论/ }))
+    expect(await screen.findByRole('heading', { name: newer.setup.topic })).toBeInTheDocument()
+    oldDetail.resolve({ session: older })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByRole('heading', { name: newer.setup.topic })).toBeInTheDocument()
+  })
+
+  it('invalidates a delayed detail when a new search replaces its list', async () => {
+    const api = installApi()
+    const detail = deferred<{ session: DebateSession | null }>()
+    api.history.get.mockReturnValueOnce(detail.promise)
+    api.history.list.mockResolvedValueOnce({ sessions: [summary(older), summary(newer)] })
+      .mockResolvedValueOnce({ sessions: [summary(older)] })
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await user.type(screen.getByRole('searchbox', { name: '搜索历史记录' }), '旧记录')
+    await user.click(screen.getByRole('button', { name: '搜索' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /查看可恢复的新辩论/ })).not.toBeInTheDocument())
+    detail.resolve({ session: newer })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByRole('heading', { name: newer.setup.topic })).not.toBeInTheDocument()
+  })
+
+  it('does not let a pending list response repopulate cleared history', async () => {
+    const api = installApi()
+    const delayedList = deferred<{ sessions: ReturnType<typeof summary>[] }>()
+    api.history.list.mockResolvedValueOnce({ sessions: [summary(older), summary(newer)] })
+      .mockReturnValueOnce(delayedList.promise)
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+    await screen.findByRole('button', { name: /查看可恢复的新辩论/ })
+    await user.click(screen.getByRole('button', { name: '搜索' }))
+    await user.click(screen.getByRole('button', { name: '清空历史记录' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认清空' }))
+    delayedList.resolve({ sessions: [summary(older), summary(newer)] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByText('暂无历史记录')).toBeInTheDocument()
+  })
+
+  it('deletes a row while its detail request is pending and ignores the late detail', async () => {
+    const api = installApi()
+    const delayedDetail = deferred<{ session: DebateSession | null }>()
+    api.history.get.mockReturnValueOnce(delayedDetail.promise)
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await user.click(screen.getByRole('button', { name: '删除可恢复的新辩论' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认删除' }))
+    delayedDetail.resolve({ session: newer })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(screen.queryByRole('button', { name: /查看可恢复的新辩论/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: newer.setup.topic })).not.toBeInTheDocument()
+  })
+
+  it('prevents selection changes while a delete mutation is in flight', async () => {
+    const api = installApi()
+    const deletion = deferred<{ deleted: boolean }>()
+    api.history.delete.mockReturnValueOnce(deletion.promise)
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await screen.findByRole('heading', { name: newer.setup.topic })
+    await user.click(screen.getByRole('button', { name: '删除此记录' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认删除' }))
+
+    expect(screen.getByRole('button', { name: /查看人工智能会改善教育吗/ })).toBeDisabled()
+    deletion.resolve({ deleted: true })
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('invalidates pending detail and export results after clear or a new selection', async () => {
+    const api = installApi()
+    const delayedDetail = deferred<{ session: DebateSession | null }>()
+    const delayedExport = deferred<{ cancelled: boolean; fileName?: string }>()
+    api.history.get.mockImplementation(({ sessionId }) => sessionId === newer.id
+      ? delayedDetail.promise
+      : Promise.resolve({ session: older }))
+    api.export.markdown.mockReturnValueOnce(delayedExport.promise)
+    const user = userEvent.setup()
+    render(<HistoryPage onRecover={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await user.click(screen.getByRole('button', { name: '清空历史记录' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认清空' }))
+    delayedDetail.resolve({ session: newer })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByRole('heading', { name: newer.setup.topic })).not.toBeInTheDocument()
+
+    api.history.list.mockResolvedValueOnce({ sessions: [summary(older)] })
+    await user.click(screen.getByRole('button', { name: '搜索' }))
+    await screen.findByRole('button', { name: /查看人工智能会改善教育吗/ })
+    expect(screen.queryByRole('heading', { name: newer.setup.topic })).not.toBeInTheDocument()
+
+    api.history.list.mockResolvedValueOnce({ sessions: [summary(older), summary(newer)] })
+    await user.click(screen.getByRole('button', { name: '搜索' }))
+    await user.click(await screen.findByRole('button', { name: /查看可恢复的新辩论/ }))
+    await screen.findByRole('heading', { name: newer.setup.topic })
+    await user.click(screen.getByRole('button', { name: '导出 Markdown' }))
+    await user.click(screen.getByRole('button', { name: /查看人工智能会改善教育吗/ }))
+    await screen.findByRole('heading', { name: older.setup.topic })
+    delayedExport.resolve({ cancelled: false, fileName: '迟到.md' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByText('已保存：迟到.md')).not.toBeInTheDocument()
+  })
+
   it('lists newest first, searches, and loads a read-only detail', async () => {
     const api = installApi()
     const user = userEvent.setup()

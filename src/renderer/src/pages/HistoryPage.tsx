@@ -22,16 +22,25 @@ export function HistoryPage({ onRecover }: {
   const [confirmation, setConfirmation] = useState<Confirmation>()
   const listGeneration = useRef(0)
   const detailGeneration = useRef(0)
+  const operationGeneration = useRef(0)
 
   const loadList = useCallback((search?: string): void => {
     const generation = ++listGeneration.current
+    detailGeneration.current += 1
+    operationGeneration.current += 1
     setLoading(true)
+    setDetailLoading(false)
+    setBusy(false)
+    setSelected(undefined)
+    setNotice(undefined)
     setError(undefined)
     const trimmed = search?.trim() ?? ''
     void window.aiDebates.history.list({ limit: 50, ...(trimmed === '' ? {} : { search: trimmed }) })
       .then(({ sessions: result }) => {
         if (generation !== listGeneration.current) return
-        setSessions([...result].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)))
+        setSessions([...result].sort((a, b) =>
+          Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.updatedAt.localeCompare(a.updatedAt)
+        ))
       })
       .catch(() => {
         if (generation === listGeneration.current) setError('无法加载历史记录，请重试')
@@ -46,12 +55,16 @@ export function HistoryPage({ onRecover }: {
     return () => {
       listGeneration.current += 1
       detailGeneration.current += 1
+      operationGeneration.current += 1
     }
   }, [loadList])
 
   const selectSession = (sessionId: string): void => {
     const generation = ++detailGeneration.current
+    operationGeneration.current += 1
     setDetailLoading(true)
+    setBusy(false)
+    setSelected(undefined)
     setError(undefined)
     setNotice(undefined)
     void window.aiDebates.history.get({ sessionId }).then(({ session }) => {
@@ -67,33 +80,52 @@ export function HistoryPage({ onRecover }: {
 
   const exportSelected = (): void => {
     if (selected === undefined || busy) return
+    const generation = ++operationGeneration.current
     setBusy(true)
     setError(undefined)
     setNotice(undefined)
     void window.aiDebates.export.markdown({ sessionId: selected.id }).then((result) => {
+      if (generation !== operationGeneration.current) return
       setNotice(result.cancelled ? '已取消保存' : `已保存：${result.fileName ?? 'Markdown 文件'}`)
-    }).catch(() => setError('导出失败，请重试')).finally(() => setBusy(false))
+    }).catch(() => {
+      if (generation === operationGeneration.current) setError('导出失败，请重试')
+    }).finally(() => {
+      if (generation === operationGeneration.current) setBusy(false)
+    })
   }
 
   const recoverSelected = (): void => {
     if (selected === undefined || busy) return
+    const generation = ++operationGeneration.current
     setBusy(true)
     setError(undefined)
     void window.aiDebates.debate.recover({ sessionId: selected.id })
-      .then(({ session }) => onRecover(session))
-      .catch(() => setError('恢复失败，请重试'))
-      .finally(() => setBusy(false))
+      .then(({ session }) => {
+        if (generation === operationGeneration.current) onRecover(session)
+      })
+      .catch(() => {
+        if (generation === operationGeneration.current) setError('恢复失败，请重试')
+      })
+      .finally(() => {
+        if (generation === operationGeneration.current) setBusy(false)
+      })
   }
 
   const confirmOperation = (): void => {
     if (confirmation === undefined || busy) return
     const target = confirmation
+    listGeneration.current += 1
+    detailGeneration.current += 1
+    const generation = ++operationGeneration.current
+    setLoading(false)
+    setDetailLoading(false)
     setBusy(true)
     setError(undefined)
     const operation = target.kind === 'clear'
       ? window.aiDebates.history.clear()
       : window.aiDebates.history.delete({ sessionId: target.sessionId })
     void operation.then((result) => {
+      if (generation !== operationGeneration.current) return
       if (target.kind === 'delete' && (!('deleted' in result) || !result.deleted)) {
         throw new Error('History record was not deleted')
       }
@@ -106,9 +138,12 @@ export function HistoryPage({ onRecover }: {
       }
       setConfirmation(undefined)
     }).catch(() => {
+      if (generation !== operationGeneration.current) return
       setError(target.kind === 'clear' ? '清空失败，请重试' : '删除失败，请重试')
       setConfirmation(undefined)
-    }).finally(() => setBusy(false))
+    }).finally(() => {
+      if (generation === operationGeneration.current) setBusy(false)
+    })
   }
 
   return <section className="history-page" aria-labelledby="history-title">
@@ -120,14 +155,16 @@ export function HistoryPage({ onRecover }: {
     <form className="history-search" role="search" onSubmit={(event) => { event.preventDefault(); loadList(query) }}>
       <label htmlFor="history-search">搜索历史记录</label>
       <input id="history-search" type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
-      <button type="submit" className="button secondary" disabled={loading}>搜索</button>
+      <button type="submit" className="button secondary" disabled={loading || busy}>搜索</button>
     </form>
     {error ? <p className="page-error" role="alert">{error}</p> : null}
     {loading && sessions.length === 0 ? <p className="history-empty" role="status">正在加载历史记录…</p> : null}
     {!loading && error && sessions.length === 0 ? <button type="button" className="button secondary" onClick={() => loadList(query)}>重试</button> : null}
     {!loading && !error && sessions.length === 0 ? <div className="history-empty"><h2>暂无历史记录</h2><p>完成或暂停一场辩论后，会在这里显示。</p></div> : null}
     {sessions.length > 0 ? <div className="history-layout">
-      <aside><HistoryList sessions={sessions} selectedId={selected?.id} onSelect={selectSession} /></aside>
+      <aside><HistoryList sessions={sessions} selectedId={selected?.id} busy={busy}
+        selectionDisabled={busy && confirmation !== undefined}
+        onSelect={selectSession} onDelete={(sessionId) => setConfirmation({ kind: 'delete', sessionId })} /></aside>
       <main>{detailLoading ? <p className="history-empty" role="status">正在加载详情…</p>
         : selected === undefined ? <div className="history-empty"><h2>选择一条记录</h2><p>详情将在此处显示。</p></div>
           : <HistoryDetail session={selected} busy={busy} notice={notice}
