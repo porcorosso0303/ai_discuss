@@ -454,16 +454,19 @@ export class DesktopServices {
     }
   }
 
-  private async control(
+  private control(
     input: unknown,
     operation: (orchestrator: OrchestratorPort) => Promise<DebateSession>
-  ): Promise<{ accepted: true }> {
+  ): { accepted: true } {
     const { sessionId } = ipcInvokeContracts[IPC_CHANNELS.debatePause].request.parse(input)
     const orchestrator = this.active
     if (orchestrator === undefined || orchestrator.getSession().id !== sessionId) {
       throw new Error('Session mismatch')
     }
-    await operation(orchestrator)
+    const pending = operation(orchestrator)
+    void Promise.resolve(pending)
+      .catch((error: unknown) => this.recordAsyncFailure(error, 'debate-control'))
+      .catch(() => undefined)
     return { accepted: true }
   }
 }

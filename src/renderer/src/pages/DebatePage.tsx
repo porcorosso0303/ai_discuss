@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import type { DebateSetup, RoleConfig } from '../../../shared/domain'
 import { DebateControls } from '../components/DebateControls'
@@ -12,21 +12,38 @@ const phaseLabels: Record<string, string> = {
   paused: '已暂停', completed: '已完成', stopped: '已停止', unresolved: '未决', refused: '模型拒绝', failed: '调用失败'
 }
 
-export function DebatePage({ roles, onBack }: { roles: [RoleConfig, RoleConfig]; onBack(): void }): React.JSX.Element {
+const terminalPhases = new Set(['completed', 'stopped', 'unresolved', 'refused', 'failed'])
+
+export function DebatePage({ roles, onBack, onActivityChange }: {
+  roles: [RoleConfig, RoleConfig]
+  onBack(): void
+  onActivityChange?(active: boolean): void
+}): React.JSX.Element {
   const [state, dispatch] = useDebateEvents()
   const [started, setStarted] = useState(false)
   const [startBusy, setStartBusy] = useState(false)
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string>()
+  const startAttempt = useRef(0)
+  const debateActive = started && !terminalPhases.has(state.phase)
+
+  useEffect(() => {
+    onActivityChange?.(debateActive)
+  }, [debateActive, onActivityChange])
+  useEffect(() => () => onActivityChange?.(false), [onActivityChange])
 
   const requestStart = (setup: DebateSetup): void => {
+    const attempt = ++startAttempt.current
     setStartBusy(true)
-    dispatch({ type: 'begin', setup })
+    setControlError(undefined)
+    dispatch({ type: 'begin', setup, attempt })
     void window.aiDebates.debate.start({ setup }).then(({ session }) => {
-      dispatch({ type: 'session', session })
+      dispatch({ type: 'session', session, attempt })
     }).catch(() => {
-      dispatch({ type: 'start-error', message: '无法启动辩论，请重试' })
-    }).finally(() => setStartBusy(false))
+      dispatch({ type: 'start-error', attempt, message: '无法启动辩论，请重试' })
+    }).finally(() => {
+      if (startAttempt.current === attempt) setStartBusy(false)
+    })
   }
 
   const start = (setup: DebateSetup): void => {
@@ -46,7 +63,8 @@ export function DebatePage({ roles, onBack }: { roles: [RoleConfig, RoleConfig];
   }
 
   const retry = (): void => {
-    if (state.sessionId !== undefined) control('retryCurrentTurn')
+    if (state.startRejected && state.setup !== undefined && !startBusy) requestStart(state.setup)
+    else if (state.sessionId !== undefined) control('retryCurrentTurn')
     else if (state.setup !== undefined && !startBusy) requestStart(state.setup)
   }
 
@@ -55,8 +73,10 @@ export function DebatePage({ roles, onBack }: { roles: [RoleConfig, RoleConfig];
   return <section className="debate-page live-debate-page" aria-labelledby="live-debate-title">
     <header className="live-heading"><div><p className="eyebrow">第三步</p><h1 id="live-debate-title">{state.setup?.topic}</h1></div>
       <DebateControls phase={state.phase} enabled={state.sessionId !== undefined}
-        canRetry={!startBusy && (state.sessionId !== undefined || state.setup !== undefined)}
-        retryLabel={state.sessionId === undefined ? '重新启动辩论' : '重试当前轮'} busy={controlBusy}
+        canRetry={state.startRejected
+          ? !startBusy && state.setup !== undefined
+          : state.sessionId !== undefined}
+        retryLabel={state.startRejected || state.sessionId === undefined ? '重新启动辩论' : '重试当前轮'} busy={controlBusy}
         onPause={() => control('pause')} onResume={() => control('resume')} onStop={() => control('stop')}
         onRetry={retry} /></header>
     <div className="debate-status-band" role="status"><span className={`phase-badge phase-${state.phase}`}>{phaseLabels[state.phase]}</span>

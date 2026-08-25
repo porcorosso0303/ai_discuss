@@ -22,6 +22,7 @@ export interface DebateWarning {
 }
 
 export interface DebateViewState {
+  attempt: number
   sessionId?: string
   setup?: DebateSetup
   phase: DebateSessionState | 'starting'
@@ -34,16 +35,19 @@ export interface DebateViewState {
   usage: Partial<Record<RoleId, Usage>>
   session?: DebateSession
   error?: string
+  startRejected: boolean
+  hasStartedSession: boolean
+  ignoredSessionIds: ReadonlySet<string>
   seenEventIds: ReadonlySet<string>
   completedTurns: ReadonlySet<string>
   contentRevision: number
 }
 
 export type DebateViewAction =
-  | { type: 'begin'; setup: DebateSetup }
+  | { type: 'begin'; setup: DebateSetup; attempt: number }
   | { type: 'event'; event: DebateEvent }
-  | { type: 'session'; session: DebateSession }
-  | { type: 'start-error'; message: string }
+  | { type: 'session'; session: DebateSession; attempt: number }
+  | { type: 'start-error'; message: string; attempt: number }
   | { type: 'discard-drafts' }
 
 const terminalStates: ReadonlySet<DebateSessionState> = new Set([
@@ -54,8 +58,9 @@ const turnKey = (roleId: RoleId, turn: number): string => `${roleId}:${turn}`
 
 export function createDebateViewState(): DebateViewState {
   return {
-    phase: 'starting', currentTurn: 0, messages: [], drafts: {}, warnings: [],
-    compressedRoles: [], usage: {}, seenEventIds: new Set(), completedTurns: new Set(), contentRevision: 0
+    attempt: 0, phase: 'starting', currentTurn: 0, messages: [], drafts: {}, warnings: [],
+    compressedRoles: [], usage: {}, startRejected: false, hasStartedSession: false,
+    ignoredSessionIds: new Set(), seenEventIds: new Set(), completedTurns: new Set(), contentRevision: 0
   }
 }
 
@@ -67,7 +72,8 @@ function upsertMessage(messages: DebateMessage[], message: DebateMessage): Debat
 
 function mergeSession(state: DebateViewState, session: DebateSession): DebateViewState {
   if (state.sessionId !== undefined && state.sessionId !== session.id) return state
-  let next: DebateViewState = { ...state, sessionId: session.id, setup: session.setup, error: undefined }
+  let next: DebateViewState = { ...state, sessionId: session.id, setup: session.setup,
+    startRejected: false, error: undefined }
   for (const item of session.events) next = debateViewReducer(next, { type: 'event', event: item })
   let messages = next.messages
   const completedTurns = new Set(next.completedTurns)
@@ -76,23 +82,34 @@ function mergeSession(state: DebateViewState, session: DebateSession): DebateVie
     completedTurns.add(turnKey(message.roleId, message.turn))
   }
   return { ...next, phase: session.state, currentTurn: Math.max(next.currentTurn, session.currentTurn),
+    hasStartedSession: next.hasStartedSession || session.messages.length > 0 ||
+      !['idle', 'validating', 'failed'].includes(session.state),
     session, messages, completedTurns, drafts: terminalStates.has(session.state) ? {} : next.drafts,
     contentRevision: next.contentRevision + (session.messages.length > 0 ? 1 : 0) }
 }
 
 export function debateViewReducer(state: DebateViewState, action: DebateViewAction): DebateViewState {
   if (action.type === 'begin') {
-    return { ...createDebateViewState(), setup: action.setup }
+    const ignoredSessionIds = new Set(state.ignoredSessionIds)
+    if (state.sessionId !== undefined) ignoredSessionIds.add(state.sessionId)
+    return { ...createDebateViewState(), attempt: action.attempt, setup: action.setup, ignoredSessionIds }
   }
-  if (action.type === 'session') return mergeSession(state, action.session)
+  if (action.type === 'session') {
+    return action.attempt === state.attempt ? mergeSession(state, action.session) : state
+  }
   if (action.type === 'start-error') {
-    return { ...state, phase: 'failed', drafts: {}, error: action.message, contentRevision: state.contentRevision + 1 }
+    if (action.attempt !== state.attempt) return state
+    if (state.phase !== 'starting' && terminalStates.has(state.phase) && state.phase !== 'failed') return state
+    if (state.phase === 'failed' && state.hasStartedSession) return state
+    return { ...state, phase: 'failed', startRejected: true, drafts: {}, error: action.message,
+      contentRevision: state.contentRevision + 1 }
   }
   if (action.type === 'discard-drafts') {
     return { ...state, drafts: {}, contentRevision: state.contentRevision + 1 }
   }
 
   const item = action.event
+  if (state.ignoredSessionIds.has(item.sessionId)) return state
   if (state.sessionId !== undefined && state.sessionId !== item.sessionId) return state
   if (state.seenEventIds.has(item.id)) return state
   const seenEventIds = new Set(state.seenEventIds).add(item.id)
@@ -100,14 +117,16 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
 
   switch (item.type) {
     case 'state-changed':
-      return { ...next, phase: item.state, drafts: terminalStates.has(item.state) ? {} : next.drafts }
+      return { ...next, phase: item.state,
+        hasStartedSession: next.hasStartedSession || !['idle', 'validating', 'failed'].includes(item.state),
+        drafts: terminalStates.has(item.state) ? {} : next.drafts }
     case 'turn-started':
-      return { ...next, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId }
+      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId }
     case 'speech-delta': {
       const key = turnKey(item.roleId, item.turn)
       if (next.completedTurns.has(key)) return next
       const previous = next.drafts[key]
-      return { ...next, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId,
+      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId,
         drafts: { ...next.drafts, [key]: { roleId: item.roleId, turn: item.turn,
           speech: `${previous?.speech ?? ''}${item.delta}` } }, contentRevision: next.contentRevision + 1 }
     }
@@ -120,7 +139,7 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
       const key = turnKey(item.message.roleId, item.message.turn)
       const drafts = { ...next.drafts }
       delete drafts[key]
-      return { ...next, messages: upsertMessage(next.messages, item.message), drafts,
+      return { ...next, hasStartedSession: true, messages: upsertMessage(next.messages, item.message), drafts,
         completedTurns: new Set(next.completedTurns).add(key), currentTurn: Math.max(next.currentTurn, item.message.turn),
         contentRevision: next.contentRevision + 1 }
     }

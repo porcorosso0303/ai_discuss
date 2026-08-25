@@ -98,6 +98,45 @@ function installAsyncRejectingEmitter(h: ReturnType<typeof harness>, message: st
 }
 
 describe('desktop services', () => {
+  it.each([
+    [IPC_CHANNELS.debateResume, 'resume'],
+    [IPC_CHANNELS.debateRetryCurrentTurn, 'retryCurrentTurn']
+  ] as const)('acknowledges %s after synchronous dispatch without awaiting the debate drive', async (channel, method) => {
+    const h = harness()
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.debateStart, { setup: createSession().setup })
+    let settle!: () => void
+    h.orchestrator[method].mockReturnValueOnce(new Promise((resolve) => {
+      settle = () => resolve(createSession({ state: 'running' }))
+    }))
+
+    await expect(Promise.race([
+      services.invoke(channel, { sessionId: 'session-1' }),
+      new Promise((resolve) => setTimeout(() => resolve('timed-out'), 20))
+    ])).resolves.toEqual({ accepted: true })
+    expect(h.orchestrator[method]).toHaveBeenCalledOnce()
+    settle()
+    await services.dispose()
+  })
+
+  it('contains and records a rejected background debate control operation', async () => {
+    const h = harness()
+    const services = new DesktopServices(h.dependencies)
+    await services.invoke(IPC_CHANNELS.debateStart, { setup: createSession().setup })
+    h.orchestrator.resume.mockRejectedValueOnce(new Error('drive failed after acceptance'))
+
+    const unhandled = await captureUnhandled(async () => {
+      await expect(services.invoke(IPC_CHANNELS.debateResume, { sessionId: 'session-1' }))
+        .resolves.toEqual({ accepted: true })
+    })
+
+    expect(unhandled).toEqual([])
+    expect(h.log.error).toHaveBeenCalledWith(expect.any(Error), {
+      boundary: 'services', operation: 'debate-control'
+    })
+    await services.dispose()
+  })
+
   it('removes secrets before deleting a role and never reports partial deletion as success', async () => {
     const h = harness()
     const services = new DesktopServices(h.dependencies)

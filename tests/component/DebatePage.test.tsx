@@ -48,6 +48,19 @@ function session(overrides: Partial<DebateSession> = {}): DebateSession {
   }
 }
 
+async function captureUnhandled(operation: () => Promise<void> | void): Promise<unknown[]> {
+  const unhandled: unknown[] = []
+  const listener = (reason: unknown): void => { unhandled.push(reason) }
+  process.on('unhandledRejection', listener)
+  try {
+    await operation()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    return unhandled
+  } finally {
+    process.off('unhandledRejection', listener)
+  }
+}
+
 function apiHarness(options: { delayedStart?: boolean } = {}) {
   let debateListener: ((payload: DebateEvent) => void) | undefined
   let resolveStart!: (value: { session: DebateSession }) => void
@@ -90,6 +103,37 @@ function apiHarness(options: { delayedStart?: boolean } = {}) {
 afterEach(cleanup)
 
 describe('debate event reducer', () => {
+  it('restarts a rejected validation attempt and quarantines its late responses and events', () => {
+    const setup = session().setup
+    let state = debateViewReducer(createDebateViewState(), { type: 'begin', setup, attempt: 1 })
+    state = debateViewReducer(state, { type: 'event', event: event({ type: 'state-changed', state: 'validating' }) })
+    state = debateViewReducer(state, { type: 'start-error', attempt: 1, message: '无法启动辩论，请重试' })
+    expect(state.startRejected).toBe(true)
+
+    state = debateViewReducer(state, { type: 'begin', setup, attempt: 2 })
+    state = debateViewReducer(state, { type: 'start-error', attempt: 1, message: '旧失败' })
+    state = debateViewReducer(state, { type: 'session', attempt: 1, session: session({ state: 'completed' }) })
+    state = debateViewReducer(state, { type: 'event', event: event({ type: 'state-changed', state: 'completed' }) })
+    expect(state.phase).toBe('starting')
+    expect(state.error).toBeUndefined()
+
+    state = debateViewReducer(state, { type: 'event', event: event({ sessionId: 'session-2', type: 'state-changed', state: 'validating' }) })
+    expect(state.sessionId).toBe('session-2')
+    expect(state.phase).toBe('validating')
+  })
+
+  it.each(['completed', 'unresolved'] as const)('keeps a terminal %s result when start rejects late', (terminal) => {
+    let state = debateViewReducer(createDebateViewState(), {
+      type: 'begin', setup: session().setup, attempt: 1
+    })
+    state = debateViewReducer(state, { type: 'event', event: event({ type: 'state-changed', state: terminal }) })
+    state = debateViewReducer(state, {
+      type: 'start-error', attempt: 1, message: '迟到的请求失败'
+    })
+    expect(state.phase).toBe(terminal)
+    expect(state.error).toBeUndefined()
+  })
+
   it('streams a draft, resets it, promotes a formal message, and ignores duplicates and late deltas', () => {
     let state = createDebateViewState()
     const delta = event({ id: 'delta-1', type: 'speech-delta', roleId: 'role-a', turn: 1, delta: '第一段' })
@@ -126,7 +170,7 @@ describe('debate event reducer', () => {
   it('treats a terminal start response as authoritative over older embedded events', () => {
     const oldRunning = event({ id: 'old-running', type: 'state-changed', state: 'running' })
     const final = session({ state: 'unresolved', terminationReason: 'max-turns', events: [oldRunning] })
-    const state = debateViewReducer(createDebateViewState(), { type: 'session', session: final })
+    const state = debateViewReducer(createDebateViewState(), { type: 'session', attempt: 0, session: final })
     expect(state.phase).toBe('unresolved')
     expect(state.session).toBe(final)
   })
@@ -179,6 +223,46 @@ describe('live debate page', () => {
     )
   })
 
+  it('restarts after validation failure even when that attempt already emitted a session id', async () => {
+    const harness = apiHarness({ delayedStart: true })
+    let rejectFirst!: (error: Error) => void
+    ;(harness.api.debate.start as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(new Promise((_resolve, reject) => { rejectFirst = reject }))
+      .mockReturnValueOnce(new Promise(() => undefined))
+    const user = userEvent.setup()
+    render(<DebatePage roles={roles} onBack={vi.fn()} />)
+    await user.type(screen.getByLabelText('辩论话题'), '校验失败话题')
+    await user.click(screen.getByRole('button', { name: '开始辩论' }))
+    harness.emit(event({ type: 'state-changed', state: 'validating' }))
+    await act(async () => rejectFirst(new Error('validation failed')))
+
+    await user.click(await screen.findByRole('button', { name: '重新启动辩论' }))
+
+    expect(harness.api.debate.start).toHaveBeenCalledTimes(2)
+    expect(harness.api.debate.retryCurrentTurn).not.toHaveBeenCalled()
+    harness.emit(event({ type: 'state-changed', state: 'completed' }))
+    expect(screen.getByText('正在启动')).toBeInTheDocument()
+    harness.emit(event({ sessionId: 'session-2', type: 'state-changed', state: 'validating' }))
+    expect(screen.getByText('正在校验')).toBeInTheDocument()
+  })
+
+  it('marks every invalid setup field and focuses the first invalid field', async () => {
+    apiHarness({ delayedStart: true })
+    const user = userEvent.setup()
+    render(<DebatePage roles={roles} onBack={vi.fn()} />)
+    const maxTurns = screen.getByLabelText('最大轮次')
+    await user.clear(maxTurns)
+    await user.type(maxTurns, '101')
+    await user.click(screen.getByRole('button', { name: '开始辩论' }))
+
+    const topic = screen.getByLabelText('辩论话题')
+    expect(topic).toHaveFocus()
+    expect(topic).toHaveAttribute('aria-invalid', 'true')
+    expect(maxTurns).toHaveAttribute('aria-invalid', 'true')
+    expect(maxTurns).toHaveAttribute('aria-describedby', 'debate-max-turns-error')
+    expect(screen.getByText('轮次必须在 1 到 100 之间')).toHaveAttribute('id', 'debate-max-turns-error')
+  })
+
   it('pauses, resumes, and stops by session id while discarding the draft immediately', async () => {
     const harness = apiHarness({ delayedStart: true })
     const user = userEvent.setup()
@@ -195,6 +279,37 @@ describe('live debate page', () => {
     await user.click(screen.getByRole('button', { name: '停止辩论' }))
     expect(harness.api.debate.stop).toHaveBeenCalledWith({ sessionId: 'session-1' })
     expect(screen.queryByText('临时内容')).not.toBeInTheDocument()
+  })
+
+  it('treats failed as terminal for stop while preserving turn retry', async () => {
+    const harness = apiHarness({ delayedStart: true })
+    const user = userEvent.setup()
+    render(<DebatePage roles={roles} onBack={vi.fn()} />)
+    await user.type(screen.getByLabelText('辩论话题'), '失败话题')
+    await user.click(screen.getByRole('button', { name: '开始辩论' }))
+    harness.emit(event({ type: 'state-changed', state: 'running' }))
+    harness.emit(event({ type: 'state-changed', state: 'failed' }))
+
+    expect(screen.getByRole('button', { name: '停止辩论' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '重试当前轮' })).toBeEnabled()
+  })
+
+  it('contains a late control rejection after unmount', async () => {
+    const harness = apiHarness({ delayedStart: true })
+    let rejectResume!: (error: Error) => void
+    ;(harness.api.debate.resume as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((_resolve, reject) => { rejectResume = reject })
+    )
+    const user = userEvent.setup()
+    const rendered = render(<DebatePage roles={roles} onBack={vi.fn()} />)
+    await user.type(screen.getByLabelText('辩论话题'), '卸载竞态')
+    await user.click(screen.getByRole('button', { name: '开始辩论' }))
+    harness.emit(event({ type: 'state-changed', state: 'paused' }))
+    await user.click(screen.getByRole('button', { name: '继续辩论' }))
+    rendered.unmount()
+
+    const unhandled = await captureUnhandled(async () => { rejectResume(new Error('late failure')) })
+    expect(unhandled).toEqual([])
   })
 
   it.each([
@@ -265,8 +380,9 @@ describe('live debate page', () => {
 })
 
 describe('configuration navigation', () => {
-  it('enters debate setup with two tested roles and marks the debate navigation active', async () => {
-    const { api } = apiHarness()
+  it('navigates with buttons and locks configuration while a debate is active', async () => {
+    const harness = apiHarness({ delayedStart: true })
+    const { api } = harness
     const catalog = (provider: 'openai' | 'deepseek') => ({
       provider,
       defaultModel: provider === 'openai' ? 'gpt-test' : 'deepseek-test',
@@ -285,9 +401,25 @@ describe('configuration navigation', () => {
       await user.click(within(card).getByRole('button', { name: '获取模型' }))
       await user.click(within(card).getByRole('button', { name: '测试连接' }))
     }
-    await user.click(screen.getByRole('button', { name: '进入辩论设置' }))
+    const debateNavigation = screen.getByRole('button', { name: '辩论现场' })
+    expect(debateNavigation).toBeEnabled()
+    await user.click(debateNavigation)
     expect(await screen.findByRole('heading', { name: '设置辩论话题' })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: '辩论现场' })).toHaveAttribute('aria-current', 'page')
-    expect(screen.getByRole('link', { name: '历史记录' })).toHaveAttribute('aria-disabled', 'true')
+    expect(debateNavigation).toHaveAttribute('aria-current', 'page')
+    const configuration = screen.getByRole('button', { name: '角色配置' })
+    expect(configuration).toBeEnabled()
+    await user.click(configuration)
+    expect(await screen.findByRole('heading', { name: '配置 AI 角色' })).toBeInTheDocument()
+    await user.click(debateNavigation)
+    expect(await screen.findByRole('heading', { name: '设置辩论话题' })).toBeInTheDocument()
+    await user.type(screen.getByLabelText('辩论话题'), '导航锁定话题')
+    await user.click(screen.getByRole('button', { name: '开始辩论' }))
+    harness.emit(event({ type: 'state-changed', state: 'running' }))
+    expect(configuration).toBeDisabled()
+    harness.emit(event({ type: 'state-changed', state: 'unresolved' }))
+    expect(configuration).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: '返回角色配置' }))
+    expect(await screen.findByRole('heading', { name: '配置 AI 角色' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '历史记录' })).toBeDisabled()
   })
 })

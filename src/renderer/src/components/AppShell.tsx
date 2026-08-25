@@ -1,4 +1,13 @@
-export function AppShell({ children, active = 'configuration' }: { children: React.ReactNode; active?: 'configuration' | 'debate' }): React.JSX.Element {
+type AppRoute = 'configuration' | 'debate'
+
+export function AppShell({ children, active = 'configuration', configurationDisabled = false,
+  debateDisabled = false, onNavigate }: {
+  children: React.ReactNode
+  active?: AppRoute
+  configurationDisabled?: boolean
+  debateDisabled?: boolean
+  onNavigate?(route: AppRoute): void
+}): React.JSX.Element {
   return (
     <div className="desktop-shell">
       <header className="topbar">
@@ -8,9 +17,13 @@ export function AppShell({ children, active = 'configuration' }: { children: Rea
       <aside className="sidebar" aria-label="主导航">
         <p className="nav-label">工作区</p>
         <nav>
-          <a className={`nav-item${active === 'configuration' ? ' active' : ''}`} aria-current={active === 'configuration' ? 'page' : undefined} href="#configuration">角色配置</a>
-          <a className={`nav-item${active === 'debate' ? ' active' : ''}`} aria-current={active === 'debate' ? 'page' : undefined} href="#debate">辩论现场</a>
-          <a className="nav-item disabled" aria-disabled="true" href="#history" onClick={(event) => event.preventDefault()}>历史记录</a>
+          <button type="button" className={`nav-item${active === 'configuration' ? ' active' : ''}`}
+            aria-current={active === 'configuration' ? 'page' : undefined}
+            disabled={configurationDisabled || active === 'configuration'} onClick={() => onNavigate?.('configuration')}>角色配置</button>
+          <button type="button" className={`nav-item${active === 'debate' ? ' active' : ''}`}
+            aria-current={active === 'debate' ? 'page' : undefined}
+            disabled={debateDisabled || active === 'debate'} onClick={() => onNavigate?.('debate')}>辩论现场</button>
+          <button type="button" className="nav-item disabled" disabled>历史记录</button>
         </nav>
         <div className="sidebar-note"><strong>凭据保护</strong><span>API Key 由 Windows Credential Manager 保存。</span></div>
       </aside>

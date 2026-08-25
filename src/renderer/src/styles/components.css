@@ -6,9 +6,9 @@
 .desktop-status i { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #63d59a; }
 .sidebar { display: flex; flex-direction: column; padding: 24px 14px 18px; border-right: 1px solid var(--border); background: #0f1828; }
 .nav-label { margin: 0 10px 10px; color: #65758f; font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-.nav-item { display: block; padding: 11px 14px; border-radius: 8px; color: var(--muted); text-decoration: none; }
+.nav-item { display: block; width: 100%; padding: 11px 14px; border: 0; border-radius: 8px; color: var(--muted); background: transparent; font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
 .nav-item.active { color: var(--text); background: #192941; box-shadow: inset 3px 0 var(--cyan); }
-.nav-item.disabled { color: #60708a; cursor: not-allowed; }
+.nav-item.disabled, .nav-item:disabled { color: #60708a; cursor: not-allowed; }
 .sidebar-note { display: flex; flex-direction: column; gap: 6px; margin-top: auto; padding: 14px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: .76rem; line-height: 1.5; }
 .sidebar-note strong { color: var(--text); }
 .main-content { min-width: 0; max-height: calc(100vh - 64px); overflow: auto; }
