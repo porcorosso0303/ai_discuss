@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import type {
   CredentialScope,
@@ -531,6 +531,46 @@ export interface ProductionDesktopServicesOptions {
   openExternal(url: string): Promise<unknown>
 }
 
+const createE2eCredentialPort = (
+  isPackaged: boolean,
+  env: Readonly<NodeJS.ProcessEnv>
+): CredentialPort | undefined => {
+  const marker = env.AI_DEBATES_E2E_CREDENTIAL_FILE
+  if (isPackaged || marker === undefined || !isAbsolute(marker) || marker.includes('\0')) return undefined
+  const secrets = new Map<string, string>()
+  const keyFor = (scope: CredentialScope): string =>
+    `${scope.roleId}\n${scope.provider}\n${scope.origin}`
+  return {
+    get: async (scope) => secrets.get(keyFor(scope)),
+    set: async (scope, secret) => {
+      secrets.set(keyFor(scope), secret)
+      return { stored: true }
+    },
+    delete: async (scope) => {
+      secrets.delete(keyFor(scope))
+      return { deleted: true }
+    },
+    deleteRoleSecrets: async (roleId) => {
+      for (const key of secrets.keys()) {
+        if (key.startsWith(`${roleId}\n`)) secrets.delete(key)
+      }
+    }
+  }
+}
+
+const createE2eOpenAIProvider = (enabled: boolean): OpenAIProviderPort | undefined => enabled
+  ? {
+      readAccount: async () => ({ signedIn: false, requiresOpenaiAuth: true }),
+      startChatGptLogin: async () => { throw new Error('OpenAI login is unavailable in E2E mode') },
+      cancelChatGptLogin: async () => undefined,
+      logout: async () => undefined,
+      dispose: async () => undefined,
+      discover: async () => { throw new Error('OpenAI is unavailable in E2E mode') },
+      streamReply: async function * () { throw new Error('OpenAI is unavailable in E2E mode') },
+      cancelActive: async () => undefined
+    }
+  : undefined
+
 export function createProductionDesktopServices({
   emit,
   app,
@@ -547,12 +587,14 @@ export function createProductionDesktopServices({
   const repository = new DebateRepository(root)
   const log = new LogService(root)
   const shutdownController = new AbortController()
-  const credentials = new CredentialVault({
-    isPackaged: app.isPackaged,
-    resourcesPath,
-    env,
-    hostEnv: env
-  })
+  const e2eCredentials = createE2eCredentialPort(app.isPackaged, env)
+  const credentials: CredentialPort = e2eCredentials ??
+    new CredentialVault({
+      isPackaged: app.isPackaged,
+      resourcesPath,
+      env,
+      hostEnv: env
+    })
   const secretFor = async (
     role: Exclude<RoleConfig, { provider: 'openai' }>,
     signal: AbortSignal
@@ -565,7 +607,7 @@ export function createProductionDesktopServices({
     if (secret === undefined) throw new ProviderNonRetryableError('Provider credential is missing')
     return secret
   }
-  const openai = new CodexProvider({
+  const openai = createE2eOpenAIProvider(e2eCredentials !== undefined) ?? new CodexProvider({
     createClient: () => startCodexAppServer({
       clientVersion: app.getVersion(),
       codexHome: join(root, 'codex'),

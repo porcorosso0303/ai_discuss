@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 
@@ -20,11 +20,19 @@ let ipcRegistration: DesktopIpcRegistration | undefined
 
 async function registerIpcHandlers(): Promise<void> {
   let nextRegistration: DesktopIpcRegistration | undefined
+  const e2eExportPath = !app.isPackaged &&
+    process.env.AI_DEBATES_E2E_EXPORT_PATH !== undefined &&
+    isAbsolute(process.env.AI_DEBATES_E2E_EXPORT_PATH) &&
+    !process.env.AI_DEBATES_E2E_EXPORT_PATH.includes('\0')
+    ? process.env.AI_DEBATES_E2E_EXPORT_PATH
+    : undefined
   const production = createProductionDesktopServices({
     app,
     resourcesPath: process.resourcesPath,
     env: process.env,
-    dialog: { showSaveDialog: (options) => dialog.showSaveDialog(options) },
+    dialog: { showSaveDialog: (options) => e2eExportPath === undefined
+      ? dialog.showSaveDialog(options)
+      : Promise.resolve({ canceled: false, filePath: e2eExportPath }) },
     openExternal: (url) => shell.openExternal(url),
     emit: (channel, payload) => {
       for (const window of BrowserWindow.getAllWindows()) {
