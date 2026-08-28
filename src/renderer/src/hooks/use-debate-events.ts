@@ -9,6 +9,7 @@ import type {
   RoleId,
   Usage
 } from '../../../shared/domain'
+import { debateSessionSchema } from '../../../shared/schemas'
 
 export interface DebateDraft {
   roleId: RoleId
@@ -114,6 +115,56 @@ function upsertMessage(messages: DebateMessage[], message: DebateMessage): Debat
   return next.sort((left, right) => left.turn - right.turn || left.createdAt.localeCompare(right.createdAt))
 }
 
+const otherRole = (roleId: RoleId): RoleId => roleId === 'role-a' ? 'role-b' : 'role-a'
+
+function sessionOutcome(
+  phase: DebateSessionState,
+  messages: DebateMessage[]
+): Pick<DebateSession, 'terminationReason' | 'winnerRoleId'> {
+  if (phase === 'stopped') return { terminationReason: 'user-stopped' }
+  if (phase === 'unresolved') return { terminationReason: 'max-turns' }
+  if (phase === 'refused') return { terminationReason: 'provider-refusal' }
+  if (phase === 'failed') return { terminationReason: 'call-failed' }
+  if (phase !== 'completed') return {}
+
+  const last = messages.at(-1)
+  if (last?.status === 'concede') {
+    return { terminationReason: 'conceded', winnerRoleId: otherRole(last.roleId) }
+  }
+  const previous = messages.at(-2)
+  if (last?.status === 'agree' && previous?.status === 'agree' && last.roleId !== previous.roleId) {
+    return { terminationReason: 'agreed' }
+  }
+  return {}
+}
+
+function synchronizeSession(
+  state: DebateViewState,
+  item: DebateEvent
+): DebateViewState {
+  if (state.session === undefined) return state
+  const events = state.session.events.some(({ id }) => id === item.id)
+    ? state.session.events
+    : [...state.session.events, item].slice(-10_000)
+  const phase = item.type === 'state-changed' ? item.state : state.session.state
+  const updatedAt = Date.parse(item.createdAt) > Date.parse(state.session.updatedAt)
+    ? item.createdAt
+    : state.session.updatedAt
+  const session = debateSessionSchema.parse({
+    ...state.session,
+    state: phase,
+    messages: state.messages,
+    events,
+    currentTurn: state.currentTurn,
+    updatedAt,
+    contextCompressed: state.session.contextCompressed || item.type === 'context-compressed',
+    terminationReason: undefined,
+    winnerRoleId: undefined,
+    ...sessionOutcome(phase, state.messages)
+  })
+  return { ...state, session }
+}
+
 function mergeSession(state: DebateViewState, session: DebateSession): DebateViewState {
   if (state.sessionId !== undefined && state.sessionId !== session.id) return state
   let next: DebateViewState = { ...state, sessionId: session.id, setup: session.setup,
@@ -174,42 +225,47 @@ export function debateViewReducer(state: DebateViewState, action: DebateViewActi
 
   switch (item.type) {
     case 'state-changed':
-      return { ...next, phase: item.state,
+      return synchronizeSession({ ...next, phase: item.state,
         hasStartedSession: next.hasStartedSession || !['idle', 'validating', 'failed'].includes(item.state),
-        drafts: terminalStates.has(item.state) ? {} : next.drafts }
+        drafts: terminalStates.has(item.state) ? {} : next.drafts }, item)
     case 'turn-started':
-      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn),
-        currentRoleId: item.roleId, recoveryResumePending: false }
+      return synchronizeSession({ ...next, hasStartedSession: true,
+        currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId,
+        recoveryResumePending: false }, item)
     case 'speech-delta': {
       const key = turnKey(item.roleId, item.turn)
-      if (next.completedTurns.has(key)) return next
+      if (next.completedTurns.has(key)) return synchronizeSession(next, item)
       const previous = next.drafts[key]
-      return { ...next, hasStartedSession: true, currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId,
+      return synchronizeSession({ ...next, hasStartedSession: true,
+        currentTurn: Math.max(next.currentTurn, item.turn), currentRoleId: item.roleId,
         drafts: { ...next.drafts, [key]: { roleId: item.roleId, turn: item.turn,
-          speech: `${previous?.speech ?? ''}${item.delta}` } }, contentRevision: next.contentRevision + 1 }
+          speech: `${previous?.speech ?? ''}${item.delta}` } },
+        contentRevision: next.contentRevision + 1 }, item)
     }
     case 'speech-reset': {
       const drafts = { ...next.drafts }
       delete drafts[turnKey(item.roleId, item.turn)]
-      return { ...next, drafts, contentRevision: next.contentRevision + 1 }
+      return synchronizeSession({ ...next, drafts, contentRevision: next.contentRevision + 1 }, item)
     }
     case 'message-completed': {
       const key = turnKey(item.message.roleId, item.message.turn)
       const drafts = { ...next.drafts }
       delete drafts[key]
-      return { ...next, hasStartedSession: true, messages: upsertMessage(next.messages, item.message), drafts,
+      return synchronizeSession({ ...next, hasStartedSession: true,
+        messages: upsertMessage(next.messages, item.message), drafts,
         completedTurns: new Set(next.completedTurns).add(key), currentTurn: Math.max(next.currentTurn, item.message.turn),
-        contentRevision: next.contentRevision + 1 }
+        contentRevision: next.contentRevision + 1 }, item)
     }
     case 'warning':
-      return { ...next, warnings: [...next.warnings, { id: item.id, message: item.message }],
+      return synchronizeSession({ ...next,
+        warnings: [...next.warnings, { id: item.id, message: item.message }],
         recoveryValidationFailed: next.recoveryResumePending && item.code === 'provider-discovery-error'
-          ? true : next.recoveryValidationFailed }
+          ? true : next.recoveryValidationFailed }, item)
     case 'context-compressed':
-      return { ...next, compressedRoles: next.compressedRoles.includes(item.roleId)
-        ? next.compressedRoles : [...next.compressedRoles, item.roleId] }
+      return synchronizeSession({ ...next, compressedRoles: next.compressedRoles.includes(item.roleId)
+        ? next.compressedRoles : [...next.compressedRoles, item.roleId] }, item)
     case 'usage-updated':
-      return { ...next, usage: { ...next.usage, [item.roleId]: item.usage } }
+      return synchronizeSession({ ...next, usage: { ...next.usage, [item.roleId]: item.usage } }, item)
   }
 }
 

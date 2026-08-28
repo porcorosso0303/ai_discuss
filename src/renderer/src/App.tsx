@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 
 import type { DebateSession, RoleConfig } from '../../shared/domain'
 import { AppShell, type AppRoute } from './components/AppShell'
@@ -15,6 +15,9 @@ function AppContent(): React.JSX.Element {
   const [debateRoles, setDebateRoles] = useState<[RoleConfig, RoleConfig]>()
   const roleA = toRoleConfig(roles['role-a'])
   const roleB = toRoleConfig(roles['role-b'])
+  const keepLatestSession = useCallback((session: DebateSession): void => {
+    setInitialSession((current) => current === undefined || current.id === session.id ? session : current)
+  }, [])
   const enterDebate = (): void => {
     if (canContinue && roleA !== undefined && roleB !== undefined) {
       setInitialSession(undefined)
@@ -40,6 +43,7 @@ function AppContent(): React.JSX.Element {
     debateDisabled={debateRoles === undefined && (!canContinue || roleA === undefined || roleB === undefined)}
     historyDisabled={debateActive}>{route === 'debate' && debateRoles !== undefined
     ? <DebatePage roles={debateRoles} initialSession={initialSession} onActivityChange={setDebateActive}
+        onSessionChange={keepLatestSession}
         onBack={() => { setInitialSession(undefined); setRoute('configuration') }} />
     : route === 'history'
       ? <HistoryPage onRecover={(session) => {

@@ -14,11 +14,12 @@ const phaseLabels: Record<string, string> = {
 
 const terminalPhases = new Set(['completed', 'stopped', 'unresolved', 'refused', 'failed'])
 
-export function DebatePage({ roles, initialSession, onBack, onActivityChange }: {
+export function DebatePage({ roles, initialSession, onBack, onActivityChange, onSessionChange }: {
   roles: [RoleConfig, RoleConfig]
   initialSession?: DebateSession
   onBack(): void
   onActivityChange?(active: boolean): void
+  onSessionChange?(session: DebateSession): void
 }): React.JSX.Element {
   const [state, dispatch] = useDebateEvents(initialSession)
   const [started, setStarted] = useState(initialSession !== undefined)
@@ -32,6 +33,9 @@ export function DebatePage({ roles, initialSession, onBack, onActivityChange }: 
     onActivityChange?.(debateActive)
   }, [debateActive, onActivityChange])
   useEffect(() => () => onActivityChange?.(false), [onActivityChange])
+  useEffect(() => {
+    if (state.session !== undefined) onSessionChange?.(state.session)
+  }, [onSessionChange, state.session])
 
   const requestStart = (setup: DebateSetup): void => {
     const attempt = ++startAttempt.current

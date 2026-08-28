@@ -216,6 +216,100 @@ describe('debate event reducer', () => {
     expect(state.phase).toBe('unresolved')
     expect(state.session).toBe(final)
   })
+
+  it.each([
+    ['stopped', 'user-stopped'],
+    ['unresolved', 'max-turns'],
+    ['refused', 'provider-refusal'],
+    ['failed', 'call-failed']
+  ] as const)('keeps a recovered session snapshot synchronized when it becomes %s', (phase, reason) => {
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1,
+      messages: [{
+        id: 'restored-message', turn: 1, roleId: 'role-a', provider: 'openai', model: 'gpt-test',
+        speech: '恢复前的发言', status: 'continue', createdAt: now
+      }]
+    })
+    const changedAt = '2026-08-24T08:01:00.000Z'
+    let state = createDebateViewState(recovered)
+    state = debateViewReducer(state, { type: 'event', event: event({
+      id: `state-${phase}`, createdAt: changedAt, type: 'state-changed', state: phase
+    }) })
+
+    expect(state.session).toMatchObject({
+      state: phase, currentTurn: 1, messages: recovered.messages,
+      updatedAt: changedAt, terminationReason: reason
+    })
+    expect(state.session?.winnerRoleId).toBeUndefined()
+  })
+
+  it('derives a concession result from completed messages in the recovered session snapshot', () => {
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1,
+      messages: [{
+        id: 'restored-message', turn: 1, roleId: 'role-a', provider: 'openai', model: 'gpt-test',
+        speech: '恢复前的发言', status: 'continue', createdAt: now
+      }]
+    })
+    const concession = {
+      id: 'concession', turn: 2, roleId: 'role-b' as const, provider: 'deepseek' as const,
+      model: 'deepseek-test', speech: '我认输。', status: 'concede' as const,
+      createdAt: '2026-08-24T08:01:00.000Z'
+    }
+    let state = createDebateViewState(recovered)
+    state = debateViewReducer(state, { type: 'event', event: event({
+      id: 'completed-concession', createdAt: concession.createdAt,
+      type: 'message-completed', message: concession
+    }) })
+    state = debateViewReducer(state, { type: 'event', event: event({
+      id: 'state-completed', createdAt: '2026-08-24T08:01:01.000Z',
+      type: 'state-changed', state: 'completed'
+    }) })
+
+    expect(state.session).toMatchObject({
+      state: 'completed', messages: recovered.messages.concat(concession), currentTurn: 2,
+      updatedAt: '2026-08-24T08:01:01.000Z', terminationReason: 'conceded', winnerRoleId: 'role-a'
+    })
+  })
+
+  it('derives agreement only from two consecutive formal agreement messages', () => {
+    const firstAgreement = {
+      id: 'first-agreement', turn: 1, roleId: 'role-a' as const, provider: 'openai' as const,
+      model: 'gpt-test', speech: '我同意这一点。', status: 'agree' as const, createdAt: now
+    }
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1, messages: [firstAgreement]
+    })
+    let state = createDebateViewState(recovered)
+    state = debateViewReducer(state, { type: 'event', event: event({
+      type: 'message-completed', message: {
+        id: 'second-agreement', turn: 2, roleId: 'role-b', provider: 'deepseek',
+        model: 'deepseek-test', speech: '我也同意。', status: 'agree', createdAt: now
+      }
+    }) })
+    state = debateViewReducer(state, { type: 'event', event: event({
+      createdAt: '2026-08-24T08:01:01.000Z', type: 'state-changed', state: 'completed'
+    }) })
+
+    expect(state.session).toMatchObject({
+      state: 'completed', currentTurn: 2, terminationReason: 'agreed'
+    })
+    expect(state.session?.winnerRoleId).toBeUndefined()
+  })
+
+  it('does not regress the session timestamp for an older offset event', () => {
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, updatedAt: '2026-08-24T08:00:00.000Z'
+    })
+    const state = debateViewReducer(createDebateViewState(recovered), {
+      type: 'event',
+      event: event({
+        createdAt: '2026-08-24T09:00:00.000+08:00', type: 'state-changed', state: 'running'
+      })
+    })
+
+    expect(state.session?.updatedAt).toBe('2026-08-24T08:00:00.000Z')
+  })
 })
 
 describe('live debate page', () => {
@@ -256,6 +350,48 @@ describe('live debate page', () => {
 
     await user.click(screen.getByRole('button', { name: '继续辩论' }))
     expect(harness.api.debate.resume).toHaveBeenCalledWith({ sessionId: 'session-1' })
+  })
+
+  it('publishes the latest recovered session and renders its event-derived concession result', async () => {
+    const harness = apiHarness()
+    const onSessionChange = vi.fn()
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1,
+      messages: [{
+        id: 'restored-message', turn: 1, roleId: 'role-a', provider: 'openai', model: 'gpt-test',
+        speech: '恢复前的发言', status: 'continue', createdAt: now
+      }]
+    })
+    render(<DebatePage roles={roles} initialSession={recovered} onBack={vi.fn()}
+      onSessionChange={onSessionChange} />)
+
+    harness.emit(event({ type: 'message-completed', message: {
+      id: 'concession', turn: 2, roleId: 'role-b', provider: 'deepseek', model: 'deepseek-test',
+      speech: '我认输。', status: 'concede', createdAt: '2026-08-24T08:01:00.000Z'
+    } }))
+    harness.emit(event({ createdAt: '2026-08-24T08:01:01.000Z', type: 'state-changed', state: 'completed' }))
+
+    expect(await screen.findByText('理性派 获胜')).toBeInTheDocument()
+    await waitFor(() => expect(onSessionChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      state: 'completed', currentTurn: 2, terminationReason: 'conceded', winnerRoleId: 'role-a'
+    })))
+  })
+
+  it.each([
+    ['stopped', '辩论已停止'],
+    ['unresolved', '达到轮次上限，尚未决出结果'],
+    ['refused', '模型拒绝继续'],
+    ['failed', '模型调用失败']
+  ] as const)('renders the event-derived recovered %s result', async (phase, title) => {
+    const harness = apiHarness()
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 0, messages: []
+    })
+    render(<DebatePage roles={roles} initialSession={recovered} onBack={vi.fn()} />)
+
+    harness.emit(event({ type: 'state-changed', state: phase }))
+
+    expect(await screen.findByText(title)).toBeInTheDocument()
   })
 
   it('offers configuration repair instead of turn retry when recovered model validation fails', async () => {
@@ -492,6 +628,44 @@ describe('configuration navigation', () => {
     expect(harness.api.debate.resume).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: '角色配置' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '历史记录' })).toBeDisabled()
+  })
+
+  it('returns from history to the latest terminal recovered-session snapshot', async () => {
+    const harness = apiHarness()
+    const recovered = session({
+      state: 'paused', terminationReason: undefined, currentTurn: 1,
+      messages: [{
+        id: 'restored-message', turn: 1, roleId: 'role-a', provider: 'openai', model: 'gpt-test',
+        speech: '恢复前的发言', status: 'continue', createdAt: now
+      }]
+    })
+    ;(harness.api.history.list as ReturnType<typeof vi.fn>).mockResolvedValue({ sessions: [{
+      id: recovered.id, topic: recovered.setup.topic, state: recovered.state,
+      currentTurn: recovered.currentTurn, createdAt: recovered.createdAt, updatedAt: recovered.updatedAt
+    }] })
+    ;(harness.api.history.get as ReturnType<typeof vi.fn>).mockResolvedValue({ session: recovered })
+    ;(harness.api.debate.recover as ReturnType<typeof vi.fn>).mockResolvedValue({ session: recovered })
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(await screen.findByRole('button', { name: '历史记录' }))
+    await user.click(await screen.findByRole('button', { name: /查看测试话题/ }))
+    await user.click(await screen.findByRole('button', { name: '加载并恢复' }))
+    await user.click(await screen.findByRole('button', { name: '继续辩论' }))
+    harness.emit(event({ type: 'state-changed', state: 'running' }))
+    harness.emit(event({ type: 'message-completed', message: {
+      id: 'concession', turn: 2, roleId: 'role-b', provider: 'deepseek', model: 'deepseek-test',
+      speech: '我认输。', status: 'concede', createdAt: '2026-08-24T08:01:00.000Z'
+    } }))
+    harness.emit(event({ createdAt: '2026-08-24T08:01:01.000Z', type: 'state-changed', state: 'completed' }))
+    expect(await screen.findByText('理性派 获胜')).toBeInTheDocument()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '历史记录' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '历史记录' }))
+    await user.click(screen.getByRole('button', { name: '辩论现场' }))
+
+    expect(await screen.findByText('理性派 获胜')).toBeInTheDocument()
+    expect(screen.queryByText('已恢复，等待用户继续')).not.toBeInTheDocument()
   })
 
   it('navigates with buttons and locks configuration while a debate is active', async () => {
