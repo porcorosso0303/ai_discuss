@@ -7,6 +7,11 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "build:credential-helper": "node scripts/build-credential-helper.mjs",
+    "stage:codex": "node scripts/stage-codex-runtime.mjs",
+    "verify:staged-runtime": "node scripts/verify-staged-runtime.mjs",
+    "dist:win": "npm run build && electron-builder --win portable --x64",
+    "verify:artifact": "node scripts/verify-artifact.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run --exclude \"tests/e2e/**\"",
     "test:e2e": "npm run build && node scripts/run-e2e.mjs"
@@ -17,6 +22,8 @@
     "zod": "^4.0.17"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@openai/codex": "0.147.0",
     "@playwright/test": "^1.54.2",
     "@testing-library/jest-dom": "^6.6.4",
     "@testing-library/react": "^16.3.0",
@@ -31,6 +38,7 @@
     "jsdom": "^26.1.0",
     "typescript": "^5.9.2",
     "vite": "^6.1.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "yaml": "2.9.0"
   }
 }
