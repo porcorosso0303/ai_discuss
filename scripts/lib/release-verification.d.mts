@@ -1,6 +1,7 @@
 import type { LockedCodexRuntime } from './codex-stage.mjs'
 
 export function assertPeX64(buffer: Buffer, label: string): void
+export function assertPortableExecutable(buffer: Buffer, label: string): void
 export function assertBuilderConfig(config: unknown): void
 export function assertAsarContents(entries: string[]): void
 

@@ -10,6 +10,7 @@ import {
   assertAsarContents,
   assertBuilderConfig,
   assertPeX64,
+  assertPortableExecutable,
   verifyArtifact,
   verifyStagedRuntime
 } from '../../../scripts/lib/release-verification.mjs'
@@ -23,11 +24,64 @@ function pe(machine = 0x8664): Buffer {
   return buffer
 }
 
+function portablePe(machine: 0x14c | 0x8664 = 0x14c): Buffer {
+  const buffer = Buffer.alloc(1024)
+  const peOffset = 0x80
+  const optionalSize = machine === 0x14c ? 0xe0 : 0xf0
+  const optionalOffset = peOffset + 24
+  const sectionOffset = optionalOffset + optionalSize
+  buffer.write('MZ', 0, 'ascii')
+  buffer.writeUInt32LE(peOffset, 0x3c)
+  buffer.write('PE\0\0', peOffset, 'binary')
+  buffer.writeUInt16LE(machine, peOffset + 4)
+  buffer.writeUInt16LE(1, peOffset + 6)
+  buffer.writeUInt16LE(optionalSize, peOffset + 20)
+  buffer.writeUInt16LE(machine === 0x14c ? 0x10b : 0x20b, optionalOffset)
+  buffer.writeUInt32LE(512, optionalOffset + 60)
+  buffer.write('.text\0\0\0', sectionOffset, 'binary')
+  buffer.writeUInt32LE(64, sectionOffset + 16)
+  buffer.writeUInt32LE(512, sectionOffset + 20)
+  return buffer
+}
+
 describe('release verification', () => {
   test('accepts only PE x64 executables', () => {
     expect(() => assertPeX64(pe(), 'codex.exe')).not.toThrow()
     expect(() => assertPeX64(pe(0x14c), 'codex.exe')).toThrow(/x64/i)
     expect(() => assertPeX64(Buffer.from('not-an-exe'), 'codex.exe')).toThrow(/PE/i)
+  })
+
+  test('accepts a structurally valid NSIS-like PE32 portable executable', () => {
+    expect(() => assertPortableExecutable(portablePe(), 'portable artifact')).not.toThrow()
+    expect(() => assertPortableExecutable(portablePe(0x8664), 'portable artifact')).not.toThrow()
+  })
+
+  test('rejects malformed, truncated, or unsupported portable executable headers and sections', () => {
+    const onlyMz = Buffer.alloc(64)
+    onlyMz.write('MZ')
+
+    const truncatedHeaders = portablePe().subarray(0, 400)
+    const invalidMachine = portablePe()
+    invalidMachine.writeUInt16LE(0xaa64, 0x84)
+    const invalidMagic = portablePe()
+    invalidMagic.writeUInt16LE(0x999, 0x98)
+    const shortOptionalHeader = portablePe()
+    shortOptionalHeader.writeUInt16LE(0x40, 0x80 + 20)
+    const invalidSection = portablePe()
+    invalidSection.writeUInt32LE(900, 0x80 + 24 + 0xe0 + 20)
+    invalidSection.writeUInt32LE(200, 0x80 + 24 + 0xe0 + 16)
+
+    for (const invalid of [
+      Buffer.from('not an executable'),
+      onlyMz,
+      truncatedHeaders,
+      invalidMachine,
+      invalidMagic,
+      shortOptionalHeader,
+      invalidSection
+    ]) {
+      expect(() => assertPortableExecutable(invalid, 'portable artifact')).toThrow(/portable artifact/i)
+    }
   })
 
   test('requires portable x64 asInvoker builder settings and exact filename', () => {
@@ -128,7 +182,7 @@ describe('release verification', () => {
       const bin = join(unpacked, 'resources', 'bin')
       const appSource = join(root, 'app-source')
       const codex = pe()
-      const artifact = pe()
+      const artifact = portablePe()
       await mkdir(bin, { recursive: true })
       await mkdir(join(appSource, 'out', 'main'), { recursive: true })
       await writeFile(join(root, 'package.json'), JSON.stringify({ devDependencies: { '@openai/codex': '0.147.0' } }))

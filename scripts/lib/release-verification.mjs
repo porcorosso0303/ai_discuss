@@ -26,6 +26,62 @@ export function assertPeX64(buffer, label) {
   }
 }
 
+export function assertPortableExecutable(buffer, label) {
+  if (buffer.length < 64 || buffer.toString('ascii', 0, 2) !== 'MZ') {
+    throw new Error(`${label} is not a valid PE executable`)
+  }
+
+  const peOffset = buffer.readUInt32LE(0x3c)
+  const coffEnd = peOffset + 24
+  if (
+    peOffset < 0x40 ||
+    coffEnd > buffer.length ||
+    buffer.toString('binary', peOffset, peOffset + 4) !== 'PE\0\0'
+  ) {
+    throw new Error(`${label} has an invalid PE header`)
+  }
+
+  const machine = buffer.readUInt16LE(peOffset + 4)
+  const sectionCount = buffer.readUInt16LE(peOffset + 6)
+  const optionalSize = buffer.readUInt16LE(peOffset + 20)
+  const optionalOffset = coffEnd
+  if ((machine !== 0x14c && machine !== 0x8664) || sectionCount < 1 || sectionCount > 96) {
+    throw new Error(`${label} has an unsupported PE machine or section count`)
+  }
+  const minimumOptionalSize = machine === 0x14c ? 0xe0 : 0xf0
+  if (optionalSize < minimumOptionalSize || optionalOffset + optionalSize > buffer.length) {
+    throw new Error(`${label} has a truncated optional PE header`)
+  }
+
+  const optionalMagic = buffer.readUInt16LE(optionalOffset)
+  if (
+    (machine === 0x14c && optionalMagic !== 0x10b) ||
+    (machine === 0x8664 && optionalMagic !== 0x20b)
+  ) {
+    throw new Error(`${label} has an invalid PE optional header`)
+  }
+
+  const sectionTable = optionalOffset + optionalSize
+  const sectionTableEnd = sectionTable + sectionCount * 40
+  if (sectionTableEnd > buffer.length) {
+    throw new Error(`${label} has a truncated PE section table`)
+  }
+
+  const sizeOfHeaders = buffer.readUInt32LE(optionalOffset + 60)
+  if (sizeOfHeaders < sectionTableEnd || sizeOfHeaders > buffer.length) {
+    throw new Error(`${label} has an invalid PE header size`)
+  }
+
+  for (let index = 0; index < sectionCount; index += 1) {
+    const section = sectionTable + index * 40
+    const rawSize = buffer.readUInt32LE(section + 16)
+    const rawOffset = buffer.readUInt32LE(section + 20)
+    if (rawSize > 0 && (rawOffset < sizeOfHeaders || rawOffset > buffer.length - rawSize)) {
+      throw new Error(`${label} has an invalid PE section range`)
+    }
+  }
+}
+
 export function assertBuilderConfig(config) {
   if (config.asar !== true) throw new Error('electron-builder asar must be enabled')
   if (config.artifactName !== 'AI-Debates-Portable-x64.exe') {
@@ -133,6 +189,7 @@ export async function verifyArtifact({ root }) {
 
   const artifactPath = join(root, 'dist', 'AI-Debates-Portable-x64.exe')
   const artifact = await requiredFile(artifactPath, 'portable artifact')
+  assertPortableExecutable(artifact, 'portable artifact')
 
   const unpackedRoot = join(root, 'dist', 'win-unpacked')
   await verifyStagedRuntime({ root: unpackedRoot, expectedVersion })
