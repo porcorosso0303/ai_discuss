@@ -29,11 +29,16 @@ describe('release documentation', () => {
       'https://developers.openai.com/codex/app-server/',
       'https://platform.kimi.com/docs/api/overview',
       'https://platform.kimi.com/docs/api/chat',
+      'https://platform.kimi.com/docs/introduction',
       'https://api-docs.deepseek.com/api/create-chat-completion/',
       'https://api-docs.deepseek.com/guides/thinking_mode/'
     ]) {
       expect(sources).toContain(url)
     }
+    expect(sources).not.toContain('https://platform.kimi.com/docs/guide/start')
+    expect(sources).not.toContain('版本及文件哈希由 staging/verification 脚本校验')
+    expect(sources).toContain('tests/unit/providers/codex/codex-events.test.ts')
+    expect(sources).toContain('sha256sum -c SHA256SUMS')
     expect(sources).toMatch(/代码映射|固定合同/u)
   })
 
@@ -49,6 +54,9 @@ describe('release documentation', () => {
     ]) {
       expect(smoke).toContain(required)
     }
+    expect(smoke).toContain('cd native/credential-helper')
+    expect(smoke).toContain('GOCACHE=/tmp/ai-debates-go-cache go test ./...')
+    expect(smoke).toContain('Set-Location native/credential-helper')
   })
 
   it('publishes a 0.1.0 changelog with unsigned-build limitations', async () => {

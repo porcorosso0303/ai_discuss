@@ -9,13 +9,13 @@
 - [Permissions](https://learn.chatgpt.com/docs/permissions)：权限 profile 与文件系统/网络规则。
 - [Configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)：`default_permissions`、登录方式、历史、搜索和 feature 配置。
 
-代码映射：`src/main/providers/codex/` 使用随包固定的 Codex CLI 0.147.0 和稳定 App Server 合同；生产包不调用 OpenAI API Key，而是在应用独立的 Codex 数据目录中完成 ChatGPT 浏览器登录。协议子集固定在 `vendor/codex-schema/`，版本及文件哈希由 staging/verification 脚本校验。
+代码映射：`src/main/providers/codex/` 使用随包固定的 Codex CLI 0.147.0 和稳定 App Server 合同；生产包不调用 OpenAI API Key，而是在应用独立的 Codex 数据目录中完成 ChatGPT 浏览器登录。协议子集固定在 `vendor/codex-schema/`。`tests/unit/providers/codex/codex-events.test.ts` 检查集成所依赖的 schema 为 stable-only；`SHA256SUMS` 则是独立的文件完整性清单。2026-08-30 发布复查在 `vendor/codex-schema` 目录运行 `sha256sum -c SHA256SUMS`，27 个文件均为 `OK`。staging/verification 脚本校验的是随包 Codex runtime 和 credential helper，不校验这些 schema 文件。
 
 ## Kimi
 
 - [API 概览](https://platform.kimi.com/docs/api/overview)
 - [Chat Completions](https://platform.kimi.com/docs/api/chat)
-- [模型与指南目录](https://platform.kimi.com/docs/guide/start)
+- [主要概念](https://platform.kimi.com/docs/introduction)
 
 固定合同：默认 Base URL `https://api.moonshot.cn/v1`，Bearer 鉴权，OpenAI-compatible Chat Completions；请求按模型能力映射 `thinking`、`reasoning_effort`、`max_completion_tokens`、`response_format` 与 `stream`。模型能力由 `/models` 响应和本地已审阅规则共同约束，见 `src/main/providers/kimi/`。
 

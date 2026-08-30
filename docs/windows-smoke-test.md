@@ -21,11 +21,25 @@
 | `npm run lint` | 150 个源文件检查通过 | Pass | 检查 NUL、合并标记、行尾空白、末尾换行和大小上限 |
 | `npm run build` | main/preload/renderer 构建成功 | Pass | exit 0 |
 | `npm run test:e2e` | 6 passed | Pass | 包含中文话题、100 条边界、暂停/继续、认输、重试、历史导出和 renderer 隔离 |
-| `GOCACHE=/tmp/ai-debates-go-cache go test ./...` | credential helper tests passed | Pass | 使用全新缓存；系统默认 Go cache 曾无法解析 stdlib |
+| Linux credential helper Go test（见下方命令） | credential helper tests passed | Pass | 从模块目录运行并使用全新缓存；系统默认 Go cache 曾无法解析 stdlib |
 | `npm run build:credential-helper` | exit 0 | Pass | 生成 Windows amd64 helper |
 | `npm run stage:codex` / `npm run verify:staged-runtime` | Codex 0.147.0、Codex/helper PE x64 通过 | Pass | Windows 隔离目录再次执行并通过 |
 | `npm audit --omit=dev` | 0 vulnerabilities | Pass | Linux 与 Windows `npm ci` 均报告 0 |
 | Windows `npm run dist:win` / `npm run verify:artifact` | portable 结构、大小与哈希通过 | Pass | 未签名 |
+
+Linux/WSL 本次实际执行：
+
+```bash
+cd native/credential-helper
+GOCACHE=/tmp/ai-debates-go-cache go test ./...
+```
+
+Windows PowerShell 若已安装 Go，应从同一模块目录运行：
+
+```powershell
+Set-Location native/credential-helper
+go test ./...
+```
 
 ## 干净 Windows 10/11 x64 人工清单
 
