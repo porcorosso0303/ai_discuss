@@ -7,6 +7,9 @@ import { registerDesktopIpc, type DesktopIpcRegistration } from './ipc/register-
 import { startApplication } from './lifecycle'
 import { resolveDesktopRuntime } from './renderer-runtime'
 import { createProductionDesktopServices, type DesktopServices } from './services'
+import { configureWindowsUserDataPath } from './user-data-path'
+
+configureWindowsUserDataPath(app, process.env, process.platform)
 
 const preloadPath = join(__dirname, '../preload/index.js')
 const rendererPath = join(__dirname, '../renderer/index.html')

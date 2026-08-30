@@ -25,6 +25,7 @@ describe('Windows portable packaging configuration', () => {
     const pkg = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'))
     expect(pkg.devDependencies['@openai/codex']).toBe('0.147.0')
     expect(pkg.scripts).toMatchObject({
+      lint: 'node scripts/lint-source.mjs',
       'build:credential-helper': 'node scripts/build-credential-helper.mjs',
       'stage:codex': 'node scripts/stage-codex-runtime.mjs',
       'verify:staged-runtime': 'node scripts/verify-staged-runtime.mjs',
@@ -44,6 +45,7 @@ describe('Windows portable packaging configuration', () => {
       'npm run verify:staged-runtime',
       'npm test',
       'npm run typecheck',
+      'npm run lint',
       'npm run test:e2e',
       'npm run dist:win',
       'npm run verify:artifact',

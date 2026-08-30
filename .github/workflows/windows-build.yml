@@ -27,6 +27,7 @@ jobs:
       - run: npm run verify:staged-runtime
       - run: npm test
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm run test:e2e
       - run: npm run dist:win
       - run: npm run verify:artifact

@@ -12,6 +12,7 @@
     "verify:staged-runtime": "node scripts/verify-staged-runtime.mjs",
     "dist:win": "npm run build && electron-builder --win portable --x64",
     "verify:artifact": "node scripts/verify-artifact.mjs",
+    "lint": "node scripts/lint-source.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run --exclude \"tests/e2e/**\"",
     "test:e2e": "npm run build && node scripts/run-e2e.mjs"
