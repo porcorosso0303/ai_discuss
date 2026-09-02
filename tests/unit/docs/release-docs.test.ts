@@ -64,6 +64,13 @@ describe('release documentation', () => {
     expect(smoke).toContain('RUN_DEEPSEEK_LIVE_TEST=1')
     expect(smoke).toContain('仅设置 API Key 不会启用 live test')
     expect(smoke).toContain('CI 不设置上述 RUN_*_LIVE_TEST 开关')
+    expect(smoke).toContain('2026-09-02')
+    expect(smoke).toContain('144,826,755 bytes')
+    expect(smoke).toContain('f92690855ebce024b78e3672e2d9c8c8000a221ed7de845e173eba0249691f44')
+    expect(smoke).toContain('4032、19604、21524、26940、28152')
+    expect(smoke).toContain('3 秒后相关残留为 0')
+    expect(smoke).not.toContain('144,822,831 bytes')
+    expect(smoke).not.toContain('21bcd9e4ee4a44ca3e4066d745237912425eb125ac9c384e4899a121e5e44a7d')
   })
 
   it('publishes a 0.1.0 changelog with unsigned-build limitations', async () => {
