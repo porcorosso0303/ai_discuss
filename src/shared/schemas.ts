@@ -303,6 +303,52 @@ export const usageSchema = z.strictObject({
   cacheReadTokens: nonNegativeIntegerSchema.optional()
 })
 
+export const ARGUMENT_SUMMARY_ITEM_MAX_LENGTH = 4000
+export const ARGUMENT_SUMMARY_CONTENT_MAX_LENGTH = 32_000
+
+const argumentSummaryItemSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(ARGUMENT_SUMMARY_ITEM_MAX_LENGTH)
+
+export const argumentSummarySchema = z
+  .strictObject({
+    claims: z.array(argumentSummaryItemSchema).max(100),
+    evidence: z.array(argumentSummaryItemSchema).max(100),
+    concessions: z.array(argumentSummaryItemSchema).max(100),
+    disputes: z.array(argumentSummaryItemSchema).max(100)
+  })
+  .refine(
+    ({ claims, evidence, concessions, disputes }) =>
+      claims.length + evidence.length + concessions.length + disputes.length > 0,
+    { message: 'argument summary must not be empty' }
+  )
+  .refine(
+    ({ claims, evidence, concessions, disputes }) =>
+      [...claims, ...evidence, ...concessions, ...disputes].reduce(
+        (total, item) => total + item.length,
+        0
+      ) <= ARGUMENT_SUMMARY_CONTENT_MAX_LENGTH,
+    { message: 'argument summary exceeds the aggregate content limit' }
+  )
+
+export const argumentSummaryMetadataSchema = z
+  .strictObject({
+    id: z.string().trim().min(1).max(200),
+    createdAt: z.string().datetime({ offset: true }),
+    coveredFromTurn: z.number().int().positive(),
+    coveredThroughTurn: z.number().int().positive(),
+    provider: z.string().trim().min(1).max(100),
+    model: z.string().trim().min(1).max(200),
+    source: z.enum(['provider', 'fallback']),
+    summary: argumentSummarySchema,
+    warning: z.string().trim().min(1).max(4000).optional()
+  })
+  .refine(({ coveredFromTurn, coveredThroughTurn }) => coveredFromTurn <= coveredThroughTurn, {
+    message: 'coveredFromTurn must not exceed coveredThroughTurn'
+  })
+
 export const debateMessageSchema = z.strictObject({
   id: idSchema,
   turn: positiveIntegerSchema,
@@ -358,7 +404,8 @@ export const debateEventSchema = z.discriminatedUnion('type', [
     ...eventBaseShape,
     type: z.literal('context-compressed'),
     roleId: roleIdSchema,
-    throughTurn: nonNegativeIntegerSchema
+    throughTurn: nonNegativeIntegerSchema,
+    summary: argumentSummaryMetadataSchema.optional()
   }),
   z.strictObject({
     ...eventBaseShape,
@@ -498,6 +545,8 @@ export type DebateSetup = z.output<typeof debateSetupSchema>
 export type DebateReplyStatus = z.output<typeof debateReplyStatusSchema>
 export type DebateReply = z.output<typeof debateReplySchema>
 export type Usage = z.output<typeof usageSchema>
+export type ArgumentSummary = z.output<typeof argumentSummarySchema>
+export type ArgumentSummaryMetadata = z.output<typeof argumentSummaryMetadataSchema>
 export type DebateMessage = z.output<typeof debateMessageSchema>
 export type DebateSessionState = z.output<typeof debateSessionStateSchema>
 export type DebateTerminationReason = z.output<typeof debateTerminationReasonSchema>

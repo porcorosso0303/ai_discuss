@@ -17,6 +17,7 @@ import {
   type IpcInvokeChannel
 } from '../shared/ipc'
 import { DebateOrchestrator } from './debate/orchestrator'
+import { ContextManager } from './debate/context-manager'
 import { MarkdownExporter, type MarkdownExportResult } from './export/markdown-exporter'
 import { CodexProvider, type CodexAccountStatus } from './providers/codex/codex-provider'
 import { startCodexAppServer } from './providers/codex/codex-process'
@@ -635,12 +636,16 @@ export function createProductionDesktopServices({
     })
   }
   const exporter = new MarkdownExporter(dialog)
+  const contextPreparation = new ContextManager({})
   const services = new DesktopServices({
     version: app.getVersion(), config, credentials, providers, repository, exporter, emit, log,
     shutdownController,
     createOrchestrator: (onEvent, initialSession) => initialSession === undefined
-      ? new DebateOrchestrator({ registry: providers, repository, onEvent })
-      : DebateOrchestrator.restore({ registry: providers, repository, onEvent }, initialSession)
+      ? new DebateOrchestrator({ registry: providers, repository, onEvent, contextPreparation })
+      : DebateOrchestrator.restore(
+          { registry: providers, repository, onEvent, contextPreparation },
+          initialSession
+        )
   })
   return { services, log }
 }

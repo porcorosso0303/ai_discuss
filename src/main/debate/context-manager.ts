@@ -46,7 +46,7 @@ export interface SummaryProvider {
 }
 
 export interface ContextManagerDependencies {
-  summaryProvider: SummaryProvider
+  summaryProvider?: SummaryProvider
   estimateTokens?: (input: string) => number
   thresholdRatio?: number
   unknownContextLength?: number
@@ -227,19 +227,23 @@ export class ContextManager {
       messages: coveredMessages.map((oldMessage) => this.projectMessage(session, oldMessage))
     }
     let summary: ArgumentSummary | undefined
-    let source: 'provider' | 'fallback' = 'provider'
-    let provider = boundedIdentifier(
-      this.dependencies.summaryProvider.provider,
-      'summary-provider',
-      100
-    )
-    let model = boundedIdentifier(this.dependencies.summaryProvider.model, 'summary-model', 200)
+    const summaryProvider = this.dependencies.summaryProvider
+    let source: 'provider' | 'fallback' = summaryProvider === undefined ? 'fallback' : 'provider'
+    let provider = summaryProvider === undefined
+      ? 'fallback'
+      : boundedIdentifier(summaryProvider.provider, 'summary-provider', 100)
+    let model = summaryProvider === undefined
+      ? 'deterministic-local'
+      : boundedIdentifier(summaryProvider.model, 'summary-model', 200)
     let warning: string | undefined
 
     let providerResult: unknown
-    try {
+    if (summaryProvider === undefined) {
+      warning = '未配置外部摘要服务，已使用本地确定性摘要。'
+      summary = deterministicFallback(request)
+    } else try {
       signal?.throwIfAborted()
-      providerResult = await this.dependencies.summaryProvider.summarize(request, signal)
+      providerResult = await summaryProvider.summarize(request, signal)
       signal?.throwIfAborted()
     } catch (error) {
       if (signal?.aborted || isAbortError(error)) {

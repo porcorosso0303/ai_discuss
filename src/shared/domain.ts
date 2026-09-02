@@ -51,6 +51,8 @@ export const STRUCTURED_OUTPUT_MODES = [
 
 export type {
   BaseUrl,
+  ArgumentSummary,
+  ArgumentSummaryMetadata,
   CredentialScope,
   DebateEvent,
   DebateMessage,

@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
 
 import {
+  argumentSummaryMetadataSchema,
+  argumentSummarySchema,
   debateEventSchema,
   debateReplySchema,
   debateSessionSchema,
@@ -52,6 +54,31 @@ describe('schema type ownership', () => {
 
     expect(domainSource).not.toMatch(/\binterface\b/)
     expect(domainSource).toMatch(/export type \{[\s\S]*RoleConfig[\s\S]*\} from '\.\/schemas'/)
+  })
+})
+
+describe('argument summary schemas', () => {
+  const metadata = {
+    id: 'summary-1',
+    createdAt: '2026-08-12T00:00:00.000Z',
+    coveredFromTurn: 1,
+    coveredThroughTurn: 3,
+    provider: 'fallback',
+    model: 'deterministic-local',
+    source: 'fallback' as const,
+    summary: { claims: ['旧观点'], evidence: [], concessions: [], disputes: [] }
+  }
+
+  it('owns argument summary contracts in shared and keeps old context events compatible', () => {
+    expect(argumentSummarySchema.parse(metadata.summary)).toEqual(metadata.summary)
+    expect(argumentSummaryMetadataSchema.parse(metadata)).toEqual(metadata)
+
+    const base = {
+      id: 'event-1', sessionId: 'session-1', createdAt: '2026-08-12T00:00:00.000Z',
+      type: 'context-compressed' as const, roleId: 'role-a' as const, throughTurn: 3
+    }
+    expect(debateEventSchema.parse(base)).toEqual(base)
+    expect(debateEventSchema.parse({ ...base, summary: metadata })).toEqual({ ...base, summary: metadata })
   })
 })
 

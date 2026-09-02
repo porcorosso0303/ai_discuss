@@ -3,6 +3,7 @@ import type {
   DebateMessage,
   DebateSession,
   DebateSetup,
+  ModelCapability,
   RoleConfig,
   Usage
 } from '../../shared/domain'
@@ -19,7 +20,7 @@ import {
   retryDelayMs,
   type RetrySleep
 } from '../providers/http/retry-policy'
-import { buildRoleView } from './prompt-builder'
+import { ContextManager, type PrepareContextInput, type PreparedContext } from './context-manager'
 import { parseReply } from './reply-parser'
 import {
   createDebateMachine,
@@ -38,6 +39,10 @@ export interface RetryPolicy {
   shouldRetry(error: unknown): boolean
 }
 
+export interface ContextPreparationPort {
+  prepare(input: PrepareContextInput): Promise<PreparedContext>
+}
+
 export interface OrchestratorDependencies {
   registry: ProviderRegistry
   repository: DebateRepository
@@ -48,6 +53,7 @@ export interface OrchestratorDependencies {
   retryNow?: () => number
   retryRandom?: () => number
   retryMaxDelayMs?: number
+  contextPreparation?: ContextPreparationPort
   onEvent?: (event: DebateEvent) => void
 }
 
@@ -75,6 +81,8 @@ export class DebateOrchestrator {
   private readonly retryNow: () => number
   private readonly retryRandom: () => number
   private readonly retryMaxDelayMs: number | undefined
+  private readonly contextPreparation: ContextPreparationPort
+  private readonly modelCapabilities = new Map<RoleConfig['roleId'], ModelCapability>()
 
   constructor(private readonly dependencies: OrchestratorDependencies) {
     this.clock = dependencies.clock ?? (() => new Date())
@@ -87,6 +95,7 @@ export class DebateOrchestrator {
     this.retryNow = dependencies.retryNow ?? Date.now
     this.retryRandom = dependencies.retryRandom ?? Math.random
     this.retryMaxDelayMs = dependencies.retryMaxDelayMs
+    this.contextPreparation = dependencies.contextPreparation ?? new ContextManager({})
   }
 
   static restore(
@@ -128,6 +137,10 @@ export class DebateOrchestrator {
             'The configured model is not available from provider discovery'
           )
         }
+        this.modelCapabilities.set(
+          role.roleId,
+          capabilities.models.find(({ id }) => id === role.model)!
+        )
       } catch (error) {
         this.throwIfStartupAborted(signal)
         this.emitProviderDiscoveryError(role, error)
@@ -187,6 +200,10 @@ export class DebateOrchestrator {
             'The configured model is not available from provider discovery'
           )
         }
+        this.modelCapabilities.set(
+          role.roleId,
+          capabilities.models.find(({ id }) => id === role.model)!
+        )
       } catch (error) {
         this.emitProviderDiscoveryError(role, error)
         this.transition({ type: 'recoveryValidationFailed' })
@@ -267,10 +284,47 @@ export class DebateOrchestrator {
     const generation = this.generation
     let completedRaw: string | undefined
     let completedUsage: Usage | undefined
+    const controller = new AbortController()
+    this.abortController = controller
+    let prepared: PreparedContext
 
-    for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
-      const controller = new AbortController()
-      this.abortController = controller
+    try {
+      prepared = await this.contextPreparation.prepare({
+        session: this.session(),
+        currentRoleId: role.roleId,
+        modelCapability: this.modelCapabilities.get(role.roleId),
+        signal: controller.signal
+      })
+      if (generation !== this.generation || controller.signal.aborted) return
+      if (prepared.contextCompressed && prepared.summary !== undefined) {
+        this.contextCompressed = true
+        this.emit({
+          type: 'context-compressed',
+          roleId: role.roleId,
+          throughTurn: prepared.summary.coveredThroughTurn,
+          summary: prepared.summary
+        })
+      }
+      if (prepared.warning !== undefined) {
+        this.emit({
+          type: 'warning',
+          code: 'context-compression-warning',
+          roleId: role.roleId,
+          turn,
+          message: prepared.warning,
+          retryable: false
+        })
+      }
+    } catch (error) {
+      if (generation !== this.generation || controller.signal.aborted) return
+      this.emitProviderError(role, turn, 1, false, this.errorMessage(error))
+      this.transition({ type: 'turnFailed' })
+      await this.enqueueSave()
+      return
+    }
+
+    try {
+      for (let attempt = 1; attempt <= this.retryPolicy.maxAttempts; attempt += 1) {
       let raw = ''
       let usage: Usage | undefined
       let refused = false
@@ -282,7 +336,7 @@ export class DebateOrchestrator {
             sessionId: before.sessionId,
             turn,
             role,
-            view: buildRoleView(this.session(), role.roleId)
+            view: prepared.view
           },
           controller.signal
         )) {
@@ -374,11 +428,10 @@ export class DebateOrchestrator {
         if (generation !== this.generation || controller.signal.aborted) {
           return
         }
-      } finally {
-        if (this.abortController === controller) {
-          this.abortController = undefined
-        }
       }
+      }
+    } finally {
+      if (this.abortController === controller) this.abortController = undefined
     }
 
     if (completedRaw === undefined) {

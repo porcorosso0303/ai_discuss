@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { DebateOrchestrator } from '../../../src/main/debate/orchestrator'
+import {
+  DebateOrchestrator,
+  type ContextPreparationPort
+} from '../../../src/main/debate/orchestrator'
+import { ContextManager } from '../../../src/main/debate/context-manager'
 import {
   ProviderNonRetryableError,
   ProviderRefusalError,
@@ -50,6 +54,164 @@ const jsonReply = (speech: string, status = 'continue'): string =>
 const acceptsProviderContract = (_provider: Provider): void => undefined
 
 describe('DebateOrchestrator turn scheduling', () => {
+  it('prepares context once per turn, persists compression metadata, and sends only the prepared view', async () => {
+    const provider = new FakeProvider([
+      { error: new ProviderRetryableError('retry') },
+      { chunks: [
+        { type: 'content', content: jsonReply('压缩后回答') },
+        { type: 'final', finishReason: 'stop' }
+      ] }
+    ])
+    const originalDiscover = provider.discover.bind(provider)
+    provider.discover = async (role, signal) => ({
+      ...await originalDiscover(role, signal),
+      models: [{
+        id: role.model, contextLength: 64, reasoningEfforts: [], thinking: null,
+        samplingParameters: [], structuredOutputModes: ['json-object']
+      }]
+    })
+    const preparedView = {
+      system: 'prepared-system', waiting: false,
+      messages: [{ role: 'user' as const, content: 'prepared-history' }]
+    }
+    const prepare = vi.fn<ContextPreparationPort['prepare']>().mockResolvedValue({
+      view: preparedView,
+      contextCompressed: true,
+      warning: '使用本地确定性摘要。',
+      summary: {
+        id: 'summary-1', createdAt: '2026-08-12T00:00:00.000Z',
+        coveredFromTurn: 1, coveredThroughTurn: 21,
+        provider: 'fallback', model: 'deterministic-local', source: 'fallback',
+        summary: { claims: ['旧观点'], evidence: [], concessions: [], disputes: [] },
+        warning: '使用本地确定性摘要。'
+      }
+    })
+    const repository = new FakeDebateRepository()
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai: provider, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository,
+      contextPreparation: { prepare }
+    })
+
+    const result = await orchestrator.start(setup(1))
+
+    expect(prepare).toHaveBeenCalledTimes(1)
+    expect(prepare.mock.calls[0]?.[0].modelCapability).toMatchObject({ id: 'gpt-5', contextLength: 64 })
+    expect(provider.requests).toHaveLength(2)
+    expect(provider.requests.every(({ view }) => view === preparedView)).toBe(true)
+    expect(result.contextCompressed).toBe(true)
+    expect(result.events).toContainEqual(expect.objectContaining({
+      type: 'context-compressed', roleId: 'role-a', throughTurn: 21,
+      summary: expect.objectContaining({ id: 'summary-1', source: 'fallback' })
+    }))
+    expect(result.events).toContainEqual(expect.objectContaining({
+      type: 'warning', code: 'context-compression-warning', roleId: 'role-a', turn: 1
+    }))
+    expect(repository.saved.at(-1)?.events).toEqual(result.events)
+  })
+
+  it('aborts context preparation on stop without calling a provider or saving a message', async () => {
+    let seenSignal: AbortSignal | undefined
+    let started = (): void => undefined
+    const preparing = new Promise<void>((resolve) => { started = resolve })
+    const contextPreparation: ContextPreparationPort = {
+      prepare: async ({ signal }) => {
+        seenSignal = signal
+        started()
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        throw new Error('unreachable')
+      }
+    }
+    const provider = new FakeProvider([])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai: provider, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(), contextPreparation
+    })
+
+    const running = orchestrator.start(setup(1))
+    await preparing
+    const stopped = await orchestrator.stop()
+    const completed = await running
+
+    expect(seenSignal?.aborted).toBe(true)
+    expect(provider.requests).toHaveLength(0)
+    expect(stopped.state).toBe('stopped')
+    expect(completed.messages).toEqual([])
+  })
+
+  it('integrates local compression while retaining full formal history in the session', async () => {
+    const messages = Array.from({ length: 21 }, (_, index) => ({
+      id: `old-${index + 1}`,
+      turn: index + 1,
+      roleId: (index % 2 === 0 ? 'role-a' : 'role-b') as 'role-a' | 'role-b',
+      provider: (index % 2 === 0 ? 'openai' : 'kimi') as 'openai' | 'kimi',
+      model: index % 2 === 0 ? 'gpt-5' : 'kimi-k2.5',
+      speech: `正式历史-${index + 1}`,
+      status: 'continue' as const,
+      createdAt: '2026-08-12T00:00:00.000Z'
+    }))
+    const saved = {
+      id: 'compressed-session', setup: setup(22), state: 'running' as const,
+      messages, events: [], currentTurn: 21,
+      createdAt: '2026-08-12T00:00:00.000Z', updatedAt: '2026-08-12T00:00:00.000Z',
+      contextCompressed: false
+    }
+    const kimi = new FakeProvider([{ chunks: [
+      { type: 'content', content: jsonReply('压缩上下文后的回应') },
+      { type: 'final', finishReason: 'stop' }
+    ] }])
+    const originalDiscover = kimi.discover.bind(kimi)
+    kimi.discover = async (role, signal) => ({
+      ...await originalDiscover(role, signal),
+      models: [{
+        id: role.model, contextLength: 100, reasoningEfforts: [], thinking: null,
+        samplingParameters: [], structuredOutputModes: ['json-object']
+      }]
+    })
+    const repository = new FakeDebateRepository()
+    const orchestrator = DebateOrchestrator.restore({
+      ...deterministicDependencies(),
+      registry: { openai: new FakeProvider([]), kimi, deepseek: new FakeProvider([]) },
+      repository,
+      contextPreparation: new ContextManager({ estimateTokens: () => 100 })
+    }, saved)
+
+    const result = await orchestrator.resume()
+
+    expect(kimi.requests[0]?.view.messages).toHaveLength(21)
+    expect(kimi.requests[0]?.view.messages[0]?.content).toContain('中立论点摘要')
+    expect(kimi.requests[0]?.view.messages.slice(1).map(({ content }) => content).join('\n'))
+      .not.toContain('\n正式历史-1\n')
+    expect(kimi.requests[0]?.view.messages.at(-1)?.content).toContain('正式历史-21')
+    expect(result.messages).toHaveLength(22)
+    expect(result.messages.slice(0, 21)).toEqual(messages)
+    expect(result.contextCompressed).toBe(true)
+    expect(repository.saved.at(-1)).toEqual(result)
+  })
+
+  it('keeps the complete view and emits no context event below the compression threshold', async () => {
+    const provider = new FakeProvider([{ chunks: [
+      { type: 'content', content: jsonReply('完整上下文回答') },
+      { type: 'final', finishReason: 'stop' }
+    ] }])
+    const orchestrator = new DebateOrchestrator({
+      ...deterministicDependencies(),
+      registry: { openai: provider, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) },
+      repository: new FakeDebateRepository(),
+      contextPreparation: new ContextManager({ estimateTokens: () => 1 })
+    })
+
+    const result = await orchestrator.start(setup(1))
+
+    expect(provider.requests[0]?.view.system).toContain('[指定话题]')
+    expect(result.events.some(({ type }) => type === 'context-compressed')).toBe(false)
+    expect(result.contextCompressed).toBe(false)
+  })
+
   it('restores passively and validates providers only when the user resumes', async () => {
     const openai = new FakeProvider([])
     const kimi = new FakeProvider([{ chunks: [

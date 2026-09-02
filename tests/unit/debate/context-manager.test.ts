@@ -83,6 +83,25 @@ const summaryProvider = (): SummaryProvider => ({
 })
 
 describe('ContextManager', () => {
+  it('uses the deterministic local summary directly when no external summary provider is configured', async () => {
+    const result = await new ContextManager({
+      estimateTokens: vi.fn().mockReturnValueOnce(100).mockReturnValue(1),
+      clock: () => new Date('2026-08-12T00:00:00.000Z'),
+      idFactory: () => 'local-summary'
+    }).prepare({
+      session: session(21),
+      currentRoleId: 'role-a',
+      modelCapability: capability(100)
+    })
+
+    expect(result.contextCompressed).toBe(true)
+    expect(result.summary).toMatchObject({
+      provider: 'fallback', model: 'deterministic-local', source: 'fallback'
+    })
+    expect(result.warning).toContain('使用本地确定性摘要')
+    expect(result.warning).not.toContain('服务不可用')
+  })
+
   it('keeps the complete role view and never calls the summarizer below budget', async () => {
     const debate = session(4)
     const provider = summaryProvider()
