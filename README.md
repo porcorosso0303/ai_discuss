@@ -51,4 +51,14 @@ Kimi 与 DeepSeek 的 API Key 保存在 Windows Credential Manager；配置、�
 - 便携版“无需安装”不等于“零写入”：它仍会写入每用户数据目录和 Windows Credential Manager。
 - 自动化验收不代替真实账号的人工登录、退出/重新登录与服务商计费检查。
 
+## 开发者：真实服务测试
+
+真实服务测试可能产生费用，因此默认全部跳过，必须同时提供服务商专用的显式开关和凭据：
+
+- Kimi：`RUN_KIMI_LIVE_TEST=1` 和 `KIMI_API_KEY`
+- DeepSeek：`RUN_DEEPSEEK_LIVE_TEST=1` 和 `DEEPSEEK_API_KEY`
+- Codex：`RUN_CODEX_LIVE_TEST=1`、绝对路径 `CODEX_BIN`（Codex 0.147.0）和绝对文件路径 `CODEX_AUTH_SOURCE`（已有 ChatGPT 登录的 `auth.json`）
+
+仅设置 API Key 不会运行 Kimi 或 DeepSeek live test；设置 RUN 开关但缺少对应凭据会以固定、无密钥内容的错误明确失败。CI 不设置这些 RUN 开关，因而不会连接真实服务。
+
 开发、协议映射与发布验收详见 [官方 API 来源](docs/official-api-sources.md) 和 [Windows 冒烟测试](docs/windows-smoke-test.md)。

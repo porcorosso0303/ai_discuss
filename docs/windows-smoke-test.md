@@ -6,7 +6,7 @@
 
 | Item | Expected | Actual | Pass | Notes |
 | --- | --- | --- | --- | --- |
-| 自动化单元/合同测试 | 全部通过，live 默认显示 skipped | 2026-08-30：42 个测试文件通过、1 个文件 skipped；775 项通过、5 项 skipped，其中 3 项为 live | Pass | 未设置真实 API 环境变量 |
+| 自动化单元/合同测试 | 全部通过，live 默认显示 skipped | 2026-08-30：43 个测试文件通过、1 个文件 skipped；780 项通过、5 项 skipped，其中 3 项为 live | Pass | 未设置真实 API 环境变量 |
 | Windows 构建与结构校验 | portable、Codex、credential helper 均为 x64，固定版本通过 | Windows 11 x64（10.0.26200）隔离目录构建；Codex 0.147.0 与两个 PE x64 校验通过 | Pass | `npm ci` 使用独立 Windows `node_modules` |
 | 中文路径启动 | EXE 在中文目录启动，10 秒后进程仍存活 | 从 `AI辩论验收-20260830` 启动；15 秒后 5 个本次进程存活、1 个有窗口；隔离 userData 已创建 | Pass | 仅按本次新增 PID 停止；3 秒后相关残留为 0 |
 
@@ -16,9 +16,9 @@
 
 | Command | Actual | Pass | Notes |
 | --- | --- | --- | --- |
-| `npm test -- --reporter=dot` | 775 passed、5 skipped | Pass | 3 个 live provider 测试因无 opt-in 环境变量跳过；另有 2 个既有条件测试跳过 |
+| `npm test -- --reporter=dot` | 780 passed、5 skipped | Pass | 3 个 live provider 测试因无 opt-in 环境变量跳过；另有 2 个既有条件测试跳过 |
 | `npm run typecheck` | exit 0 | Pass | renderer/main 两套 TypeScript 配置 |
-| `npm run lint` | 150 个源文件检查通过 | Pass | 检查 NUL、合并标记、行尾空白、末尾换行和大小上限 |
+| `npm run lint` | 152 个源文件检查通过 | Pass | 检查 NUL、合并标记、行尾空白、末尾换行和大小上限 |
 | `npm run build` | main/preload/renderer 构建成功 | Pass | exit 0 |
 | `npm run test:e2e` | 6 passed | Pass | 包含中文话题、100 条边界、暂停/继续、认输、重试、历史导出和 renderer 隔离 |
 | Linux credential helper Go test（见下方命令） | credential helper tests passed | Pass | 从模块目录运行并使用全新缓存；系统默认 Go cache 曾无法解析 stdlib |
@@ -66,8 +66,8 @@ go test ./...
 
 默认运行 `npm test` 时三个真实服务测试全部 skip。按服务单独提供环境变量：
 
-- Kimi：`KIMI_API_KEY`
-- DeepSeek：`DEEPSEEK_API_KEY`
+- Kimi：`RUN_KIMI_LIVE_TEST=1` 和 `KIMI_API_KEY`
+- DeepSeek：`RUN_DEEPSEEK_LIVE_TEST=1` 和 `DEEPSEEK_API_KEY`
 - Codex：`RUN_CODEX_LIVE_TEST=1`、绝对路径 `CODEX_BIN`（必须为 0.147.0）和绝对文件路径 `CODEX_AUTH_SOURCE`（已有 ChatGPT 登录的 `auth.json`）
 
-当 `RUN_CODEX_LIVE_TEST=1` 但 Codex 前提缺失时，测试必须明确失败，不会静默跳过。测试使用临时隔离目录、短输出、超时和 finally 清理，不打印 secret。
+仅设置 API Key 不会启用 live test，也不会构造 provider 或发起网络请求。任一 `RUN_*_LIVE_TEST=1` 已设置但对应凭据缺失或为空白时，测试必须用固定消息明确失败，不会静默跳过，也不会打印 secret。CI 不设置上述 RUN_*_LIVE_TEST 开关。测试使用临时隔离目录、短输出、超时和 finally 清理。

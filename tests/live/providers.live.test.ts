@@ -18,6 +18,7 @@ import type {
   OpenAIRoleConfig,
   RoleConfig
 } from '../../src/shared/domain'
+import { isLiveTestEnabled, runCredentialedLiveEntry } from './live-test-gate'
 
 const liveTimeoutMs = 60_000
 const codexTimeoutMs = 120_000
@@ -58,56 +59,70 @@ const assertShortStructuredReply = async (
   expect(parsed.status).toBe('continue')
 }
 
-describe.skipIf(process.env.KIMI_API_KEY === undefined)('Kimi live provider', () => {
+describe.skipIf(!isLiveTestEnabled(process.env, 'RUN_KIMI_LIVE_TEST'))('Kimi live provider', () => {
   it('discovers models and returns one short structured response', async () => {
-    const apiKey = process.env.KIMI_API_KEY
-    if (apiKey === undefined || apiKey.trim() === '') throw new Error('KIMI_API_KEY must not be empty')
-    const provider = new KimiProvider({ getApiKey: async () => apiKey })
-    const discoveryRole: KimiRoleConfig = {
-      roleId: 'role-a',
-      name: 'Kimi live',
-      personaOrStance: '简洁',
-      provider: 'kimi',
-      baseUrl: 'https://api.moonshot.cn/v1',
-      model: 'kimi-k3',
-      maxCompletionTokens: 128
-    }
-    const capabilities = await provider.discover(discoveryRole, AbortSignal.timeout(liveTimeoutMs))
-    const model = capabilities.defaultModel ?? capabilities.models[0]?.id
-    if (model === undefined) throw new Error('Kimi model discovery returned no models')
-    const role = { ...discoveryRole, model }
-    await provider.discover(role, AbortSignal.timeout(liveTimeoutMs))
-    await assertShortStructuredReply(provider, role)
+    await runCredentialedLiveEntry(
+      process.env,
+      'RUN_KIMI_LIVE_TEST',
+      'KIMI_API_KEY',
+      async (apiKey) => {
+        const provider = new KimiProvider({ getApiKey: async () => apiKey })
+        const discoveryRole: KimiRoleConfig = {
+          roleId: 'role-a',
+          name: 'Kimi live',
+          personaOrStance: '简洁',
+          provider: 'kimi',
+          baseUrl: 'https://api.moonshot.cn/v1',
+          model: 'kimi-k3',
+          maxCompletionTokens: 128
+        }
+        const capabilities = await provider.discover(
+          discoveryRole,
+          AbortSignal.timeout(liveTimeoutMs)
+        )
+        const model = capabilities.defaultModel ?? capabilities.models[0]?.id
+        if (model === undefined) throw new Error('Kimi model discovery returned no models')
+        const role = { ...discoveryRole, model }
+        await provider.discover(role, AbortSignal.timeout(liveTimeoutMs))
+        await assertShortStructuredReply(provider, role)
+      }
+    )
   }, liveTimeoutMs * 3)
 })
 
-describe.skipIf(process.env.DEEPSEEK_API_KEY === undefined)('DeepSeek live provider', () => {
-  it('discovers models and returns one short structured response', async () => {
-    const apiKey = process.env.DEEPSEEK_API_KEY
-    if (apiKey === undefined || apiKey.trim() === '') {
-      throw new Error('DEEPSEEK_API_KEY must not be empty')
-    }
-    const provider = new DeepSeekProvider({ getApiKey: async () => apiKey })
-    const discoveryRole: DeepSeekRoleConfig = {
-      roleId: 'role-a',
-      name: 'DeepSeek live',
-      personaOrStance: '简洁',
-      provider: 'deepseek',
-      baseUrl: 'https://api.deepseek.com',
-      model: 'deepseek-v4-pro',
-      maxTokens: 128
-    }
-    const capabilities = await provider.discover(
-      discoveryRole,
-      AbortSignal.timeout(liveTimeoutMs)
-    )
-    const model = capabilities.defaultModel ?? capabilities.models[0]?.id
-    if (model === undefined) throw new Error('DeepSeek model discovery returned no models')
-    const role = { ...discoveryRole, model }
-    await provider.discover(role, AbortSignal.timeout(liveTimeoutMs))
-    await assertShortStructuredReply(provider, role)
-  }, liveTimeoutMs * 3)
-})
+describe.skipIf(!isLiveTestEnabled(process.env, 'RUN_DEEPSEEK_LIVE_TEST'))(
+  'DeepSeek live provider',
+  () => {
+    it('discovers models and returns one short structured response', async () => {
+      await runCredentialedLiveEntry(
+        process.env,
+        'RUN_DEEPSEEK_LIVE_TEST',
+        'DEEPSEEK_API_KEY',
+        async (apiKey) => {
+          const provider = new DeepSeekProvider({ getApiKey: async () => apiKey })
+          const discoveryRole: DeepSeekRoleConfig = {
+            roleId: 'role-a',
+            name: 'DeepSeek live',
+            personaOrStance: '简洁',
+            provider: 'deepseek',
+            baseUrl: 'https://api.deepseek.com',
+            model: 'deepseek-v4-pro',
+            maxTokens: 128
+          }
+          const capabilities = await provider.discover(
+            discoveryRole,
+            AbortSignal.timeout(liveTimeoutMs)
+          )
+          const model = capabilities.defaultModel ?? capabilities.models[0]?.id
+          if (model === undefined) throw new Error('DeepSeek model discovery returned no models')
+          const role = { ...discoveryRole, model }
+          await provider.discover(role, AbortSignal.timeout(liveTimeoutMs))
+          await assertShortStructuredReply(provider, role)
+        }
+      )
+    }, liveTimeoutMs * 3)
+  }
+)
 
 const accountProbeSchema = z.object({
   account: z.object({ type: z.string() }).passthrough().nullable().optional(),

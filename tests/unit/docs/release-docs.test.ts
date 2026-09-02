@@ -18,6 +18,9 @@ describe('release documentation', () => {
       expect(readme).toContain(required)
     }
     expect(readme).toContain('总正式发言')
+    expect(readme).toContain('RUN_KIMI_LIVE_TEST=1')
+    expect(readme).toContain('RUN_DEEPSEEK_LIVE_TEST=1')
+    expect(readme).toContain('RUN_CODEX_LIVE_TEST=1')
   })
 
   it('records dated official API sources and their code contracts', async () => {
@@ -57,6 +60,10 @@ describe('release documentation', () => {
     expect(smoke).toContain('cd native/credential-helper')
     expect(smoke).toContain('GOCACHE=/tmp/ai-debates-go-cache go test ./...')
     expect(smoke).toContain('Set-Location native/credential-helper')
+    expect(smoke).toContain('RUN_KIMI_LIVE_TEST=1')
+    expect(smoke).toContain('RUN_DEEPSEEK_LIVE_TEST=1')
+    expect(smoke).toContain('仅设置 API Key 不会启用 live test')
+    expect(smoke).toContain('CI 不设置上述 RUN_*_LIVE_TEST 开关')
   })
 
   it('publishes a 0.1.0 changelog with unsigned-build limitations', async () => {

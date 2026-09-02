@@ -824,12 +824,12 @@ git commit -m 'build: package windows portable application'
 
 **Step 1: 添加 opt-in live tests**
 
-只有设置下列变量时运行对应测试，否则 skip：
+只有同时设置服务商专用 RUN 开关和对应凭据时运行测试，否则 skip：
 
 ```text
-KIMI_API_KEY
-DEEPSEEK_API_KEY
-RUN_CODEX_LIVE_TEST=1
+RUN_KIMI_LIVE_TEST=1 + KIMI_API_KEY
+RUN_DEEPSEEK_LIVE_TEST=1 + DEEPSEEK_API_KEY
+RUN_CODEX_LIVE_TEST=1 + CODEX_BIN + CODEX_AUTH_SOURCE
 ```
 
 测试只发现模型并各生成一条极短结构化回应；输出和日志不得打印 secret。
