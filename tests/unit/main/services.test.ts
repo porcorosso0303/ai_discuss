@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   DesktopServices,
+  createProductionOrchestratorFactory,
   isAllowedOpenAILoginUrl,
   type DesktopServicesDependencies
 } from '../../../src/main/services'
@@ -9,6 +10,8 @@ import type { CodexAccountStatus } from '../../../src/main/providers/codex/codex
 import { IPC_CHANNELS } from '../../../src/shared/ipc'
 import type { CredentialScope, DebateEvent, DebateSession, RoleConfig } from '../../../src/shared/domain'
 import { createSession, kimiRole, openAIRole } from '../../helpers/debate-fixtures'
+import { buildRoleView } from '../../../src/main/debate/prompt-builder'
+import { FakeDebateRepository, FakeProvider } from '../../helpers/fake-provider'
 
 function harness() {
   const roles = [openAIRole, kimiRole]
@@ -102,6 +105,27 @@ function installAsyncRejectingEmitter(h: ReturnType<typeof harness>, message: st
 }
 
 describe('desktop services', () => {
+  it('wires context preparation into production orchestrators', async () => {
+    const openai = new FakeProvider([{ chunks: [
+      { type: 'content', content: '{"speech":"生产工厂回答","status":"continue"}' },
+      { type: 'final', finishReason: 'stop' }
+    ] }])
+    const registry = { openai, kimi: new FakeProvider([]), deepseek: new FakeProvider([]) }
+    const repository = new FakeDebateRepository()
+    const prepare = vi.fn(async ({ session, currentRoleId }) => ({
+      view: buildRoleView(session, currentRoleId), contextCompressed: false
+    }))
+    const factory = createProductionOrchestratorFactory(registry, repository, { prepare })
+    const orchestrator = factory(() => undefined)
+
+    await orchestrator.start({
+      topic: '生产工厂是否注入上下文管理器？',
+      roles: [openAIRole, kimiRole], firstSpeaker: 'role-a', maxTurns: 1
+    })
+
+    expect(prepare).toHaveBeenCalledOnce()
+  })
+
   it('recovers an incomplete persisted session as the active paused session without starting it', async () => {
     const h = harness()
     const saved = createSession({ state: 'running' })

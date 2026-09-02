@@ -16,14 +16,22 @@ import {
   type IpcEventMap,
   type IpcInvokeChannel
 } from '../shared/ipc'
-import { DebateOrchestrator } from './debate/orchestrator'
+import {
+  DebateOrchestrator,
+  type ContextPreparationPort,
+  type DebateRepository as OrchestratorRepository
+} from './debate/orchestrator'
 import { ContextManager } from './debate/context-manager'
 import { MarkdownExporter, type MarkdownExportResult } from './export/markdown-exporter'
 import { CodexProvider, type CodexAccountStatus } from './providers/codex/codex-provider'
 import { startCodexAppServer } from './providers/codex/codex-process'
 import { DeepSeekProvider } from './providers/deepseek/deepseek-provider'
 import { KimiProvider } from './providers/kimi/kimi-provider'
-import { ProviderNonRetryableError, type Provider } from './providers/provider'
+import {
+  ProviderNonRetryableError,
+  type Provider,
+  type ProviderRegistry
+} from './providers/provider'
 import { CredentialVault } from './security/credential-vault'
 import { ConfigRepository } from './storage/config-repository'
 import { DebateRepository, type DebateListOptions, type DebateSessionSummary } from './storage/debate-repository'
@@ -92,6 +100,19 @@ export interface DesktopServicesDependencies {
   ): void | Promise<void>
   log?: { error(error: unknown, context?: unknown): Promise<void> | void }
   shutdownController?: AbortController
+}
+
+export function createProductionOrchestratorFactory(
+  registry: ProviderRegistry,
+  repository: OrchestratorRepository,
+  contextPreparation: ContextPreparationPort = new ContextManager({})
+): DesktopServicesDependencies['createOrchestrator'] {
+  return (onEvent, initialSession) => initialSession === undefined
+    ? new DebateOrchestrator({ registry, repository, onEvent, contextPreparation })
+    : DebateOrchestrator.restore(
+        { registry, repository, onEvent, contextPreparation },
+        initialSession
+      )
 }
 
 const terminalStates = new Set<DebateSession['state']>([
@@ -636,16 +657,11 @@ export function createProductionDesktopServices({
     })
   }
   const exporter = new MarkdownExporter(dialog)
-  const contextPreparation = new ContextManager({})
+  const createOrchestrator = createProductionOrchestratorFactory(providers, repository)
   const services = new DesktopServices({
     version: app.getVersion(), config, credentials, providers, repository, exporter, emit, log,
     shutdownController,
-    createOrchestrator: (onEvent, initialSession) => initialSession === undefined
-      ? new DebateOrchestrator({ registry: providers, repository, onEvent, contextPreparation })
-      : DebateOrchestrator.restore(
-          { registry: providers, repository, onEvent, contextPreparation },
-          initialSession
-        )
+    createOrchestrator
   })
   return { services, log }
 }
