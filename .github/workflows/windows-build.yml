@@ -12,11 +12,6 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      # The default Windows TEMP can contain an 8.3 alias (RUNNER~1).
-      # Use the runner's full path for filesystem and Electron test fixtures.
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,7 +25,14 @@ jobs:
       - run: npm run build:credential-helper
       - run: npm run stage:codex
       - run: npm run verify:staged-runtime
-      - run: npm test
+      - name: Run npm test
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:GITHUB_WORKSPACE '.ci-temp'
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          npm test
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run test:e2e
