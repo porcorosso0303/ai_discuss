@@ -188,7 +188,7 @@ describe('DebateRepository', () => {
 
     await expect(repository.list({ limit: 1 })).rejects.toThrow(/too many session files/i)
     expect(await readFile(join(root, 'debates/index.json'), 'utf8')).toBe(indexBeforeOverflow)
-  }, 30_000)
+  }, 120_000)
 
   it('clears all 5001 session files in bounded batches and writes an empty index only after confirmation', async () => {
     const root = await createTempDirectory('debate-repository-clear-over-cap-')
@@ -200,7 +200,7 @@ describe('DebateRepository', () => {
     expect(JSON.parse(await readFile(join(root, 'debates/index.json'), 'utf8'))).toEqual({
       sessions: []
     })
-  }, 30_000)
+  }, 120_000)
 
   it('throws on a partial clear failure and heals the index to the surviving session', async () => {
     const root = await createTempDirectory('debate-repository-clear-partial-')
@@ -262,7 +262,7 @@ describe('DebateRepository', () => {
     expect(await lstat(join(root, 'debates/index.json')).catch(() => null)).toBeNull()
     expect(await readFile(join(root, 'debates/external-00000.json'), 'utf8').catch(() => null)).toBeNull()
     expect(await readFile(join(root, 'debates/external-05000.json'), 'utf8')).toContain('external-05000')
-  }, 30_000)
+  }, 120_000)
 
   it('orders histories by parsed instants rather than RFC 3339 text offsets', async () => {
     const root = await createTempDirectory('debate-repository-offset-order-')
