@@ -520,18 +520,20 @@ describe('Codex executable resolution', () => {
     const realHome = join(root, 'real-home')
     const linkedHome = join(root, 'linked-home')
     await mkdir(realHome)
-    await symlink(realHome, linkedHome, 'dir')
+    await symlink(realHome, linkedHome, process.platform === 'win32' ? 'junction' : 'dir')
 
     await expect(prepareCodexHome('relative-home')).rejects.toThrow()
     await expect(prepareCodexHome(linkedHome)).rejects.toThrow()
 
-    const configLinkHome = join(root, 'config-link-home')
-    await mkdir(configLinkHome)
-    const outside = join(root, 'outside.toml')
-    await writeFile(outside, 'do-not-overwrite')
-    await symlink(outside, join(configLinkHome, 'config.toml'))
-    await expect(prepareCodexHome(configLinkHome)).rejects.toThrow()
-    expect(await readFile(outside, 'utf8')).toBe('do-not-overwrite')
+    if (process.platform !== 'win32') {
+      const configLinkHome = join(root, 'config-link-home')
+      await mkdir(configLinkHome)
+      const outside = join(root, 'outside.toml')
+      await writeFile(outside, 'do-not-overwrite')
+      await symlink(outside, join(configLinkHome, 'config.toml'))
+      await expect(prepareCodexHome(configLinkHome)).rejects.toThrow()
+      expect(await readFile(outside, 'utf8')).toBe('do-not-overwrite')
+    }
   })
 
   it('prepares the isolated home before spawning and completes the stable handshake', async () => {

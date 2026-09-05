@@ -219,7 +219,10 @@ describe('release verification', () => {
       await writeFile(join(appSource, 'out', 'main', 'index.js'), 'console.log("app")')
       await createPackage(appSource, join(unpacked, 'resources', 'app.asar'))
 
-      await expect(verifyArtifact({ root })).resolves.toMatchObject({
+      // Synthetic PE fixtures have headers, not executable machine code.
+      // Real Windows version execution is covered by verify:artifact in CI.
+      const verificationOptions = Object.assign({ root }, { platform: 'linux' as const })
+      await expect(verifyArtifact(verificationOptions)).resolves.toMatchObject({
         artifactPath: join(dist, 'AI-Debates-Portable-x64.exe'),
         size: artifact.length,
         sha256: createHash('sha256').update(artifact).digest('hex')

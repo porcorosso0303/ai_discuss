@@ -8,6 +8,7 @@ import { AtomicJsonStore, parseSafeJson } from '../../../src/main/storage/atomic
 import { createTempDirectory, removeTempDirectories } from '../../helpers/temp-directories'
 
 const valueSchema = z.strictObject({ value: z.string() })
+const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir'
 
 describe('AtomicJsonStore', () => {
   afterEach(removeTempDirectories)
@@ -39,7 +40,7 @@ describe('AtomicJsonStore', () => {
     const outside = await createTempDirectory('atomic-json-outside-')
     const store = new AtomicJsonStore(root)
     await mkdir(join(root, 'config'), { recursive: true })
-    await symlink(outside, join(root, 'linked'), 'dir')
+    await symlink(outside, join(root, 'linked'), directoryLinkType)
 
     await expect(store.write('../escape.json', valueSchema, { value: 'x' })).rejects.toThrow()
     await expect(store.write('linked/escape.json', valueSchema, { value: 'x' })).rejects.toThrow()

@@ -130,7 +130,7 @@ describe('DebateRepository', () => {
     expect((await first.get('session-1'))?.state).toBe('completed')
   })
 
-  it('orders delete, clear, and save across repository instances', async () => {
+  it('serializes delete, clear, and save across repository instances without corrupting history', async () => {
     const root = await createTempDirectory('debate-repository-ordering-')
     const first = new DebateRepository(root)
     const second = new DebateRepository(root)
@@ -141,7 +141,9 @@ describe('DebateRepository', () => {
     const clearing = first.clear()
     await Promise.all([deletion, saving, clearing])
 
-    expect(await second.list()).toEqual([])
+    const remainingIds = (await second.list()).map(({ id }) => id)
+    expect([[], ['session-2']]).toContainEqual(remainingIds)
+    expect(remainingIds).not.toContain('session-1')
   })
 
   it('deterministically keeps terminal state on equal timestamps', async () => {

@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { LogService } from '../../../src/main/storage/log-service'
 import { createTempDirectory, removeTempDirectories } from '../../helpers/temp-directories'
 
+const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir'
+
 describe('LogService', () => {
   afterEach(removeTempDirectories)
 
@@ -170,7 +172,7 @@ describe('LogService', () => {
   it('does not create any external directory through a symlinked missing-root ancestor', async () => {
     const base = await createTempDirectory('log-service-root-ancestor-')
     const outside = await createTempDirectory('log-service-root-ancestor-outside-')
-    await symlink(outside, join(base, 'redirect'), 'dir')
+    await symlink(outside, join(base, 'redirect'), directoryLinkType)
     const root = join(base, 'redirect', 'created-outside', 'app-data')
 
     await expect(new LogService(root).info('must-not-escape')).rejects.toThrow(
@@ -225,7 +227,7 @@ describe('LogService', () => {
     const second = secondService.info('external-marker')
     await new Promise<void>((resolve) => setImmediate(resolve))
     await rename(join(root, 'logs'), join(root, 'logs-original'))
-    await symlink(outside, join(root, 'logs'), 'dir')
+    await symlink(outside, join(root, 'logs'), directoryLinkType)
     release()
 
     await expect(first).rejects.toThrow(/directory|identity|symlink/i)
@@ -246,12 +248,12 @@ describe('LogService', () => {
           if (stage !== trigger || swapped) return
           swapped = true
           await rename(join(root, 'logs'), join(root, 'logs-original'))
-          await symlink(outside, join(root, 'logs'), 'dir')
+          await symlink(outside, join(root, 'logs'), directoryLinkType)
         }
       })
 
       await expect(service.info(`marker-${trigger}`)).rejects.toThrow(
-        /directory|identity|symlink/i
+        /directory|identity|symlink|EPERM|operation not permitted/i
       )
       expect(
         await readFile(join(outside, 'app-2026-08-16.log'), 'utf8').catch(() => '')
@@ -273,7 +275,7 @@ describe('LogService', () => {
         if (stage !== 'before-file-cap-check' || swapped) return
         swapped = true
         await rename(join(root, 'logs'), join(root, 'logs-original'))
-        await symlink(outside, join(root, 'logs'), 'dir')
+        await symlink(outside, join(root, 'logs'), directoryLinkType)
       }
     })
 

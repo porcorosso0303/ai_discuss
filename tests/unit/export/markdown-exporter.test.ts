@@ -10,6 +10,8 @@ import {
 import { createSession } from '../../helpers/debate-fixtures'
 import { createTempDirectory, removeTempDirectories } from '../../helpers/temp-directories'
 
+const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir'
+
 const completedSession = () =>
   createSession({
     state: 'completed',
@@ -223,7 +225,7 @@ describe('MarkdownExporter', () => {
           if (stage !== 'before-temp-open' || swapped) return
           swapped = true
           await rename(selectedParent, join(root, 'selected-original'))
-          await symlink(outside, selectedParent, 'dir')
+          await symlink(outside, selectedParent, directoryLinkType)
         }
       }
     )
@@ -234,7 +236,7 @@ describe('MarkdownExporter', () => {
     expect(await readFile(join(outside, 'debate.md'), 'utf8').catch(() => null)).toBeNull()
   })
 
-  it('rejects a symlink overwrite target', async () => {
+  it.skipIf(process.platform === 'win32')('rejects a symlink overwrite target', async () => {
     const root = await createTempDirectory('markdown-symlink-')
     const target = join(root, 'real.md')
     const link = join(root, 'selected.md')

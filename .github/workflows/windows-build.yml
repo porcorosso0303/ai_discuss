@@ -2,7 +2,7 @@ name: Windows portable build
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # The default Windows TEMP can contain an 8.3 alias (RUNNER~1).
+      # Use the runner's full path for filesystem and Electron test fixtures.
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

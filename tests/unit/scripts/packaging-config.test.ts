@@ -36,6 +36,11 @@ describe('Windows portable packaging configuration', () => {
 
   test('Windows CI executes the release pipeline in order and uploads the verified executable', async () => {
     const workflow = parse(await readFile(resolve(root, '.github/workflows/windows-build.yml'), 'utf8'))
+    expect(workflow.on?.push?.branches).toEqual(['main', 'master'])
+    expect(workflow.jobs?.build?.env).toMatchObject({
+      TEMP: '${{ runner.temp }}',
+      TMP: '${{ runner.temp }}'
+    })
     const steps = workflow.jobs?.build?.steps ?? []
     const commands = steps.flatMap((step: { run?: string }) => step.run ? [step.run] : [])
     expect(commands).toEqual([

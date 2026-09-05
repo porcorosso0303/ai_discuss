@@ -177,7 +177,10 @@ export async function verifyStagedRuntime({ root, expectedVersion, platform = pr
   return { codexPath, helperPath, manifest }
 }
 
-export async function verifyArtifact({ root }) {
+/**
+ * @param {{ root: string, platform?: NodeJS.Platform }} options
+ */
+export async function verifyArtifact({ root, platform = process.platform }) {
   const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
   const expectedVersion = packageJson.devDependencies?.['@openai/codex']
   if (!/^\d+\.\d+\.\d+$/.test(expectedVersion ?? '')) {
@@ -192,7 +195,7 @@ export async function verifyArtifact({ root }) {
   assertPortableExecutable(artifact, 'portable artifact')
 
   const unpackedRoot = join(root, 'dist', 'win-unpacked')
-  await verifyStagedRuntime({ root: unpackedRoot, expectedVersion })
+  await verifyStagedRuntime({ root: unpackedRoot, expectedVersion, platform })
   const asarPath = join(unpackedRoot, 'resources', 'app.asar')
   await requiredFile(asarPath, 'app.asar')
   assertAsarContents(listPackage(asarPath, { isPack: false }))
