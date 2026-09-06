@@ -1,0 +1,39 @@
+{
+  "threadStart": {
+    "thread": {
+      "id": "thread-1",
+      "sessionId": "thread-1",
+      "preview": "",
+      "ephemeral": true,
+      "modelProvider": "openai",
+      "createdAt": 1,
+      "updatedAt": 1,
+      "status": { "type": "idle" },
+      "cwd": "/tmp/role-a",
+      "cliVersion": "0.147.0",
+      "source": { "custom": "ai_debates" },
+      "turns": []
+    },
+    "model": "gpt-test",
+    "modelProvider": "openai",
+    "cwd": "/tmp/role-a",
+    "approvalPolicy": "never",
+    "approvalsReviewer": "user",
+    "sandbox": { "type": "readOnly" }
+  },
+  "turnStart": {
+    "turn": {
+      "id": "turn-1",
+      "items": [],
+      "status": "inProgress"
+    }
+  },
+  "turnCompleted": {
+    "threadId": "thread-1",
+    "turn": {
+      "id": "turn-1",
+      "items": [],
+      "status": "completed"
+    }
+  }
+}

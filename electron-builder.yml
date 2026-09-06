@@ -1,0 +1,22 @@
+appId: com.aidebates.desktop
+productName: AI Debates
+asar: true
+artifactName: AI-Debates-Portable-x64.exe
+directories:
+  output: dist
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: resources/bin/codex.exe
+    to: bin/codex.exe
+  - from: resources/bin/credential-helper.exe
+    to: bin/credential-helper.exe
+  - from: resources/bin/codex-runtime-manifest.json
+    to: bin/codex-runtime-manifest.json
+win:
+  requestedExecutionLevel: asInvoker
+  target:
+    - target: portable
+      arch:
+        - x64

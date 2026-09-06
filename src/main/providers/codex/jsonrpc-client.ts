@@ -1,0 +1,572 @@
+import type { EventEmitter } from 'node:events'
+import type { Readable, Writable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
+
+import type { z } from 'zod'
+
+import { REDACTED } from '../http/redaction'
+import { initializeResponseSchema } from './codex-events'
+
+export interface CodexClientInfo {
+  name: string
+  title: string | null
+  version: string
+}
+
+export interface CodexJsonRpcClientOptions {
+  maxLineBytes?: number
+  maxStderrBytes?: number
+  maxPending?: number
+  maxQueuedWrites?: number
+  maxQueuedWriteBytes?: number
+  requestTimeoutMs?: number
+}
+
+export interface CodexProcessTransport extends EventEmitter {
+  stdin: Writable
+  stdout: Readable
+  stderr: Readable
+  exitCode: number | null
+  signalCode: NodeJS.Signals | null
+  kill(): boolean
+}
+
+interface PendingRequest {
+  method: string
+  schema: z.ZodType
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+interface QueuedWrite {
+  encoded: string
+  bytes: number
+}
+
+type NotificationHandler = (params: unknown) => void
+
+export class JsonRpcProtocolError extends Error {}
+
+export class JsonRpcTransportError extends Error {}
+
+export class JsonRpcServerError extends Error {
+  constructor(
+    readonly code: number,
+    readonly method: string
+  ) {
+    super(`Codex App Server rejected ${method} (code ${code})`)
+  }
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+const hasOnlyKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key))
+
+const MIN_INT64 = -(1n << 63n)
+const MAX_INT64 = (1n << 63n) - 1n
+
+const skipWhitespace = (source: string, start: number): number => {
+  let index = start
+  while (/\s/u.test(source[index] ?? '')) index += 1
+  return index
+}
+
+const scanStringEnd = (source: string, start: number): number => {
+  if (source[start] !== '"') throw new JsonRpcProtocolError('Invalid JSON object member')
+  let index = start + 1
+  while (index < source.length) {
+    if (source[index] === '\\') {
+      index += 2
+      continue
+    }
+    if (source[index] === '"') return index + 1
+    index += 1
+  }
+  throw new JsonRpcProtocolError('Unterminated JSON string')
+}
+
+const scanValueEnd = (source: string, start: number): number => {
+  const first = source[start]
+  if (first === '"') return scanStringEnd(source, start)
+  if (first !== '{' && first !== '[') {
+    let index = start
+    while (index < source.length && !/[\s,}]/u.test(source[index])) index += 1
+    return index
+  }
+
+  const stack: string[] = [first]
+  let index = start + 1
+  while (index < source.length && stack.length > 0) {
+    const character = source[index]
+    if (character === '"') {
+      index = scanStringEnd(source, index)
+      continue
+    }
+    if (character === '{' || character === '[') {
+      stack.push(character)
+    } else if (character === '}' || character === ']') {
+      const expected = character === '}' ? '{' : '['
+      if (stack.pop() !== expected) {
+        throw new JsonRpcProtocolError('Mismatched JSON container')
+      }
+    }
+    index += 1
+  }
+  if (stack.length !== 0) throw new JsonRpcProtocolError('Unterminated JSON container')
+  return index
+}
+
+const extractRawTopLevelId = (line: string): string | undefined => {
+  let index = skipWhitespace(line, 0)
+  if (line[index] !== '{') throw new JsonRpcProtocolError('Expected a JSON object')
+  index += 1
+  let rawId: string | undefined
+  let idCount = 0
+
+  while (true) {
+    index = skipWhitespace(line, index)
+    if (line[index] === '}') {
+      index = skipWhitespace(line, index + 1)
+      if (index !== line.length) throw new JsonRpcProtocolError('Invalid JSON object suffix')
+      break
+    }
+    const keyEnd = scanStringEnd(line, index)
+    const key = JSON.parse(line.slice(index, keyEnd)) as unknown
+    if (typeof key !== 'string') throw new JsonRpcProtocolError('Invalid JSON object key')
+    index = skipWhitespace(line, keyEnd)
+    if (line[index] !== ':') throw new JsonRpcProtocolError('Invalid JSON object member')
+    const valueStart = skipWhitespace(line, index + 1)
+    const valueEnd = scanValueEnd(line, valueStart)
+    if (key === 'id') {
+      idCount += 1
+      rawId = line.slice(valueStart, valueEnd)
+    }
+    index = skipWhitespace(line, valueEnd)
+    if (line[index] === ',') {
+      index += 1
+      continue
+    }
+    if (line[index] !== '}') throw new JsonRpcProtocolError('Invalid JSON object delimiter')
+  }
+  if (idCount > 1) throw new JsonRpcProtocolError('Duplicate top-level response id')
+  return rawId
+}
+
+const serializeServerRequestId = (rawId: string | undefined, parsedId: unknown): string => {
+  if (rawId?.startsWith('"') === true) {
+    const decoded = JSON.parse(rawId) as unknown
+    if (typeof decoded !== 'string' || decoded !== parsedId) {
+      throw new JsonRpcProtocolError('Invalid server request id')
+    }
+    return JSON.stringify(decoded)
+  }
+  if (rawId === undefined || !/^-?(?:0|[1-9]\d*)$/u.test(rawId)) {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  let integer: bigint
+  try {
+    integer = BigInt(rawId)
+  } catch {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  if (integer < MIN_INT64 || integer > MAX_INT64 || typeof parsedId !== 'number') {
+    throw new JsonRpcProtocolError('Invalid server request id')
+  }
+  return rawId
+}
+
+const isW3cTraceContext = (value: unknown): boolean => {
+  if (value === null) return true
+  if (!isObject(value)) return false
+  for (const key of ['traceparent', 'tracestate'] as const) {
+    if (
+      Object.hasOwn(value, key) &&
+      value[key] !== null &&
+      typeof value[key] !== 'string'
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+const safePositiveInteger = (value: number | undefined, fallback: number): number => {
+  const result = value ?? fallback
+  if (!Number.isSafeInteger(result) || result <= 0) throw new RangeError('Limit must be positive')
+  return result
+}
+
+export class CodexJsonRpcClient {
+  private readonly maxLineBytes: number
+  private readonly maxStderrBytes: number
+  private readonly maxPending: number
+  private readonly maxQueuedWrites: number
+  private readonly maxQueuedWriteBytes: number
+  private readonly requestTimeoutMs: number
+  private readonly pending = new Map<number, PendingRequest>()
+  private readonly notificationHandlers = new Map<string, Set<NotificationHandler>>()
+  private readonly failureHandlers = new Set<(error: Error) => void>()
+  private readonly decoder = new StringDecoder('utf8')
+  private nextId = 1
+  private stdoutBuffer = ''
+  private stderrBuffer = ''
+  private queuedWrites: QueuedWrite[] = []
+  private queuedWriteBytes = 0
+  private writeBlocked = false
+  private writeInProgress = false
+  private state: 'new' | 'initializing' | 'ready' | 'failed' | 'disposed' = 'new'
+  private failure: Error | undefined
+
+  constructor(
+    private readonly child: CodexProcessTransport,
+    options: CodexJsonRpcClientOptions = {}
+  ) {
+    this.maxLineBytes = safePositiveInteger(options.maxLineBytes, 1024 * 1024)
+    this.maxStderrBytes = safePositiveInteger(options.maxStderrBytes, 4_096)
+    this.maxPending = safePositiveInteger(options.maxPending, 64)
+    this.maxQueuedWrites = safePositiveInteger(options.maxQueuedWrites, 64)
+    this.maxQueuedWriteBytes = safePositiveInteger(
+      options.maxQueuedWriteBytes,
+      Math.min(Number.MAX_SAFE_INTEGER, this.maxLineBytes * 4)
+    )
+    this.requestTimeoutMs = safePositiveInteger(options.requestTimeoutMs, 30_000)
+
+    child.stdout.on('data', this.handleStdout)
+    child.stderr.on('data', this.handleStderr)
+    child.stdin.on('error', this.handleProcessError)
+    child.stdout.on('error', this.handleProcessError)
+    child.stderr.on('error', this.handleProcessError)
+    child.stdin.on('drain', this.handleDrain)
+    child.once('error', this.handleProcessError)
+    child.once('exit', this.handleExit)
+  }
+
+  get pendingCount(): number {
+    return this.pending.size
+  }
+
+  get diagnostics(): { stderr: string } {
+    return { stderr: this.stderrBuffer }
+  }
+
+  async initialize(clientInfo: CodexClientInfo): Promise<void> {
+    if (this.state !== 'new') {
+      throw new JsonRpcProtocolError('Codex App Server must be initialized exactly once')
+    }
+    this.state = 'initializing'
+    try {
+      await this.sendRequest(
+        'initialize',
+        { clientInfo, capabilities: null },
+        initializeResponseSchema
+      )
+      this.writeMessage({ method: 'initialized' })
+      this.state = 'ready'
+    } catch (error) {
+      const failure =
+        error instanceof Error ? error : new JsonRpcProtocolError('Initialization failed')
+      this.fail(failure)
+      throw this.failure ?? failure
+    }
+  }
+
+  async request<Schema extends z.ZodType>(
+    method: string,
+    params: unknown,
+    schema: Schema
+  ): Promise<z.output<Schema>> {
+    if (this.state !== 'ready') {
+      throw this.failure ?? new JsonRpcProtocolError('Codex App Server is not initialized')
+    }
+    return (await this.sendRequest(method, params, schema)) as z.output<Schema>
+  }
+
+  notify(method: string, params?: unknown): void {
+    if (this.state !== 'ready') throw new JsonRpcProtocolError('Codex App Server is not initialized')
+    this.writeMessage(params === undefined ? { method } : { method, params })
+  }
+
+  onNotification(method: string, handler: NotificationHandler): () => void {
+    let handlers = this.notificationHandlers.get(method)
+    if (handlers === undefined) {
+      handlers = new Set()
+      this.notificationHandlers.set(method, handlers)
+    }
+    handlers.add(handler)
+    return () => {
+      handlers?.delete(handler)
+      if (handlers?.size === 0) this.notificationHandlers.delete(method)
+    }
+  }
+
+  onFailure(handler: (error: Error) => void): () => void {
+    this.failureHandlers.add(handler)
+    if (this.failure !== undefined) {
+      queueMicrotask(() => {
+        try {
+          handler(this.failure as Error)
+        } catch {
+          // A consumer cannot corrupt transport cleanup.
+        }
+      })
+    }
+    return () => this.failureHandlers.delete(handler)
+  }
+
+  async dispose(): Promise<void> {
+    if (this.state === 'disposed') return
+    this.state = 'disposed'
+    this.rejectPending(new JsonRpcTransportError('Codex App Server connection closed'))
+    this.notificationHandlers.clear()
+    this.failureHandlers.clear()
+    this.child.stdout.off('data', this.handleStdout)
+    this.child.stderr.off('data', this.handleStderr)
+    this.child.stdin.off('error', this.handleProcessError)
+    this.child.stdout.off('error', this.handleProcessError)
+    this.child.stderr.off('error', this.handleProcessError)
+    this.child.stdin.off('drain', this.handleDrain)
+    this.child.off('error', this.handleProcessError)
+    this.child.off('exit', this.handleExit)
+    this.clearQueuedWrites()
+    this.child.stdin.end()
+    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill()
+  }
+
+  private sendRequest(method: string, params: unknown, schema: z.ZodType): Promise<unknown> {
+    if (this.pending.size >= this.maxPending) {
+      return Promise.reject(new JsonRpcProtocolError('Too many pending Codex requests'))
+    }
+    const id = this.nextId
+    this.nextId += 1
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return
+        this.fail(new JsonRpcTransportError(`Codex request timed out: ${method}`))
+      }, this.requestTimeoutMs)
+      this.pending.set(id, { method, schema, resolve, reject, timer })
+      try {
+        this.writeMessage({ id, method, params })
+      } catch (error) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        reject(error instanceof Error ? error : new JsonRpcTransportError('Codex write failed'))
+      }
+    })
+  }
+
+  private writeMessage(message: unknown): void {
+    this.writeSerializedMessage(JSON.stringify(message))
+  }
+
+  private writeSerializedMessage(serialized: string): void {
+    if (this.child.stdin.destroyed || !this.child.stdin.writable) {
+      throw new JsonRpcTransportError('Codex App Server stdin is unavailable')
+    }
+    const encoded = `${serialized}\n`
+    if (Buffer.byteLength(encoded) > this.maxLineBytes) {
+      throw new JsonRpcProtocolError('Outbound Codex message exceeds the line limit')
+    }
+    const bytes = Buffer.byteLength(encoded)
+    if (
+      this.queuedWrites.length >= this.maxQueuedWrites ||
+      this.queuedWriteBytes + bytes > this.maxQueuedWriteBytes
+    ) {
+      const error = new JsonRpcProtocolError('Codex stdin queue exceeds the configured limit')
+      this.fail(error)
+      throw error
+    }
+    this.queuedWrites.push({ encoded, bytes })
+    this.queuedWriteBytes += bytes
+    this.flushQueuedWrites()
+  }
+
+  private readonly handleStdout = (chunk: Buffer): void => {
+    if (this.state === 'failed' || this.state === 'disposed') return
+    this.stdoutBuffer += this.decoder.write(chunk)
+    let newline = this.stdoutBuffer.indexOf('\n')
+    while (newline !== -1) {
+      const line = this.stdoutBuffer.slice(0, newline).replace(/\r$/, '')
+      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1)
+      if (Buffer.byteLength(line) > this.maxLineBytes) {
+        this.fail(new JsonRpcProtocolError('Codex stdout line exceeds the configured limit'))
+        return
+      }
+      if (line !== '') {
+        try {
+          this.handleLine(line)
+        } catch (error) {
+          this.fail(
+            error instanceof JsonRpcProtocolError
+              ? error
+              : new JsonRpcProtocolError('Codex emitted an invalid protocol message')
+          )
+          return
+        }
+      }
+      newline = this.stdoutBuffer.indexOf('\n')
+    }
+    if (Buffer.byteLength(this.stdoutBuffer) > this.maxLineBytes) {
+      this.fail(new JsonRpcProtocolError('Codex stdout line exceeds the configured limit'))
+    }
+  }
+
+  private flushQueuedWrites(): void {
+    if (this.writeBlocked || this.writeInProgress) return
+    try {
+      while (!this.writeBlocked && this.queuedWrites.length > 0) {
+        const next = this.queuedWrites.shift() as QueuedWrite
+        this.queuedWriteBytes -= next.bytes
+        this.writeInProgress = true
+        const accepted = this.child.stdin.write(next.encoded)
+        this.writeInProgress = false
+        if (!accepted) this.writeBlocked = true
+      }
+    } catch (error) {
+      this.writeInProgress = false
+      const failure =
+        error instanceof Error ? error : new JsonRpcTransportError('Codex write failed')
+      this.fail(failure)
+      throw failure
+    }
+  }
+
+  private readonly handleDrain = (): void => {
+    if (this.state === 'failed' || this.state === 'disposed') return
+    this.writeBlocked = false
+    try {
+      this.flushQueuedWrites()
+    } catch {
+      // flushQueuedWrites already failed the transport.
+    }
+  }
+
+  private readonly handleStderr = (chunk: Buffer): void => {
+    if (chunk.length > 0) this.stderrBuffer = REDACTED.slice(0, this.maxStderrBytes)
+  }
+
+  private handleLine(line: string): void {
+    let value: unknown
+    try {
+      value = JSON.parse(line)
+    } catch {
+      throw new JsonRpcProtocolError('Codex emitted malformed JSON')
+    }
+    if (!isObject(value)) throw new JsonRpcProtocolError('Codex emitted a non-object message')
+    const rawId = extractRawTopLevelId(line)
+
+    const hasId = Object.hasOwn(value, 'id')
+    const hasMethod = typeof value.method === 'string'
+    if (hasId && hasMethod) {
+      if (
+        !hasOnlyKeys(value, ['id', 'method', 'params', 'trace']) ||
+        (Object.hasOwn(value, 'trace') && !isW3cTraceContext(value.trace))
+      ) {
+        throw new JsonRpcProtocolError('Invalid server request envelope')
+      }
+      const serializedId = serializeServerRequestId(rawId, value.id)
+      this.writeSerializedMessage(
+        `{"id":${serializedId},"error":{"code":-32601,"message":"Method not found"}}`
+      )
+      return
+    }
+    if (hasMethod) {
+      if (!hasOnlyKeys(value, ['method', 'params'])) {
+        throw new JsonRpcProtocolError('Invalid notification envelope')
+      }
+      for (const handler of this.notificationHandlers.get(value.method as string) ?? []) {
+        try {
+          handler(value.params)
+        } catch {
+          // A consumer cannot corrupt the shared transport.
+        }
+      }
+      return
+    }
+    if (hasId) {
+      if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) {
+        throw new JsonRpcProtocolError('Invalid response id')
+      }
+      const pending = this.pending.get(value.id)
+      if (pending === undefined) throw new JsonRpcProtocolError('Unknown or duplicate response id')
+      this.pending.delete(value.id)
+      clearTimeout(pending.timer)
+
+      if (Object.hasOwn(value, 'error')) {
+        if (!hasOnlyKeys(value, ['id', 'error']) || !isObject(value.error)) {
+          pending.reject(new JsonRpcProtocolError('Invalid error response'))
+          return
+        }
+        const error = value.error
+        if (
+          typeof error.code !== 'number' ||
+          !Number.isSafeInteger(error.code) ||
+          typeof error.message !== 'string' ||
+          !hasOnlyKeys(error, ['code', 'message', 'data'])
+        ) {
+          pending.reject(new JsonRpcProtocolError('Invalid server error'))
+          return
+        }
+        pending.reject(new JsonRpcServerError(error.code, pending.method))
+        return
+      }
+      if (!Object.hasOwn(value, 'result') || !hasOnlyKeys(value, ['id', 'result'])) {
+        pending.reject(new JsonRpcProtocolError('Invalid success response'))
+        return
+      }
+      const parsed = pending.schema.safeParse(value.result)
+      if (!parsed.success) {
+        pending.reject(new JsonRpcProtocolError(`Invalid Codex response for ${pending.method}`))
+        return
+      }
+      pending.resolve(parsed.data)
+      return
+    }
+    throw new JsonRpcProtocolError('Unknown Codex protocol message')
+  }
+
+  private readonly handleProcessError = (): void => {
+    this.fail(new JsonRpcTransportError('Codex App Server process failed'))
+  }
+
+  private readonly handleExit = (): void => {
+    if (this.state !== 'disposed') {
+      this.fail(new JsonRpcTransportError('Codex App Server exited unexpectedly'))
+    }
+  }
+
+  private fail(error: Error): void {
+    if (this.state === 'failed' || this.state === 'disposed') return
+    this.state = 'failed'
+    this.failure = error
+    this.clearQueuedWrites()
+    this.rejectPending(error)
+    this.notificationHandlers.clear()
+    for (const handler of this.failureHandlers) {
+      try {
+        handler(error)
+      } catch {
+        // A consumer cannot corrupt transport cleanup.
+      }
+    }
+    this.failureHandlers.clear()
+    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill()
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.pending.clear()
+  }
+
+  private clearQueuedWrites(): void {
+    this.queuedWrites = []
+    this.queuedWriteBytes = 0
+    this.writeBlocked = false
+    this.writeInProgress = false
+  }
+}

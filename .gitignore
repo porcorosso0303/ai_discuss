@@ -3,10 +3,14 @@ node_modules/
 out/
 dist/
 coverage/
+.vite/
+.electron-vite/
+*.tsbuildinfo
 playwright-report/
 test-results/
 .env
 .env.*
 !.env.example
 resources/bin/*.exe
+resources/bin/codex-runtime-manifest.json
 *.log
