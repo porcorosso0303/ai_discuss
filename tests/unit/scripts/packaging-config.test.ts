@@ -26,6 +26,7 @@ describe('Windows portable packaging configuration', () => {
     expect(pkg.devDependencies['@openai/codex']).toBe('0.147.0')
     expect(pkg.scripts).toMatchObject({
       lint: 'node scripts/lint-source.mjs',
+      'install:electron': 'node node_modules/electron/install.js',
       'build:credential-helper': 'node scripts/build-credential-helper.mjs',
       'stage:codex': 'node scripts/stage-codex-runtime.mjs',
       'verify:staged-runtime': 'node scripts/verify-staged-runtime.mjs',
@@ -39,17 +40,18 @@ describe('Windows portable packaging configuration', () => {
     expect(workflow.on?.push?.branches).toEqual(['main', 'master'])
     const steps = workflow.jobs?.build?.steps ?? []
     const commands = steps.flatMap((step: { run?: string }) => step.run ? [step.run] : [])
-    expect(commands.slice(0, 4)).toEqual([
+    expect(commands.slice(0, 5)).toEqual([
       'npm ci',
+      'npm run install:electron',
       'npm run build:credential-helper',
       'npm run stage:codex',
       'npm run verify:staged-runtime'
     ])
-    expect(commands[4]).toContain("Join-Path $env:GITHUB_WORKSPACE '.ci-temp'")
-    expect(commands[4]).toContain('$env:TEMP = $testTemp')
-    expect(commands[4]).toContain('$env:TMP = $testTemp')
-    expect(commands[4]).toContain('npm test')
-    expect(commands.slice(5)).toEqual([
+    expect(commands[5]).toContain("Join-Path $env:GITHUB_WORKSPACE '.ci-temp'")
+    expect(commands[5]).toContain('$env:TEMP = $testTemp')
+    expect(commands[5]).toContain('$env:TMP = $testTemp')
+    expect(commands[5]).toContain('npm test')
+    expect(commands.slice(6)).toEqual([
       'npm run typecheck',
       'npm run lint',
       'npm run test:e2e',

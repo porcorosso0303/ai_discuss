@@ -22,6 +22,7 @@ jobs:
         with:
           go-version: '1.22.x'
       - run: npm ci
+      - run: npm run install:electron
       - run: npm run build:credential-helper
       - run: npm run stage:codex
       - run: npm run verify:staged-runtime

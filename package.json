@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "install:electron": "node node_modules/electron/install.js",
     "build:credential-helper": "node scripts/build-credential-helper.mjs",
     "stage:codex": "node scripts/stage-codex-runtime.mjs",
     "verify:staged-runtime": "node scripts/verify-staged-runtime.mjs",

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -35,6 +35,9 @@ export const test = base.extend<DesktopFixtures>({
     await server.close()
   },
   electronApp: async ({ testRoot, exportPath }, use) => {
+    if (process.platform === 'win32') {
+      await mkdir(join(testRoot, 'AI Debates'), { recursive: true })
+    }
     const app = await electron.launch({
       executablePath: electronExecutable,
       args: ['--no-sandbox', resolve('out/main/index.js')],
