@@ -36,7 +36,14 @@ jobs:
           npm test
       - run: npm run typecheck
       - run: npm run lint
-      - run: npm run test:e2e
+      - name: Run npm run test:e2e
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:GITHUB_WORKSPACE '.ci-temp'
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          npm run test:e2e
       - run: npm run dist:win
       - run: npm run verify:artifact
       - run: Get-FileHash dist/AI-Debates-Portable-x64.exe -Algorithm SHA256

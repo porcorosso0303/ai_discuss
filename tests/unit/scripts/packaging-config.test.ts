@@ -51,10 +51,15 @@ describe('Windows portable packaging configuration', () => {
     expect(commands[5]).toContain('$env:TEMP = $testTemp')
     expect(commands[5]).toContain('$env:TMP = $testTemp')
     expect(commands[5]).toContain('npm test')
-    expect(commands.slice(6)).toEqual([
+    expect(commands[8]).toContain("Join-Path $env:GITHUB_WORKSPACE '.ci-temp'")
+    expect(commands[8]).toContain('$env:TEMP = $testTemp')
+    expect(commands[8]).toContain('$env:TMP = $testTemp')
+    expect(commands[8]).toContain('npm run test:e2e')
+    expect(commands.slice(6, 8)).toEqual([
       'npm run typecheck',
-      'npm run lint',
-      'npm run test:e2e',
+      'npm run lint'
+    ])
+    expect(commands.slice(9)).toEqual([
       'npm run dist:win',
       'npm run verify:artifact',
       'Get-FileHash dist/AI-Debates-Portable-x64.exe -Algorithm SHA256'
